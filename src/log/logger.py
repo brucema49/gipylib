@@ -45,8 +45,8 @@ class Logger(Thread):
                 # 4. 解包 SensorData 并匹配写出
                 if isinstance(gnss, SensorData):
                     gnss = gnss.gnss_solution
-                # 等待 IMU 数据读到 >= GNSS 历元时间，避免竞态
-                self._wait_for_imu(gnss.timestamp)
+                # 等待 IMU 数据读到 >= GNSS 历元 + harvest_window，确保收割窗口内 IMU 都已到达
+                self._wait_for_imu(gnss.timestamp + self.aligner.harvest_window)
                 aligned = self.aligner.harvest(gnss)
                 if aligned is not None:
                     self.writer.write(aligned)
