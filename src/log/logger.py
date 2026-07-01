@@ -47,7 +47,7 @@ class Logger(Thread):
                     gnss = gnss.gnss_solution
                 # 等待 IMU 数据读到 >= GNSS 历元时间，避免竞态
                 self._wait_for_imu(gnss.timestamp)
-                aligned = self.aligner.match(gnss)
+                aligned = self.aligner.harvest(gnss)
                 if aligned is not None:
                     self.writer.write(aligned)
         finally:
