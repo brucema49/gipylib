@@ -26,22 +26,6 @@ class GnssSolution:
 
 
 @dataclass
-class AlignedRow:
-    """对齐后的一行输出数据。"""
-    week: int
-    sow: float                # GNSS 历元时间
-    imu_count: int            # 窗口内 IMU 数据条数
-    imu_first_sow: float
-    imu_last_sow: float
-    gnss_pos: np.ndarray      # [3]
-    gnss_q: int
-    gnss_ns: int
-    gnss_sd: np.ndarray       # [3]
-    imu_avg_accel: np.ndarray # [3] 窗口均值
-    imu_avg_gyro: np.ndarray  # [3] 窗口均值
-
-
-@dataclass
 class AlignedBlock:
     """对齐后的块数据：1 个 GNSS + N 个 IMU。"""
     gnss: GnssSolution
