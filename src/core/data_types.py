@@ -1,6 +1,6 @@
 """GInsStream 核心数据类型定义。"""
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 
@@ -39,6 +39,13 @@ class AlignedRow:
     gnss_sd: np.ndarray       # [3]
     imu_avg_accel: np.ndarray # [3] 窗口均值
     imu_avg_gyro: np.ndarray  # [3] 窗口均值
+
+
+@dataclass
+class AlignedBlock:
+    """对齐后的块数据：1 个 GNSS + N 个 IMU。"""
+    gnss: GnssSolution
+    imu_list: List[ImuMeasurement]
 
 
 @dataclass
