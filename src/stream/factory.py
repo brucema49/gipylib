@@ -17,14 +17,19 @@ class SensorFactory:
                        gnss_queue: Queue,
                        control: ThreadControl) -> List[BaseSensor]:
         sensors: List[BaseSensor] = []
+        gnss_source = config["gnss"]["gnss_source"]
+        ins_enabled = config["ins"]["enabled"]
 
-        # IMU
-        imu_path = config["ins"]["imu_data_path"]
-        sensors.append(ImuSensor(imu_path, imu_queue, control))
-
-        # GNSS（仅 external 模式，由 config_loader 保证）
-        if config["gnss"]["gnss_source"] == "external":
+        if gnss_source == "external":
+            # external + ins.enabled=on: IMU + 外部 GNSS 结果
+            imu_path = config["ins"]["imu_data_path"]
+            sensors.append(ImuSensor(imu_path, imu_queue, control))
             gnss_path = config["gnss"]["external_sol_path"]
             sensors.append(GnssSolSensor(gnss_path, gnss_queue, control))
+        elif gnss_source == "internal" and ins_enabled == "off":
+            # internal + off: 纯 GNSS，仅 InternalGnssSensor，无 IMU
+            from src.stream.internal_gnss_sensor import InternalGnssSensor
+            sensors.append(InternalGnssSensor(config, gnss_queue, control))
+        # internal + on 已由 config_loader 抛 NotImplementedError
 
         return sensors
