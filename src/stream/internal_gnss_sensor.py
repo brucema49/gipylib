@@ -3,12 +3,15 @@
 逐历元调用 rtklib-py 的 pntpos/relpos，把 GnssSolution 推入 gnss_queue。
 文件读完后推入 None 作为 EOF sentinel。
 """
+import tempfile
+from pathlib import Path
 from queue import Queue
 from threading import Thread
 
 from src.core.thread_control import ThreadControl
 from src.core.data_types import SensorData
 from src.core.gnss.rtklib_config_adapter import RtklibEnv
+from src.utility.rinex_simplifier import needs_simplification, simplify_rinex
 
 
 class InternalGnssSensor(Thread):
@@ -24,14 +27,32 @@ class InternalGnssSensor(Thread):
         self.gnss_cfg = config["gnss"]
         self.output_queue = output_queue
         self.control = control
+        self._temp_files = []  # 临时简化文件，待清理
 
     def run(self):
         try:
             self._run_impl()
-        except Exception:
-            pass
         finally:
+            # 清理临时简化文件
+            for p in self._temp_files:
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except Exception:
+                    pass
             self.output_queue.put(None)  # EOF sentinel
+
+    def _prepare_rinex(self, path: str) -> str:
+        """如需简化则生成临时简化文件，返回可用路径。"""
+        if not needs_simplification(path):
+            return path
+        suffix = Path(path).suffix
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=suffix, delete=False, encoding="utf-8"
+        )
+        tmp.close()
+        simplify_rinex(path, tmp.name)
+        self._temp_files.append(tmp.name)
+        return tmp.name
 
     def _run_impl(self):
         # 1. 初始化 rtklib 环境 + nav
@@ -39,21 +60,25 @@ class InternalGnssSensor(Thread):
         env.setup()
         nav = env.init_nav()
 
-        # 2. 加载流动站观测值 + 星历（延迟导入 rinex）
+        # 2. 准备 RINEX 文件（必要时简化）
+        rover_path = self._prepare_rinex(self.gnss_cfg["rover_path"])
+
+        # 3. 加载流动站观测值 + 星历（延迟导入 rinex）
         import rinex as rn
         rov = rn.rnx_decode(env.get_cfg())
-        rov.decode_obsfile(nav, self.gnss_cfg["rover_path"], None)
+        rov.decode_obsfile(nav, rover_path, None)
         rov.decode_nav(self.gnss_cfg["eph_path"], nav)
 
-        # 3. RTK 模式加载基站
+        # 4. RTK 模式加载基站
         base = None
         if self.gnss_cfg.get("positioning_mode") == "rtk":
+            base_path = self._prepare_rinex(self.gnss_cfg["base_path"])
             base = rn.rnx_decode(env.get_cfg())
-            base.decode_obsfile(nav, self.gnss_cfg["base_path"], None)
+            base.decode_obsfile(nav, base_path, None)
             if nav.rb[0] == 0:
                 nav.rb = base.pos
 
-        # 4. 创建处理器并运行（延迟导入，需 RtklibEnv.setup() 先完成）
+        # 5. 创建处理器并运行（延迟导入，需 RtklibEnv.setup() 先完成）
         mode = self.gnss_cfg["positioning_mode"]
         if mode == "spp":
             from src.core.gnss.spp_processor import SppProcessor

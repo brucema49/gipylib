@@ -33,6 +33,11 @@ class RtkProcessor(GnssProcessor):
         # 首历元或 sol.rr[0]==0 时先 pntpos 取初值
         if self.nav.use_sing_pos or self.sol.stat == SOLQ_NONE or self.sol.rr[0] == 0.0:
             self.sol = self._pntpos(obsr, self.nav)
+            # 用 SPP 解初始化 nav.x，供 relpos 的 zdres 计算流动站位置。
+            # rtklib-py 的 rtkpos() 用 cfg.rr_f 初始化 nav.x；当 rr_f=0 时
+            # nav.x 保持 [0,0,0]，导致 relpos 残差异常全部被剔除。
+            self.nav.x[0:6] = self.sol.rr[0:6]
+            self.nav.x[6:9] = 1e-6  # match RTKLIB
         else:
             self.sol = self._Sol()
 

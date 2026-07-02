@@ -29,61 +29,76 @@ def _get_constellation_map():
     return _CONSTELLATION_MAP
 
 
+def _f(v):
+    """强制转 float（YAML 可能将科学计数法解析为 str）。"""
+    return float(v)
+
+
+def _i(v):
+    """强制转 int。"""
+    return int(v)
+
+
+def _fv(lst):
+    """列表 → float 列表。"""
+    return [float(x) for x in lst]
+
+
 def build_cfg_module(gnss_cfg: dict) -> types.ModuleType:
     """把 YAML gnss: 段翻译成 rtklib-py 期望的 cfg 模块对象。"""
     cfg = types.ModuleType("__ppk_config")
 
-    cfg.nf = gnss_cfg["nf"]
+    cfg.nf = _i(gnss_cfg["nf"])
     cfg.pmode = gnss_cfg["pmode"]
     cfg.filtertype = gnss_cfg["filtertype"]
     cfg.use_sing_pos = gnss_cfg["use_sing_pos"]
-    cfg.elmin = gnss_cfg["elmin"]
-    cfg.cnr_min = gnss_cfg["cnr_min"]
+    cfg.elmin = _f(gnss_cfg["elmin"])
+    cfg.cnr_min = _fv(gnss_cfg["cnr_min"])
     cfg.excsats = gnss_cfg["excsats"]
-    cfg.maxinno = gnss_cfg["maxinno"]
-    cfg.maxcode = gnss_cfg["maxcode"]
-    cfg.maxage = gnss_cfg["maxage"]
-    cfg.maxout = gnss_cfg["maxout"]
-    cfg.thresdop = gnss_cfg["thresdop"]
-    cfg.thresslip = gnss_cfg["thresslip"]
+    cfg.maxinno = _f(gnss_cfg["maxinno"])
+    cfg.maxcode = _f(gnss_cfg["maxcode"])
+    cfg.maxage = _f(gnss_cfg["maxage"])
+    cfg.maxout = _i(gnss_cfg["maxout"])
+    cfg.thresdop = _f(gnss_cfg["thresdop"])
+    cfg.thresslip = _f(gnss_cfg["thresslip"])
     cfg.interp_base = gnss_cfg["interp_base"]
-    cfg.eratio = gnss_cfg["eratio"]
-    cfg.snrmax = gnss_cfg["snrmax"]
-    cfg.accelh = gnss_cfg["accelh"]
-    cfg.accelv = gnss_cfg["accelv"]
-    cfg.prnbias = gnss_cfg["prnbias"]
-    cfg.sig_p0 = gnss_cfg["sig_p0"]
-    cfg.sig_v0 = gnss_cfg["sig_v0"]
-    cfg.sig_n0 = gnss_cfg["sig_n0"]
-    cfg.armode = gnss_cfg["armode"]
-    cfg.thresar = gnss_cfg["thresar"]
-    cfg.thresar1 = gnss_cfg["thresar1"]
-    cfg.minlock = gnss_cfg.get("minlock", 0)
-    cfg.glo_hwbias = gnss_cfg["glo_hwbias"]
-    cfg.elmaskar = gnss_cfg["elmaskar"]
-    cfg.var_holdamb = gnss_cfg["var_holdamb"]
-    cfg.minfix = gnss_cfg["minfix"]
-    cfg.minfixsats = gnss_cfg["minfixsats"]
-    cfg.minholdsats = gnss_cfg["minholdsats"]
-    cfg.mindropsats = gnss_cfg["mindropsats"]
-    cfg.sing_p0 = gnss_cfg["sing_p0"]
-    cfg.sing_v0 = gnss_cfg["sing_v0"]
-    cfg.sing_elmin = gnss_cfg["sing_elmin"]
-    cfg.freq = gnss_cfg["freq_table"]
-    cfg.dfreq_glo = gnss_cfg["dfreq_glo"]
-    cfg.rb = gnss_cfg["rb"]
-    cfg.rr_f = gnss_cfg["rr_f"]
-    cfg.rr_b = gnss_cfg["rr_b"]
+    cfg.eratio = _fv(gnss_cfg["eratio"])
+    cfg.snrmax = _f(gnss_cfg["snrmax"])
+    cfg.accelh = _f(gnss_cfg["accelh"])
+    cfg.accelv = _f(gnss_cfg["accelv"])
+    cfg.prnbias = _f(gnss_cfg["prnbias"])
+    cfg.sig_p0 = _f(gnss_cfg["sig_p0"])
+    cfg.sig_v0 = _f(gnss_cfg["sig_v0"])
+    cfg.sig_n0 = _f(gnss_cfg["sig_n0"])
+    cfg.armode = _i(gnss_cfg["armode"])
+    cfg.thresar = _f(gnss_cfg["thresar"])
+    cfg.thresar1 = _f(gnss_cfg["thresar1"])
+    cfg.minlock = _i(gnss_cfg.get("minlock", 0))
+    cfg.glo_hwbias = _f(gnss_cfg["glo_hwbias"])
+    cfg.elmaskar = _f(gnss_cfg["elmaskar"])
+    cfg.var_holdamb = _f(gnss_cfg["var_holdamb"])
+    cfg.minfix = _i(gnss_cfg["minfix"])
+    cfg.minfixsats = _i(gnss_cfg["minfixsats"])
+    cfg.minholdsats = _i(gnss_cfg["minholdsats"])
+    cfg.mindropsats = _i(gnss_cfg["mindropsats"])
+    cfg.sing_p0 = _f(gnss_cfg["sing_p0"])
+    cfg.sing_v0 = _f(gnss_cfg["sing_v0"])
+    cfg.sing_elmin = _f(gnss_cfg["sing_elmin"])
+    cfg.freq = _fv(gnss_cfg["freq_table"])
+    cfg.dfreq_glo = _fv(gnss_cfg["dfreq_glo"])
+    cfg.rb = _fv(gnss_cfg["rb"])
+    cfg.rr_f = _fv(gnss_cfg["rr_f"])
+    cfg.rr_b = _fv(gnss_cfg["rr_b"])
 
     # err 数组: [_, base, el, bl, snr, rcvstd, satclk]
     cfg.err = [
         0,
-        gnss_cfg["err_base"],
-        gnss_cfg["err_el"],
+        _f(gnss_cfg["err_base"]),
+        _f(gnss_cfg["err_el"]),
         0.0,
         0,
         0,
-        gnss_cfg["err_satclk"],
+        _f(gnss_cfg["err_satclk"]),
     ]
 
     cmap = _get_constellation_map()
@@ -94,12 +109,25 @@ def build_cfg_module(gnss_cfg: dict) -> types.ModuleType:
         ("GAL", gnss_cfg["efact_gal"]),
     ]:
         if sat_str in cmap:
-            cfg.efact[cmap[sat_str]] = val
+            cfg.efact[cmap[sat_str]] = _f(val)
 
     cfg.gnss_t = [cmap[s] for s in gnss_cfg["gnss_t"] if s in cmap]
 
-    cfg.freq_ix0 = {cmap[k]: v for k, v in gnss_cfg["freq_ix0"].items() if k in cmap}
-    cfg.freq_ix1 = {cmap[k]: v for k, v in gnss_cfg["freq_ix1"].items() if k in cmap}
+    cfg.freq_ix0 = {cmap[k]: _i(v) for k, v in gnss_cfg["freq_ix0"].items() if k in cmap}
+    cfg.freq_ix1 = {cmap[k]: _i(v) for k, v in gnss_cfg["freq_ix1"].items() if k in cmap}
+
+    # rtklib-py 的 rnx_decode 需要信号查找表与跳过表。
+    # sig_tbl: rtklib-py 标准信号查找表。
+    # skip_sig_tbl: 由 RINEX 简化器（rinex_simplifier）在解码前限制为 2 频点，
+    #               因此这里默认不跳过任何信号。
+    from rtkcmn import rSIG
+    cfg.sig_tbl = {
+        "1C": rSIG.L1C, "1X": rSIG.L1X, "1W": rSIG.L1W,
+        "2W": rSIG.L2W, "2C": rSIG.L2C, "2X": rSIG.L2X,
+        "5Q": rSIG.L5Q, "5X": rSIG.L5X, "7Q": rSIG.L7Q,
+        "7X": rSIG.L7X,
+    }
+    cfg.skip_sig_tbl = {sat_enum: [] for sat_enum in cmap.values()}
 
     return cfg
 
@@ -131,6 +159,13 @@ class RtklibEnv:
         self._cfg_module = build_cfg_module(self.gnss_cfg)
         sys.modules["__ppk_config"] = self._cfg_module
         self._injected = True
+
+        # rtklib-py 的 trace() 引用模块级 trace_level 变量，但该变量仅在
+        # 调用 tracelevel() 后才存在。这里调用一次以初始化（设为 0 关闭日志），
+        # 否则 pntpos/relpos 首次调用会抛 NameError。
+        import rtkcmn as _gn
+        if not hasattr(_gn, "trace_level"):
+            _gn.tracelevel(0)
 
     def get_cfg(self):
         """返回 cfg 模块对象（setup 后可用）。"""
