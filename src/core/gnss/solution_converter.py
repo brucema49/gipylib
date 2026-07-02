@@ -21,8 +21,11 @@ def sol_to_gnss_solution(sol) -> Optional[GnssSolution]:
     if sol.stat == SOLQ_NONE:
         return None
 
+    # rtklib-py 的 gtime_t.time 是 Unix 秒（从 1970-01-01 起算），
+    # 需减去 GPST epoch（1980-01-06 = Unix 315964800s）才能算 GPS 周/周内秒
     SECONDS_PER_WEEK = 604800
-    total_sec = sol.t.time + sol.t.sec
+    GPST_EPOCH_UNIX = 315964800  # 1980-01-06 00:00:00 UTC 的 Unix 时间戳
+    total_sec = sol.t.time + sol.t.sec - GPST_EPOCH_UNIX
     week = int(total_sec // SECONDS_PER_WEEK)
     sow = total_sec - week * SECONDS_PER_WEEK
 

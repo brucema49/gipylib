@@ -60,8 +60,9 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
     if gnss_source == "internal" and ins_enabled == "off":
         # 路径 B: 纯 GNSS .pos 输出
         sensors = SensorFactory.create_sensors(config, imu_queue, gnss_queue, control)
+        filename = config["output"].get("solution_filename", "solution.pos")
         writer = SolutionWriter(output_dir=config["output"]["output_dir"],
-                                filename="solution.pos")
+                                filename=filename)
         logger = SolutionLogger(gnss_queue, writer, control)
         return sensors, logger
 

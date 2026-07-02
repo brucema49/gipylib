@@ -3,7 +3,7 @@ from typing import Optional
 
 from src.core.data_types import GnssSolution
 from src.core.gnss.gnss_processor import GnssProcessor
-from src.core.gnss.solution_converter import sol_to_gnss_solution
+from src.core.gnss.solution_converter import sol_to_gnss_solution, SOLQ_NONE
 
 
 class SppProcessor(GnssProcessor):
@@ -22,4 +22,8 @@ class SppProcessor(GnssProcessor):
     def process_epoch(self, obsr, obsb=None) -> Optional[GnssSolution]:
         """调用 pntpos 解算单历元 SPP。"""
         sol = self._pntpos(obsr, self.nav)
+        # rtklib-py 的 pntpos 不写 sol.ns，用本历元观测卫星数近似
+        # (含仰角/CNR 排除的卫星，但比 0 更接近真实)
+        if sol.stat != SOLQ_NONE and sol.ns == 0:
+            sol.ns = len(obsr.sat)
         return sol_to_gnss_solution(sol)
