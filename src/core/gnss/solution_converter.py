@@ -30,7 +30,8 @@ def sol_to_gnss_solution(sol) -> Optional[GnssSolution]:
     sow = total_sec - week * SECONDS_PER_WEEK
 
     position = np.array(sol.rr[0:3], dtype=float)
-    sd = np.sqrt(np.abs(np.diag(sol.qr[0:3, 0:3])))
+    qr3 = np.array(sol.qr[0:3, 0:3], dtype=float)
+    sd = np.sqrt(np.abs(np.diag(qr3)))
 
     return GnssSolution(
         timestamp=sow,
@@ -39,4 +40,5 @@ def sol_to_gnss_solution(sol) -> Optional[GnssSolution]:
         quality=int(sol.stat),
         num_sv=int(sol.ns),
         sd=sd,
+        cov=qr3,
     )

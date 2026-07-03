@@ -74,14 +74,21 @@ class SolutionWriter(WriterBase):
 
         llh = ecef2llh(sol.position)
         R = ecef2enu_matrix(llh)
-        cov_ecef = np.diag(sol.sd ** 2)
+        # 优先使用完整 3x3 ECEF 协方差（含非对角项），与 rtklib-py covenu 一致
+        # 回退到 diag(sd**2) 仅对角线（兼容旧 GnssSolution 无 cov 字段的情况）
+        if sol.cov is not None:
+            cov_ecef = sol.cov
+        else:
+            cov_ecef = np.diag(sol.sd ** 2)
         cov_enu = R @ cov_ecef @ R.T
-        sdn = np.sqrt(abs(cov_enu[0, 0]))
-        sde = np.sqrt(abs(cov_enu[1, 1]))
+        # ENU 协方差矩阵: [0,0]=E, [1,1]=N, [2,2]=U (与 rtklib-py xyz2enu 一致)
+        # 输出顺序对齐 rtklib-py postpos.savesol: sdn=N, sde=E, sdu=U, sdne=EN, sdeu=UE, sdun=NU
+        sdn = np.sqrt(abs(cov_enu[1, 1]))
+        sde = np.sqrt(abs(cov_enu[0, 0]))
         sdu = np.sqrt(abs(cov_enu[2, 2]))
         sdne = np.sqrt(abs(cov_enu[0, 1])) * np.sign(cov_enu[0, 1])
-        sdeu = np.sqrt(abs(cov_enu[1, 2])) * np.sign(cov_enu[1, 2])
-        sdun = np.sqrt(abs(cov_enu[2, 0])) * np.sign(cov_enu[2, 0])
+        sdeu = np.sqrt(abs(cov_enu[2, 0])) * np.sign(cov_enu[2, 0])
+        sdun = np.sqrt(abs(cov_enu[1, 2])) * np.sign(cov_enu[1, 2])
 
         D2R = np.pi / 180.0
         fmt = (

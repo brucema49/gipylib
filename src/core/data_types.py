@@ -23,6 +23,7 @@ class GnssSolution:
     quality: int              # 1=SPP, 2=RTD, 5=LC
     num_sv: int
     sd: np.ndarray            # [3] 位置标准差 (sdx, sdy, sdz)
+    cov: Optional[np.ndarray] = None  # [3,3] ECEF 协方差矩阵（可选，含非对角项）
 
 
 @dataclass
