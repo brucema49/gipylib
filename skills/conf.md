@@ -1,16 +1,25 @@
 # 配置文件说明
 
 > 定义 GInsStream 统一定位解算配置文件的格式、字段与默认值。
-> 配置文件采用 YAML 格式，存放于 `data/config.yaml`。
+> 配置文件采用 YAML 格式，存放于 `data/config.yaml`（测试样例：`data/cfg_test_spp.yaml`、`data/cfg_test_rtk.yaml`）。
 >
 > **配置来源约定**：
-> - **GNSS 部分配置项**：参考 `library/rtklib-py` 项目的 `config_phone.py` / `config_f9p.py` / `__ppk_config.py`
+> - **GNSS 部分配置项**：参考 rtklib-py 的 `config_phone.py` / `config_f9p.py` / `__ppk_config.py`
+>   （rtklib-py 已吸收到 `src/core/gnss/rtklib/`，配置通过 `src/core/gnss/rtklib_config_adapter.py` 注入）
 > - **组合导航部分配置项**：参考 `tools/gnss_ins_lc_nhc` 项目的 `config/configure.ini`
 > - **文件格式**：仿照 `tools/KF-GINS/config/kf-gins.yaml` 的中英双语注释 YAML 风格
 >
-> **时间系统约定**：全框架统一使用 GPS 秒（GPST，since 1980-01-06），不使用 Unix epoch 或本地时间。
+> **时间系统约定**：全框架内部统一使用 **Unix 时间戳（float 秒，与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）**。
+> 输入端（`src/stream/formators.py`）将 GPS 周+周内秒通过 `gpst_to_unix()` 转为 Unix 时间戳；
+> 输出端（`src/log/solution_writer.py` / `aligned_writer.py`）通过 `unix_to_gpst()` 转回 (week, sow) 写文件。
+> 时间转换工具位于 `src/core/time_utils.py`，常量 `GPST_EPOCH_UNIX = 315964800`。
 >
-> **双滤波架构对应**：
+> **当前项目状态**：
+> - ✅ 已实现：内部 GNSS 模式（SPP/RTK，`gnss_source: "internal"` + `ins.enabled: "off"`）→ 输出 `.pos` 文件
+> - ✅ 已实现：外部 GNSS 模式（`gnss_source: "external"` + `ins.enabled: "on"`）→ 输出对齐块状 CSV
+> - 🚧 预留：`internal` + `ins.enabled: "on"`（INS 估计器未实现，由 `config_loader.py` 拦截抛 `NotImplementedError`）
+>
+> **双滤波架构对应**（INS 启用后的设计，当前未实现）：
 > - 主滤波 P1（E 系，15 维 = 位置3+速度3+姿态3+陀螺零偏3+加计零偏3；可选 +3 维 GNSS 杆臂 = 18 维）
 > - NHC 子滤波 P2（v 系，5 维 = IMU 安装角 2 + IMU 杆臂 3）
 > - NHC/ZUPT 互斥：静止时仅 ZUPT（3D，作用于 P1），运动时仅 NHC（H1 作用于 P1 + H2 作用于 P2）
@@ -75,19 +84,22 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 ## 2. 配置文件格式
 
 - 文件格式：YAML 1.1
-- 文件位置：`data/config.yaml`
+- 文件位置：`data/config.yaml`（测试样例：`data/cfg_test_spp.yaml`、`data/cfg_test_rtk.yaml`）
 - 注释风格：中英双语注释（参考 kf-gins.yaml）
 - 数组：使用 YAML 内联数组语法 `[a, b, c]` 或块状语法
 - 布尔值：`true` / `false`
 - 字符串：可加引号或不加引号（含特殊字符时建议加引号）
-- 时间单位：除特别说明外，时间戳使用 GPST 秒
+- 时间单位：除特别说明外，**内部时间戳使用 Unix 秒（与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）**；
+  YAML 配置文件中涉及时间字段的语义见各小节说明（如 `start_time` 为周内秒）
 
 ---
 
 ## 3. GNSS 配置项（参考 rtklib-py）
 
-> 以下配置项映射自 `library/rtklib-py` 的 `config_phone.py` / `config_f9p.py` / `__ppk_config.py`。
-> 命名保持与 rtklib-py 一便，便于算法移植与对照。
+> 以下配置项映射自 rtklib-py 的 `config_phone.py` / `config_f9p.py` / `__ppk_config.py`。
+> rtklib-py 已吸收到 `src/core/gnss/rtklib/`，配置通过 `src/core/gnss/rtklib_config_adapter.py::build_params()`
+> 翻译为 params dict，由 `config.set_params()` 注入 `_CfgProxy` 单例（参考 `src/core/gnss/rtklib/config.py`）。
+> 命名保持与 rtklib-py 一致，便于算法移植与对照。
 
 ### 3.1 数据源与文件路径
 
@@ -377,6 +389,7 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `output_dir` | str | `"output"` | 输出目录 |
+| `solution_filename` | str | `"solution.pos"` | 内部模式输出 `.pos` 文件名（如 `test_spp.pos`、`test_rtk.pos`） |
 | `solution_format` | str | `"pos"` | 解算结果格式：`pos` / `csv` / `nmea` |
 | `trace_level` | int | `1` | 轨迹输出级别：0=无 / 1=基本 / 2=详细 / 3=调试 |
 | `log_raw_data` | bool | `false` | 是否记录原始数据到 raw/ |
@@ -426,6 +439,9 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 | `data/cpt_euroc.csv` | EuRoC 格式 | EuRoC 格式的 IMU 文件 |
 | `data/cpt_imu.csv` | ADIS 格式 | ADIS 格式的 IMU 文件，逗号和空格都可以做分隔符 |
 
+> IMU 文件解码由 `src/stream/formators.py::ImuFormator` 实现，列格式：`week,sow,gx,gy,gz,ax,ay,az`。
+> 解码时通过 `gpst_to_unix(week, sow)` 转为 Unix 时间戳。
+
 ### 7.2 GNSS 观测值文件
 
 | 文件 | 格式 | 说明 |
@@ -434,22 +450,32 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 | `data/cpt0870_base.19o` | RINEX | 基站观测值文件 |
 | `data/brdm0870.19p` | RINEX | 星历文件（广播星历） |
 
+> RINEX 解码由 `src/core/gnss/rtklib/rinex.py::rnx_decode` 实现（吸收自 rtklib-py）。
+> 必要时由 `src/utility/rinex_simplifier.py` 简化为 2 频点。
+
 ### 7.3 GNSS 定位结果文件
 
 | 文件 | 格式 | 说明 |
 |------|------|------|
 | `data/spp.pos` | POS | GNSS 定位结果文件（外部模式输入） |
 
-> 其他格式的定位结果文件（NMEA/CSV）参考 `library/rtklib-py` 的定位结果输出文档。
-> 观测值文件和定位结果文件的格式不统一，详细参考 `library/rtklib-py` 的文档。
+> 外部 POS 文件解码由 `src/stream/formators.py::PosSolFormator` 实现，
+> 时间字段（`yyyy/mm/dd hh:mm:ss.s`）通过 `ymdhms_to_gpst()` → `gpst_to_unix()` 转为 Unix 时间戳。
+> 其他格式的定位结果文件（NMEA/CSV）当前未实现，仅支持 POS 格式（参考 `src/utility/config_loader.py::SUPPORTED_EXTERNAL_FORMATS`）。
 
 ### 7.4 输出文件
 
 | 文件 | 格式 | 内容 | 必须 |
 |------|------|------|------|
-| `output/solution.pos` | POS | 解算结果（位置、精度） | 是 |
-| `output/solution.csv` | CSV | 解算结果（完整状态） | 可选 |
-| `output/solution.nmea` | NMEA | NMEA 格式 | 可选 |
-| `output/trace.txt` | 文本 | 运行轨迹/调试信息 | 可选 |
-| `output/raw/imu_raw.csv` | CSV | IMU 原始数据 | 可选 |
-| `output/raw/rover_raw.csv` | CSV | 流动站原始数据（内部模式） | 可选 |
+| `output/test_spp.pos` / `output/test_rtk.pos` | POS | 内部模式解算结果（SPP/RTK），由 `src/log/solution_writer.py::SolutionWriter` 输出 | 是（internal 模式） |
+| `output/aligned.csv` | CSV | 外部模式对齐块状输出（G + N 行 I），由 `src/log/aligned_writer.py::AlignedWriter` 输出 | 是（external 模式） |
+| `output/solution.csv` | CSV | 解算结果（完整状态） | 可选（未实现） |
+| `output/solution.nmea` | NMEA | NMEA 格式 | 可选（未实现） |
+| `output/trace.txt` | 文本 | 运行轨迹/调试信息 | 可选（未实现） |
+| `output/raw/imu_raw.csv` | CSV | IMU 原始数据 | 可选（未实现） |
+| `output/raw/rover_raw.csv` | CSV | 流动站原始数据（内部模式） | 可选（未实现） |
+
+> 内部模式（`internal` + `ins.enabled: "off"`）主入口：`src/main.py` → `SolutionLogger` + `SolutionWriter`，
+> 输出 `.pos` 文件，文件名由 `output.solution_filename` 指定（如 `test_spp.pos`、`test_rtk.pos`）。
+> 外部模式（`external` + `ins.enabled: "on"`）主入口：`src/main.py` → `Logger` + `AlignedWriter` + `Aligner`，
+> 输出对齐块状 CSV，文件名默认 `aligned.csv`。

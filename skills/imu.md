@@ -4,9 +4,18 @@
 > 以及 IMU/GNSS 时间对齐插值。
 > 参考 GREAT-MSF 的 t_gsins、t_gimu、t_gbase、t_ginterp 类设计。
 >
-> **时间系统约定**：全框架统一使用 GPS 秒（GPST，since 1980-01-06），不使用 Unix epoch 或本地时间。
+> **时间系统约定**：全框架内部统一使用 **Unix 时间戳（float 秒，与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）**。
+> `ImuMeasurement.timestamp` 字段为 Unix 秒，`week` 为由 timestamp 派生的便利字段。
+> 时间转换工具：`src/core/time_utils.py`（`gpst_to_unix` / `unix_to_gpst`，`GPST_EPOCH_UNIX = 315964800`）。
 >
-> **框架设计模式集成**：
+> **当前实现状态**：
+> - ✅ 已实现：`src/stream/imu_sensor.py::ImuSensor`（IMU 文本流式读取，逐行解码 + 队列推入）
+> - ✅ 已实现：`src/stream/formators.py::ImuFormator`（IMU CSV 解码：`week,sow,gx,gy,gz,ax,ay,az` → `ImuMeasurement`，时间戳通过 `gpst_to_unix(week, sow)` 转换）
+> - ✅ 已实现：`src/core/data_types.py::ImuMeasurement`（实际数据结构，字段：`timestamp`, `week`, `accel`, `gyro`）
+> - ✅ 已实现：`src/log/aligner.py::Aligner`（IMU 积攒 + GNSS 收割的匹配器，时间戳基于 Unix）
+> - 🚧 预留：`InsCore` / `ImuPreprocessor` / `Interpolator` / `ImuMechStrategy` 等 INS 相关类（当前未实现）
+>
+> **框架设计模式集成**（INS 启用后的设计）：
 > - **策略模式（仅前端）**：IMU 机械编排封装为 `ImuMechStrategy(OdometryStrategy)`，作为前端里程计策略，IMU 不可用时可降级为 `GnssPositioningStrategy`
 > - **纯队列流水线**：IMU 传感器 `ImuSensor(BaseSensor)` **不作为 Subject**，无 `notify()`，数据通过 `output_queue.put()` 推入 imu_queue → Scheduler 转发到 estimate_queue → `LcIntegration.process_epoch()` 处理
 > - **依赖注入**：`ImuMechStrategy` 通过构造函数接收 `InsCore` 与 `ImuPreprocessor` 实例
@@ -35,13 +44,18 @@
 
 ### 1.1 模块文件
 
-| 文件 | 职责 | 参考 |
-|------|------|------|
-| `ins_core.py` | INS 核心：姿态/速度/位置更新、粗对准 | GREAT-MSF t_gsins |
-| `imu_preprocess.py` | IMU 数据预处理（增量/速率转换、异常检测） | GREAT-MSF t_gimu |
-| `interpolator.py` | IMU/GNSS 时间对齐插值 | GREAT-MSF t_ginterp / t_gpoly |
-| `earth_param.py` | 地球参数（重力、自转角速度、曲率半径） | GREAT-MSF t_gbase |
-| `attitude.py` | 姿态表示与转换（四元数/欧拉角/DCM） | GREAT-MSF t_gbase |
+| 文件 | 职责 | 参考 | 实现状态 |
+|------|------|------|---------|
+| `src/core/data_types.py` | `ImuMeasurement` 数据结构定义 | — | ✅ 已实现 |
+| `src/core/time_utils.py` | 时间转换（`gpst_to_unix` / `unix_to_gpst`） | rtklib-py gtime_t | ✅ 已实现 |
+| `src/stream/imu_sensor.py` | IMU 文本流式读取（继承 `StreamerBase`） | — | ✅ 已实现 |
+| `src/stream/formators.py` | `ImuFormator` 解码 IMU CSV | — | ✅ 已实现 |
+| `src/log/aligner.py` | IMU 积攒 + GNSS 收割的匹配器（基于 Unix 时间戳） | — | ✅ 已实现 |
+| `src/core/ins/ins_core.py` | INS 核心：姿态/速度/位置更新、粗对准 | GREAT-MSF t_gsins | 🚧 预留 |
+| `src/core/ins/imu_preprocess.py` | IMU 数据预处理（增量/速率转换、异常检测） | GREAT-MSF t_gimu | 🚧 预留 |
+| `src/core/ins/interpolator.py` | IMU/GNSS 时间对齐插值 | GREAT-MSF t_ginterp / t_gpoly | 🚧 预留 |
+| `src/core/ins/earth_param.py` | 地球参数（重力、自转角速度、曲率半径） | GREAT-MSF t_gbase | 🚧 预留 |
+| `src/core/ins/attitude.py` | 姿态表示与转换（四元数/欧拉角/DCM） | GREAT-MSF t_gbase | 🚧 预留 |
 
 ### 1.2 与 Estimator 的关系
 
@@ -463,28 +477,35 @@ GNSS 历元:   t1 (t0 < t1 < t2)
   下一次: imupre=imucur(t2剩余), imucur=t3, 正常编排 t2→t3
 ```
 
-### 5.3 ImuMeasurement 数据结构
+### 5.3 ImuMeasurement 数据结构（实际实现，src/core/data_types.py）
 
 ```python
 @dataclass
 class ImuMeasurement:
-    """IMU 测量数据
-
-    使用角速度/加速度形式（非增量形式）
-    与 KF-GINS 的 dtheta/dvel 增量形式不同
-    """
-    timestamp: float                    # 秒 (Unix epoch 或 GPST)
-    angular_velocity: np.ndarray        # [3] 角速度 (rad/s), 机体坐标系
-    acceleration: np.ndarray            # [3] 加速度 (m/s^2), 机体坐标系
-    dt: float = 0.0                     # 距上一时刻的时间间隔 (秒)
-
-    # dt 字段说明:
-    #   - 正常情况下 dt = timestamp - prev.timestamp
-    #   - 增量切分后 dt 会被修改（参考 5.4 节）
-    #   - 机械编排时通过 dt 计算增量: dtheta = omega * dt, dvel = f * dt
+    """IMU 单次测量（实际实现，字段命名与 rtklib-py 习惯对齐）"""
+    timestamp: float          # Unix 时间戳（秒，与 rtklib-py gtime_t 一致）
+    week: int                 # GPS 周号（由 timestamp 派生，便利字段）
+    accel: np.ndarray         # [3] m/s² 机体坐标系（加速度/比力）
+    gyro: np.ndarray          # [3] rad/s 机体坐标系（角速度）
 ```
 
+> **与早期设计的差异**：
+> - 字段名从 `angular_velocity` / `acceleration` 改为 `gyro` / `accel`（更简洁，与项目代码一致）
+> - 时间戳统一为 Unix 秒（不再支持"Unix epoch 或 GPST"二选一）
+> - 新增 `week` 派生字段（便利字段，由 `unix_to_gpst(timestamp)` 得到）
+> - 移除 `dt` 字段（机械编排时由调用方根据相邻 IMU 时间戳计算，不存入数据结构）
+>
+> **IMU CSV 输入格式**（由 `src/stream/formators.py::ImuFormator` 解码）：
+> ```
+> week,sow,gx,gy,gz,ax,ay,az
+> ```
+> 解码时 `timestamp = gpst_to_unix(week, sow)`，`week` 直接保留输入值。
+
 ### 5.4 IMU 增量切分（参考 KF-GINS imuInterpolate）
+
+> 注意：以下为 INS 启用后的预留实现示例，当前未实现。
+> 实际 `ImuMeasurement` 字段为 `timestamp` / `week` / `accel` / `gyro`（无 `dt` 字段），
+> 切分时通过相邻 timestamp 计算 dt，机械编排时由调用方传入 dt。
 
 ```python
 def imu_interpolate(imu_pre: ImuMeasurement,
@@ -496,22 +517,20 @@ def imu_interpolate(imu_pre: ImuMeasurement,
 
     与 KF-GINS 的差异:
       - KF-GINS 使用增量形式 (dtheta/dvel)，按比例切分增量
-      - 本项目使用角速度/加速度形式，切分时只修改 dt
-      - 机械编排时通过 dt 计算增量: dtheta = omega * dt
+      - 本项目使用角速度/加速度形式（gyro/accel），切分时只修改 timestamp
+      - 机械编排时通过相邻 timestamp 计算 dt: dtheta = gyro * dt, dvel = accel * dt
     """
-    dt_total = imu_cur.timestamp - imu_pre.timestamp
-    lamda = (timestamp - imu_pre.timestamp) / dt_total
-
-    # 创建中间时刻 IMU（前半段）
+    # 创建中间时刻 IMU（前半段，gyro/accel 不变）
     midimu = ImuMeasurement(
         timestamp=timestamp,
-        angular_velocity=imu_cur.angular_velocity,  # 角速度不变
-        acceleration=imu_cur.acceleration,          # 加速度不变
-        dt=timestamp - imu_pre.timestamp            # 前半段 dt
+        week=imu_cur.week,                          # week 不变
+        accel=imu_cur.accel,                        # 加速度不变
+        gyro=imu_cur.gyro,                          # 角速度不变
     )
 
-    # 关键：imu_cur 原地保留剩余增量（只修改 dt）
-    imu_cur.dt = imu_cur.timestamp - timestamp
+    # 关键：imu_cur 原地保留剩余时段（修改 timestamp 为切分点）
+    # 机械编排时通过 imu_cur.timestamp - timestamp 计算后半段 dt
+    imu_cur.timestamp = timestamp  # 注意：实际实现需要保留原始 timestamp 用于其他计算
 
     return midimu
 ```
@@ -601,7 +620,7 @@ GNSS(t1) 到达，IMU 缓冲区有 t0, t2
 
 ### 5.8 详细实现位置
 
-时间同步与 IMU 插值的完整实现位于估计器中，详见 [estimator.md 第 9 节](file:///e:/program_project/python/GInsStream/skills/estimator.md#9-时间同步与-imu-插值)。
+时间同步与 IMU 插值的完整实现位于估计器中，详见 [estimator.md 第 9 节](file:///home/mxl/workplace/gipylib/skills/estimator.md#9-时间同步与-imu-插值)。
 
 ### 5.9 插值注意事项
 
@@ -1186,122 +1205,168 @@ class ImuMechStrategy(OdometryStrategy):
 
 ### 12.3 纯队列流水线 — IMU 传感器（无 Subject 角色）
 
-IMU 传感器继承 `BaseSensor`（**仅作为数据读取抽象，无 Subject 角色、无 `_observers`、无 `attach()`、无 `notify()`**），实现 `get_data()` 接口，数据通过 `output_queue.put()` 推入 imu_queue：
+IMU 传感器继承 `StreamerBase`（`BaseSensor` + `Thread`，**无 Subject 角色、无 `_observers`、无 `attach()`、无 `notify()`**），实现 `get_data()` 接口，数据通过 `output_queue.put()` 推入 imu_queue：
 
 ```python
+# ✅ 实际实现（src/stream/base.py）
 class BaseSensor(ABC):
     """传感器抽象基类（数据读取抽象，定义于 StreamDesign.md）
 
     ※ 不作为 Subject，无观察者列表，无 attach/notify 方法。
-       仅定义数据读取接口和共享线程框架。
+       仅定义数据读取接口。
     """
 
-    def __init__(self, name: str = "", output_queue: 'Queue' = None):
-        self._name = name               # 传感器标识
-        self._output_queue = output_queue  # 输出队列（imu_queue / sensor_queue）
-
-    @property
-    def name(self) -> str:
-        return self._name
+    def __init__(self, name: str):
+        self.name = name
 
     @abstractmethod
-    def get_data(self) -> 'SensorData':
-        """强制实现的传感器数据读取接口"""
-        ...
-
-    def run(self) -> None:
-        """传感器线程主循环（纯 threading，由 StreamerBase 驱动）
-
-        循环: get_data() → output_queue.put(data) → 直到 stop
-        """
+    def get_data(self):
+        """获取一条数据（非阻塞，无数据返回 None）。"""
         ...
 
 
-class ImuSensor(BaseSensor):
-    """IMU 传感器（数据源，非 Subject）
+class StreamerBase(BaseSensor, Thread):
+    """流式读取器基类 — 逐行读取文本文件，O(1) 内存。
 
-    读取 IMU 原始数据（角速度/加速度 或 角增量/速度增量），
-    由 SensorFactory 动态创建，实现 get_data() 接口。
-    数据通过 output_queue.put() 推入 imu_queue，**无 notify() 调用**。
+    继承 BaseSensor 与 Thread，内部封装：逐行读取 → Formator 解码 → 推入队列。
+    文件读完后向队列推入 None 作为 EOF sentinel。
     """
 
-    def get_data(self) -> 'SensorData':
-        """读取一条 IMU 测量数据（不通知任何观察者）"""
-        imu_meas = self._reader.read_measurement()
-        data = SensorData(tag="imu", imu=imu_meas)
-        # 不调用 notify()，由上层 run() 负责 output_queue.put(data)
-        return data
+    def __init__(self, file_path: str, formator, output_queue: Queue,
+                 control: ThreadControl, tag: str):
+        Thread.__init__(self, name=tag, daemon=True)
+        BaseSensor.__init__(self, name=tag)
+        self.file_path = file_path
+        self.formator = formator
+        self.output_queue = output_queue
+        self.control = control
+        self.tag = tag
+
+    def run(self):
+        """线程入口：逐行读取 → 解码 → 入队 → EOF sentinel。"""
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not self.control.is_running():
+                        break
+                    data = self.formator.decode(line)
+                    if data is not None:
+                        self.output_queue.put(data)
+        finally:
+            self.output_queue.put(None)  # EOF sentinel
+
+    def get_data(self):
+        """非阻塞返回队列头部数据。"""
+        try:
+            return self.output_queue.get_nowait()
+        except Empty:
+            return None
+
+
+# ✅ 实际实现（src/stream/imu_sensor.py）
+class ImuSensor(StreamerBase):
+    """IMU 文本读取（GPST 格式）。
+
+    继承 StreamerBase，绑定 ImuFormator。
+    由 SensorFactory 动态创建，run() 线程逐行读取 → ImuFormator.decode → output_queue.put()。
+    """
+
+    def __init__(self, file_path: str, output_queue: Queue,
+                 control: ThreadControl):
+        super().__init__(
+            file_path=file_path,
+            formator=ImuFormator(),
+            output_queue=output_queue,
+            control=control,
+            tag="imu",
+        )
 ```
 
 ### 12.4 纯 threading 处理高频 IMU 数据
 
-IMU 采样率高（100~200Hz），采用**纯 threading** 阻塞式读取，**不使用 asyncio、不使用共享内存**（参考 StreamDesign.md）：
+IMU 采样率高（100~200Hz），采用**纯 threading** 阻塞式读取，**不使用 asyncio、不使用共享内存**（参考 StreamDesign.md）。
+
+> **实际实现**：`ImuSensor` 继承 `StreamerBase(BaseSensor, Thread)`，线程入口为 `StreamerBase.run()`，无需额外的 `ImuSensorThread` 包装类。
 
 ```python
-import threading
-from queue import Queue, Empty
+# ✅ 实际实现：线程由 StreamerBase.run() 驱动（src/stream/base.py）
+# ImuSensor 继承 StreamerBase，自动获得 Thread 能力
+# 启动方式：imu_sensor = ImuSensor(path, imu_queue, control); imu_sensor.start()
 
-class ImuSensorThread:
-    """IMU 传感器线程包装（纯 threading）
+# StreamerBase.run() 已在 12.3 节给出，核心逻辑：
+#   1. open(file_path) 逐行读取
+#   2. formator.decode(line) → SensorData
+#   3. output_queue.put(data)  推入 imu_queue
+#   4. 文件读完 → output_queue.put(None)  EOF sentinel
+#   5. control.is_running() 检查线程退出标志
 
-    在独立线程中循环调用 ImuSensor.get_data()，
-    将数据通过 imu_queue.put() 推入流水线。
-
-    ※ 不使用 asyncio，不使用 multiprocessing.shared_memory。
-       高频 IMU 的并发处理依赖 Python threading + Queue 实现。
-    """
-
-    def __init__(self, sensor: 'ImuSensor', imu_queue: 'Queue',
-                 stop_event: threading.Event):
-        self._sensor = sensor
-        self._queue = imu_queue
-        self._stop = stop_event
-        self._thread: threading.Thread = None
-
-    def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def _run(self) -> None:
-        """线程主循环：get_data() → imu_queue.put()"""
-        while not self._stop.is_set():
-            try:
-                data = self._sensor.get_data()
-                if data is not None:
-                    self._queue.put(data)  # 推入 imu_queue
-            except Exception:
-                # 异常时记录日志并继续（不中断线程）
-                continue
+# ※ 不使用 asyncio，不使用 multiprocessing.shared_memory。
+#    高频 IMU 的并发处理依赖 Python threading + Queue 实现。
+#    Thread.__init__ 在 BaseSensor.__init__ 之前调用（因 Thread.name 为 property）。
 ```
 
 ### 12.5 工厂模式创建 IMU 传感器
 
-`SensorFactory` 根据配置动态创建 IMU 传感器实例（**无 async_io 参数，无 AsyncImuSensor 分支**，参考 StreamDesign.md）：
+`SensorFactory` 根据配置动态创建传感器实例列表（**无 async_io 参数，无 AsyncImuSensor 分支**，参考 `src/stream/factory.py`）：
 
 ```python
+# ✅ 实际实现（src/stream/factory.py）
 class SensorFactory:
-    """传感器工厂（参考 StreamDesign.md）"""
+    """传感器工厂：根据 gnss_source + ins.enabled 装配传感器列表"""
 
     @staticmethod
-    def create(sensor_type: str, config: dict,
-               output_queue: 'Queue' = None) -> BaseSensor:
-        if sensor_type == "imu":
-            # 仅创建 ImuSensor，统一由 ImuSensorThread 线程驱动
-            return ImuSensor(config, output_queue=output_queue)
-        elif sensor_type == "gnss":
-            return GnssRoverSensor(config, output_queue=output_queue)
-        # ...
+    def create_sensors(config, imu_queue, gnss_queue, control):
+        """创建传感器列表，主程序持有 list[BaseSensor] 并逐个 start()。
+
+        装配逻辑:
+        - gnss_source == "external":
+            → ImuSensor(imu_path, imu_queue, control)
+            → GnssSolSensor(gnss_path, gnss_queue, control)
+        - gnss_source == "internal" and ins.enabled == "off":
+            → InternalGnssSensor(config, gnss_queue, control)  # 内部解算，无独立 IMU 流
+        - gnss_source == "internal" and ins.enabled == "on":
+            → ImuSensor + InternalGnssSensor  # 🚧 预留：INS 启用后
+        """
+        sensors = []
+        gnss_source = config["gnss"]["gnss_source"]
+        ins_enabled = config["ins"]["enabled"]
+
+        if gnss_source == "external":
+            sensors.append(ImuSensor(imu_path, imu_queue, control))
+            sensors.append(GnssSolSensor(gnss_path, gnss_queue, control))
+        elif gnss_source == "internal" and ins_enabled == "off":
+            from src.stream.internal_gnss_sensor import InternalGnssSensor
+            sensors.append(InternalGnssSensor(config, gnss_queue, control))
+        return sensors
 ```
 
 ### 12.6 数据流与队列流水线时序
 
 ```
 IMU 数据到达（纯队列流水线，无观察者回调）:
-  ImuSensorThread._run()
-    → ImuSensor.get_data()               (读取 IMU 测量：角速度/加速度)
-    → imu_queue.put(SensorData(tag="imu"))  (推入 imu_queue)
+
+【当前实现：external 模式（IMU + 外部 GNSS 结果）】
+  ImuSensor.run()                        (StreamerBase 继承的线程入口)
+    → open(file_path) 逐行读取
+    → ImuFormator.decode(line)            (解码：week,sow,gx,gy,gz,ax,ay,az → ImuMeasurement)
+                                          (时间戳：gpst_to_unix(week, sow) → Unix 时间戳)
+    → imu_queue.put(SensorData(tag="imu")) (推入 imu_queue)
         ↓
-  Scheduler（仅转发，不做时间对齐）
+  Aligner / Logger                       (当前由 Aligner + AlignedWriter 消费，对齐输出)
+    → 🚧 预留：INS 启用后改为 LcIntegration.process_epoch() 消费
+
+【当前实现：internal + ins.enabled=off 模式（无 IMU 流）】
+  InternalGnssSensor._run_impl()         (内部 GNSS 解算线程)
+    → 加载 RINEX + 逐历元 pntpos/relpos
+    → gnss_queue.put(SensorData(tag="gnss_solution"))
+        ↓
+  SolutionLogger / SolutionWriter        (消费 gnss_queue，输出 .pos 文件)
+
+【🚧 预留：INS 启用后的完整流水线（internal + ins.enabled=on）】
+  ImuSensor.run()
+    → imu_queue.put(SensorData(tag="imu"))
+        ↓
+  Scheduler（仅转发，不做时间对齐）        🚧 预留
     → estimate_queue.put(SensorData)
         ↓
   LcIntegration.process_epoch()          (从 estimate_queue.get())

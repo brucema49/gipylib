@@ -4,9 +4,17 @@
 > 参考 GREAT-MSF 的 `t_gsinskf`（INS 卡尔曼滤波基类）和 `t_gintegration`（组合导航类）的继承模式。
 > 参考 gnss_ins_lc_nhc 的双滤波架构：E 系主滤波 + v 系 NHC 子滤波。
 >
-> **时间系统约定**：全框架统一使用 GPS 秒（GPST，since 1980-01-06）。
+> **时间系统约定**：全框架内部统一使用 **Unix 时间戳（float 秒，与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）**。
+> 时间对齐、状态传播、量测更新等所有时间相关计算均基于 Unix 时间戳。
+> 时间转换工具：`src/core/time_utils.py`（`gpst_to_unix` / `unix_to_gpst`，`GPST_EPOCH_UNIX = 315964800`）。
 >
-> **框架设计模式集成**：
+> **当前实现状态**：
+> - 🚧 整个 estimator 模块当前未实现（预留 INS 启用后开发）
+> - ✅ 已实现：GNSS 解算部分（`SppProcessor` / `RtkProcessor`），可独立运行输出 `.pos` 文件
+> - ✅ 已实现：外部 GNSS 结果对齐输出（`Aligner` + `AlignedWriter`，IMU 积攒 + GNSS 收割的匹配器）
+> - 🚧 预留：`InsKf` / `LcEstimator` / `LcIntegration` / NHC / ZUPT / 紧组合接口
+>
+> **框架设计模式集成**（INS 启用后的设计）：
 > - **策略模式（仅前端）**：前端里程计算法封装为 `ImuMechStrategy(OdometryStrategy)`，IMU 不可用时可降级为 GNSS 纯解算；后端融合算法直接由 `LcIntegration` 承担，**不再使用 FusionStrategy 层**
 > - **纯队列流水线**：`LcIntegration` 作为估计线程主体，从 `estimate_queue` 取数据，**不继承 FusionObserver**，**无 `on_data()` 回调**，时间对齐与融合触发在主循环中执行
 > - **依赖注入**：框架核心类通过构造函数接收具体传感器实例与 `OdometryStrategy` 实例，而非内部 new，便于测试与替换
@@ -950,13 +958,15 @@ GnssProcessor 统一处理 SPP/RTD/RTK:
 本项目不估计时间同步参数，而是通过增量切分精确对齐 IMU/GNSS 时间
 （参考 KF-GINS newImuProcess + imuInterpolate）:
 
+※ 所有 timestamp 均为 Unix 时间戳（float 秒，与 rtklib-py gtime_t 一致）
+
 1. Estimator 内部维护 imupre/imucur 两个 IMU 历元
 2. GNSS 历元到达时，进入 pending_gnss (deque 缓冲，避免丢失多个 GNSS 历元)
-3. 当 imupre.t ≤ gnss.t ≤ imucur.t 时，按 4 种时间对齐情况处理:
-   - 情况 0: imupre.t == imucur.t == gnss.t  → 直接 GNSS 量测更新
-   - 情况 1: imupre.t < imucur.t == gnss.t   → 直接 GNSS 量测更新（imucur 即对齐）
-   - 情况 2: imupre.t == gnss.t < imucur.t   → 直接 GNSS 量测更新（imupre 即对齐）
-   - 情况 3: imupre.t < gnss.t < imucur.t    → 增量切分，修改 dt 后重新机械编排
+3. 当 imupre.timestamp ≤ gnss.timestamp ≤ imucur.timestamp 时，按 4 种时间对齐情况处理:
+   - 情况 0: imupre.timestamp == imucur.timestamp == gnss.timestamp  → 直接 GNSS 量测更新
+   - 情况 1: imupre.timestamp < imucur.timestamp == gnss.timestamp   → 直接 GNSS 量测更新（imucur 即对齐）
+   - 情况 2: imupre.timestamp == gnss.timestamp < imucur.timestamp   → 直接 GNSS 量测更新（imupre 即对齐）
+   - 情况 3: imupre.timestamp < gnss.timestamp < imucur.timestamp    → 增量切分，修改 dt 后重新机械编排
 4. 时间对齐由 Estimator 内部处理，Scheduler 仅转发
 5. 详见第 9 节
 ```
@@ -1160,11 +1170,18 @@ LcIntegration.process_epoch(epoch_data)   ← 从 estimate_queue 取数据
 
 ## 9. 时间同步与 IMU 插值
 
+> **时间系统**：本节所有时间戳（`imu.timestamp`、`gnss.timestamp`、`t0`/`t1`/`t2`/`t_gnss`）均为 **Unix 时间戳（float 秒，与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）**。
+> 时间差 `dt` 通过 Unix 时间戳相减直接得到，无需 GPST/Unix 转换。
+> 时间转换工具：`src/core/time_utils.py`（`gpst_to_unix` / `unix_to_gpst`，`GPST_EPOCH_UNIX = 315964800`）。
+>
+> **IMU 数据结构说明**：本节代码使用**早期设计版本** `ImuMeasurement_Design`（含 `dt`、`angular_velocity`、`acceleration` 字段，详见 StreamDesign.md 第 3.1 节），
+> 该版本将在 INS 启用后实现。当前实际 `ImuMeasurement`（`src/core/data_types.py`）字段为 `timestamp` / `week` / `accel` / `gyro`，无 `dt` 字段（`dt` 由相邻历元 timestamp 差计算）。
+
 ### 9.1 设计原则
 
 > 参考 KF-GINS 的 `GIEngine::newImuProcess()` 和 `imuInterpolate()` 实现。
 
-**核心问题**：当 GNSS 量测时刻 t1 落在两个 IMU 时刻 t0 和 t2 之间时，如何在不丢失 t2 数据的前提下进行精确插值？
+**核心问题**：当 GNSS 量测时刻 t1（Unix 时间戳）落在两个 IMU 时刻 t0 和 t2 之间时，如何在不丢失 t2 数据的前提下进行精确插值？
 
 **KF-GINS 的解决方案**：**增量切分而非弹出**。将 t2 的增量按比例切分，前半段用于 t0→t1 的机械编排，后半段保留在 imucur 中用于 t1→t2 的机械编排。
 
@@ -1229,7 +1246,7 @@ def add_gnss(self, gnss: GnssSolution) -> Optional[Solution]:
 def _is_to_update(self, t0: float, t2: float, t_gnss: float) -> int:
     """判断 GNSS 更新时机（参考 KF-GINS isToUpdate）
 
-    参数:
+    参数（均为 Unix 时间戳，float 秒）:
         t0: imupre 时间戳
         t2: imucur 时间戳
         t_gnss: GNSS 量测时间戳
@@ -1266,6 +1283,11 @@ def _imu_interpolate(self, imu_pre: ImuMeasurement,
       - KF-GINS 使用增量形式 (dtheta/dvel)，按比例切分增量
       - 本项目使用角速度/加速度形式，切分时只修改 dt
       - 机械编排时通过 dt 计算增量: dtheta = omega * dt
+
+    ※ 本代码使用早期设计版本 ImuMeasurement_Design（含 dt/angular_velocity/acceleration 字段）。
+      实际实现时（INS 启用后），imu_cur.angular_velocity → imu_cur.gyro,
+      imu_cur.acceleration → imu_cur.accel；dt 由相邻 timestamp 差计算或新增字段。
+    ※ timestamp 参数为 Unix 时间戳（float 秒）。
     """
     dt_total = imu_cur.timestamp - imu_pre.timestamp
     lamda = (timestamp - imu_pre.timestamp) / dt_total
@@ -1400,6 +1422,11 @@ def _ins_propagation(self, imu_pre: ImuMeasurement,
     """E 系机械编排（参考 imu.md 6.5 节）
 
     使用切分后的 dt 进行机械编排
+
+    ※ 本代码使用早期设计版本 ImuMeasurement_Design（含 dt/angular_velocity/acceleration 字段）。
+      实际实现时（INS 启用后），imu_cur.angular_velocity → imu_cur.gyro,
+      imu_cur.acceleration → imu_cur.accel；dt 由相邻 timestamp 差计算或新增字段。
+    ※ imu_pre.timestamp / imu_cur.timestamp 为 Unix 时间戳（float 秒）。
     """
     dt = imu_cur.dt  # 使用切分后的 dt
 
