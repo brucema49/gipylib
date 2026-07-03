@@ -3,6 +3,7 @@ import csv
 from pathlib import Path
 
 from src.core.data_types import AlignedBlock
+from src.core.time_utils import unix_to_gpst
 from src.log.writer_base import WriterBase
 
 
@@ -35,17 +36,20 @@ class AlignedWriter(WriterBase):
         if self._writer is None:
             raise RuntimeError("AlignedWriter not opened")
         g = block.gnss
+        # timestamp 是 Unix 时间戳，输出时转回 (week, sow)
+        g_week, g_sow = unix_to_gpst(g.timestamp)
         # G 行: G, week, sow, x, y, z, q, ns, sdx, sdy, sdz (11 列)
         self._writer.writerow([
-            "G", g.week, f"{g.timestamp:.6f}",
+            "G", g_week, f"{g_sow:.6f}",
             f"{g.position[0]:.4f}", f"{g.position[1]:.4f}", f"{g.position[2]:.4f}",
             g.quality, g.num_sv,
             f"{g.sd[0]:.4f}", f"{g.sd[1]:.4f}", f"{g.sd[2]:.4f}",
         ])
         # I 行: I, week, sow, gx, gy, gz, ax, ay, az (9 列)
         for imu in block.imu_list:
+            i_week, i_sow = unix_to_gpst(imu.timestamp)
             self._writer.writerow([
-                "I", imu.week, f"{imu.timestamp:.6f}",
+                "I", i_week, f"{i_sow:.6f}",
                 f"{imu.gyro[0]:.6f}", f"{imu.gyro[1]:.6f}", f"{imu.gyro[2]:.6f}",
                 f"{imu.accel[0]:.6f}", f"{imu.accel[1]:.6f}", f"{imu.accel[2]:.6f}",
             ])

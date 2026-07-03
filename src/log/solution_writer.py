@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 
 from src.core.data_types import GnssSolution
+from src.core.time_utils import unix_to_gpst
 from src.log.writer_base import WriterBase
 
 
@@ -91,12 +92,14 @@ class SolutionWriter(WriterBase):
         sdun = np.sqrt(abs(cov_enu[1, 2])) * np.sign(cov_enu[1, 2])
 
         D2R = np.pi / 180.0
+        # timestamp 是 Unix 时间戳，输出时转回 (week, sow) 对齐 rtklib-py savesol
+        week, sow = unix_to_gpst(sol.timestamp)
         fmt = (
             "%4d %10.3f %14.9f %14.9f %10.4f %3d %3d %8.4f"
             "  %8.4f %8.4f %8.4f %8.4f %8.4f %6.2f %6.1f\n"
         )
         self._fp.write(fmt % (
-            sol.week, sol.timestamp,
+            week, sow,
             llh[0] / D2R, llh[1] / D2R, llh[2],
             sol.quality, sol.num_sv,
             sdn, sde, sdu, sdne, sdeu, sdun,

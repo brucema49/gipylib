@@ -8,8 +8,8 @@ import numpy as np
 @dataclass
 class ImuMeasurement:
     """IMU 单次测量。"""
-    timestamp: float          # GPST 秒（周内秒）
-    week: int                 # GPS 周号
+    timestamp: float          # Unix 时间戳（秒，与 rtklib-py gtime_t 一致）
+    week: int                 # GPS 周号（由 timestamp 派生，便利字段）
     accel: np.ndarray         # [3] m/s² 机体坐标系
     gyro: np.ndarray          # [3] rad/s 机体坐标系
 
@@ -17,8 +17,8 @@ class ImuMeasurement:
 @dataclass
 class GnssSolution:
     """外部 GNSS 结果。"""
-    timestamp: float          # GPST 秒（周内秒）
-    week: int
+    timestamp: float          # Unix 时间戳（秒，与 rtklib-py gtime_t 一致）
+    week: int                 # GPS 周号（由 timestamp 派生，便利字段）
     position: np.ndarray      # [3] ECEF (m)
     quality: int              # 1=SPP, 2=RTD, 5=LC
     num_sv: int

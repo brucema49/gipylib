@@ -4,6 +4,8 @@
   列: GPS week, GPS sow, gx, gy, gz, ax, ay, az
 - PosSolFormator: 解析 rtklib POS 格式 GNSS 结果
   数据行: yyyy/mm/dd hh:mm:ss.s  x  y  z  Q  ns  sdx  sdy  sdz  sdxy  sdyz  sdzx  age  ratio
+
+输入的 GPS 周+周内秒在解码时转换为 Unix 时间戳（与 rtklib-py gtime_t 一致）。
 """
 from abc import ABC, abstractmethod
 from typing import Optional
@@ -11,7 +13,7 @@ from typing import Optional
 import numpy as np
 
 from src.core.data_types import ImuMeasurement, GnssSolution, SensorData
-from src.core.time_utils import ymdhms_to_gpst
+from src.core.time_utils import ymdhms_to_gpst, gpst_to_unix
 
 
 class FormatorBase(ABC):
@@ -49,7 +51,7 @@ class ImuFormator(FormatorBase):
         except (ValueError, IndexError):
             return None
         imu = ImuMeasurement(
-            timestamp=sow,
+            timestamp=gpst_to_unix(week, sow),
             week=week,
             accel=np.array([ax, ay, az], dtype=np.float64),
             gyro=np.array([gx, gy, gz], dtype=np.float64),
@@ -89,7 +91,7 @@ class PosSolFormator(FormatorBase):
         except (ValueError, IndexError):
             return None
         sol = GnssSolution(
-            timestamp=sow,
+            timestamp=gpst_to_unix(week, sow),
             week=week,
             position=np.array([x, y_pos, z], dtype=np.float64),
             quality=q,
