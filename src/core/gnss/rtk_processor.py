@@ -20,10 +20,9 @@ class RtkProcessor(GnssProcessor):
 
     def __init__(self, nav):
         self.nav = nav
-        # 延迟导入
-        from pntpos import pntpos
-        from rtkpos import relpos, timediff
-        from rtkcmn import Sol, gtime_t
+        from .rtklib.pntpos import pntpos
+        from .rtklib.rtkpos import relpos, timediff
+        from .rtklib.rtkcmn import Sol, gtime_t
         self._pntpos = pntpos
         self._relpos = relpos
         self._timediff = timediff

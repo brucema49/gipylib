@@ -15,8 +15,7 @@ class SppProcessor(GnssProcessor):
 
     def __init__(self, nav):
         self.nav = nav
-        # 延迟导入：需先由 RtklibEnv.setup() 注入 __ppk_config 到 sys.modules
-        from pntpos import pntpos
+        from .rtklib.pntpos import pntpos
         self._pntpos = pntpos
 
     def process_epoch(self, obsr, obsb=None) -> Optional[GnssSolution]:

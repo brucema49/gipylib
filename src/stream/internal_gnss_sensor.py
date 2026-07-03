@@ -56,15 +56,15 @@ class InternalGnssSensor(Thread):
 
     def _run_impl(self):
         # 1. 初始化 rtklib 环境 + nav
-        env = RtklibEnv(self.gnss_cfg, library_path="library/rtklib-py/src")
+        env = RtklibEnv(self.gnss_cfg)
         env.setup()
         nav = env.init_nav()
 
         # 2. 准备 RINEX 文件（必要时简化）
         rover_path = self._prepare_rinex(self.gnss_cfg["rover_path"])
 
-        # 3. 加载流动站观测值 + 星历（延迟导入 rinex）
-        import rinex as rn
+        # 3. 加载流动站观测值 + 星历
+        from src.core.gnss.rtklib import rinex as rn
         rov = rn.rnx_decode(env.get_cfg())
         rov.decode_obsfile(nav, rover_path, None)
         rov.decode_nav(self.gnss_cfg["eph_path"], nav)
