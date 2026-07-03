@@ -66,7 +66,18 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
         logger = SolutionLogger(gnss_queue, writer, control)
         return sensors, logger
 
-    # internal + on 已由 config_loader 拦截
+    if gnss_source == "internal" and ins_enabled == "on":
+        # 路径 C: 内部 GNSS 实时解算 + IMU 对齐输出
+        sensors = SensorFactory.create_sensors(config, imu_queue, gnss_queue, control)
+        filename = config["output"].get("aligned_filename", "aligned.csv")
+        writer = AlignedWriter(
+            output_dir=config["output"]["output_dir"],
+            filename=filename,
+        )
+        aligner = Aligner(imu_dt=1.0 / config["ins"]["data_rate"])
+        logger = Logger(imu_queue, gnss_queue, writer, aligner, control)
+        return sensors, logger
+
     raise NotImplementedError(
         f"Unsupported config: gnss_source={gnss_source}, ins.enabled={ins_enabled}"
     )

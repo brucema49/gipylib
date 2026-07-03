@@ -30,6 +30,11 @@ class SensorFactory:
             # internal + off: 纯 GNSS，仅 InternalGnssSensor，无 IMU
             from src.stream.internal_gnss_sensor import InternalGnssSensor
             sensors.append(InternalGnssSensor(config, gnss_queue, control))
-        # internal + on 已由 config_loader 抛 NotImplementedError
+        elif gnss_source == "internal" and ins_enabled == "on":
+            # internal + on: IMU 流式 + 内部 GNSS 实时解算 → 对齐输出
+            imu_path = config["ins"]["imu_data_path"]
+            sensors.append(ImuSensor(imu_path, imu_queue, control))
+            from src.stream.internal_gnss_sensor import InternalGnssSensor
+            sensors.append(InternalGnssSensor(config, gnss_queue, control))
 
         return sensors

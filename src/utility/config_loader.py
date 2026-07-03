@@ -86,9 +86,10 @@ def load_config(path) -> dict:
                 "base_path is required when positioning_mode='rtk'"
             )
         if ins_enabled == "on":
-            raise NotImplementedError(
-                "INS estimator not implemented: gnss_source='internal' + "
-                "ins.enabled='on' is reserved for future INS integration"
-            )
+            if not cfg["ins"].get("imu_data_path"):
+                raise ValueError(
+                    "ins.imu_data_path is required when gnss_source='internal' "
+                    "and ins.enabled='on'"
+                )
 
     return cfg
