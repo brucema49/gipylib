@@ -22,7 +22,7 @@
 > - ✅ 已实现：`src/stream/gnss_sol_sensor.py::GnssSolSensor`（外部 GNSS 结果传感器线程）
 > - ✅ 已实现：`src/stream/internal_gnss_sensor.py::InternalGnssSensor`（内部 GNSS 解算传感器线程，逐历元调用 pntpos/relpos）
 > - 🚧 预留：RoverSensor / EphSensor / RefSensor（独立星历/基站流，当前由 `InternalGnssSensor` 内部 RINEX 加载完成）
-> - 🚧 预留：Scheduler / 初始化状态机（当前两种模式均无 Scheduler，传感器直接推入 queue 由 Logger 消费）
+> - 🚧 预留：Scheduler / 初始化状态机（当前三种模式均无 Scheduler，传感器直接推入 queue 由 Logger/SolutionLogger 消费）
 
 ---
 
@@ -2184,7 +2184,7 @@ gipylib/
 │   └── config.yaml              # 统一配置文件
 │
 ├── src/
-│   ├── main.py                  # ✅ 主入口（两种运行模式装配）
+│   ├── main.py                  # ✅ 主入口（三种运行模式装配：路径 A/B/C）
 │   │
 │   ├── stream/                  # ✅ 传感器抽象层 + 流式读取层
 │   │   ├── __init__.py
@@ -2205,8 +2205,8 @@ gipylib/
 │   │   └── gnss/                # ✅ GNSS 解算模块（含 rtklib/ 吸收子包）
 │   │
 │   ├── log/                     # ✅ 日志层
-│   │   ├── logger.py            # ✅ Logger（external+on 模式）
-│   │   ├── solution_logger.py   # ✅ SolutionLogger（internal+off 模式）
+│   │   ├── logger.py            # ✅ Logger（external+on / internal+on 模式，消费 imu_queue + gnss_queue）
+│   │   ├── solution_logger.py   # ✅ SolutionLogger（internal+off 模式，仅消费 gnss_queue）
 │   │   ├── writer_base.py       # ✅ WriterBase 输出器抽象基类
 │   │   ├── solution_writer.py   # ✅ SolutionWriter rtklib 风格 .pos 输出
 │   │   ├── aligned_writer.py    # ✅ AlignedWriter 对齐块状 CSV 输出

@@ -9,10 +9,17 @@
 > 时间转换工具：`src/core/time_utils.py`（`gpst_to_unix` / `unix_to_gpst`，`GPST_EPOCH_UNIX = 315964800`）。
 >
 > **当前实现状态**：
-> - 🚧 整个 estimator 模块当前未实现（预留 INS 启用后开发）
 > - ✅ 已实现：GNSS 解算部分（`SppProcessor` / `RtkProcessor`），可独立运行输出 `.pos` 文件
 > - ✅ 已实现：外部 GNSS 结果对齐输出（`Aligner` + `AlignedWriter`，IMU 积攒 + GNSS 收割的匹配器）
-> - 🚧 预留：`InsKf` / `LcEstimator` / `LcIntegration` / NHC / ZUPT / 紧组合接口
+> - ✅ 已实现：内部 GNSS + IMU 数据对齐管线（`internal + ins.enabled=on`，路径 C），实时 RTK/SPP 解算 + IMU 流式读取 → Aligner 匹配 → `aligned_internal_rtk.csv` 输出
+> - 🚧 预留：`InsKf` / `LcEstimator` / `LcIntegration` / NHC / ZUPT / 紧组合接口（下一阶段：INS 机械编排）
+>
+> **INS 机械编排的下一步**：
+> 路径 C（数据对齐管线）已打通 `ImuSensor` → `imu_queue` 和 `InternalGnssSensor` → `gnss_queue` 的数据通路，
+> `Logger` + `Aligner` 已实现 IMU 积攒 + GNSS 收割的时间匹配。
+> 下一步是实现 `LcIntegration` 估计线程，从 `estimate_queue` 消费 `AlignedBlock`，
+> 调用 `ImuMechStrategy.execute()` 做 E 系机械编排，再由 `InsKf.time_update()` / `meas_update()` 做双滤波 EKF。
+> 路径 C 的 `AlignedBlock` 结构（`gnss: GnssSolution + imu_list: List[ImuMeasurement]`）可直接作为 `LcIntegration.process_epoch()` 的输入。
 >
 > **框架设计模式集成**（INS 启用后的设计）：
 > - **策略模式（仅前端）**：前端里程计算法封装为 `ImuMechStrategy(OdometryStrategy)`，IMU 不可用时可降级为 GNSS 纯解算；后端融合算法直接由 `LcIntegration` 承担，**不再使用 FusionStrategy 层**

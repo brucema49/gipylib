@@ -947,34 +947,45 @@ class GnssPositioningStrategy(OdometryStrategy):
 ### 9.4 数据流与队列流水线时序
 
 ```
-内部解算模式 (internal + ins.enabled=off, 当前实现):
+内部纯 GNSS 模式 (internal + ins.enabled=off, 当前实现):
   InternalGnssSensor.run() 线程
     → RtklibEnv.setup() + init_nav()
     → rnx_decode().decode_obsfile() / decode_nav()
     → SppProcessor / RtkProcessor 逐历元 process_epoch()
     → sol_to_gnss_solution(sol)
     → output_queue.put(SensorData(tag="gnss_solution"))   (推入 gnss_queue)
-    → Scheduler 从 gnss_queue 取数据
-    → solution_queue.put(SensorData)                       (转发到输出)
-    → SolutionLogger.write(sol)                            (写 .pos 文件)
+    → SolutionLogger 从 gnss_queue 取数据
+    → SolutionWriter.write(sol)                            (写 .pos 文件)
     → 文件结束推入 None sentinel
 
-外部结果模式 (external + ins.enabled=on, 当前实现):
+外部对齐模式 (external + ins.enabled=on, 当前实现):
   GnssSolSensor.run() 线程
     → PosSolFormator 逐行解析 .pos 文件
     → output_queue.put(SensorData(tag="gnss_solution"))   (推入 gnss_queue)
-    → Scheduler 从 gnss_queue 取数据
-    → estimate_queue.put(SensorData)                       (转发到融合)
-    → Aligner.match()                                      (IMU 积攒 + GNSS 收割)
-    → AlignedWriter.write(aligned_data)                    (写 aligned.csv)
-    → 文件结束推入 None sentinel
+  ImuSensor.run() 线程
+    → ImuFormator 逐行解析 IMU CSV
+    → output_queue.put(SensorData(tag="imu"))              (推入 imu_queue)
+  Logger 线程
+    → _drain_imu_queue() → aligner.push_imu()
+    → gnss_queue.get() → _wait_for_imu() → aligner.harvest()
+    → AlignedWriter.write(aligned_block)                   (写 aligned.csv)
+
+内部对齐模式 (internal + ins.enabled=on, 当前实现):
+  InternalGnssSensor.run() 线程
+    → ... 同内部纯 GNSS 模式的解算流程 ...
+    → output_queue.put(SensorData(tag="gnss_solution"))   (推入 gnss_queue)
+  ImuSensor.run() 线程
+    → ImuFormator 逐行解析 IMU CSV
+    → output_queue.put(SensorData(tag="imu"))              (推入 imu_queue)
+  Logger 线程（与外部对齐模式完全相同）
+    → _drain_imu_queue() → aligner.push_imu()
+    → gnss_queue.get() → _wait_for_imu() → aligner.harvest()
+    → AlignedWriter.write(aligned_block)                   (写 aligned_internal_rtk.csv)
 
 未来 INS 启用后 (internal + ins.enabled=on, 🚧 预留):
   InternalGnssSensor.run() 线程
     → ... 同内部解算模式 ...
     → output_queue.put(SensorData(tag="gnss_solution"))   (推入 gnss_queue)
-    → Scheduler 从 gnss_queue 取数据
-    → estimate_queue.put(SensorData)                       (转发到融合)
     → LcIntegration.process_epoch(epoch_data)
         → GnssInternalProvider.get_solution()
         → _gnss_update()                                   (EKF 量测更新，仅作用 P1)

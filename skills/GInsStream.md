@@ -15,8 +15,8 @@
 > - ✅ 已实现：`InternalGnssSensor`（内部模式传感器线程）/ `GnssSolSensor`（外部模式传感器线程）
 > - ✅ 已实现：`ImuSensor` + `ImuFormator`（IMU CSV 流式读取）+ `Aligner`（IMU 积攒 + GNSS 收割匹配）
 > - ✅ 已实现：`SolutionWriter` / `AlignedWriter` / `Logger` / `SolutionLogger`
-> - ✅ 已实现：两种运行模式——internal+ins.enabled=off（纯 GNSS，输出 .pos）/ external+ins.enabled=on（对齐块状 CSV）
-> - 🚧 预留：INS 机械编排 / 双滤波 EKF / NHC / ZUPT / 紧组合接口（当前未实现）
+> - ✅ 已实现：三种运行模式——internal+off（纯 GNSS，输出 .pos）/ external+on（外部对齐 CSV）/ internal+on（内部对齐 CSV，实时解算+IMU 对齐）
+> - 🚧 预留：INS 机械编排 / 双滤波 EKF / NHC / ZUPT / 紧组合接口（下一阶段实现）
 
 ### 设计模式总览
 
@@ -372,11 +372,12 @@ gipylib/
 ├── output/                        # 输出目录
 │   ├── test_spp.pos               # SPP 解算结果（internal+spp+off 模式）
 │   ├── test_rtk.pos               # RTK 解算结果（internal+rtk+off 模式）
-│   └── aligned.csv                # 对齐块状输出（external+on 模式）
+│   ├── aligned.csv                # 对齐块状输出（external+on 模式）
+│   └── aligned_internal_rtk.csv   # 对齐块状输出（internal+on 模式，实时 RTK+IMU）
 │
 ├── src/                           # 具体代码实现
 │   ├── __init__.py
-│   ├── main.py                    # ✅ 主入口（两种运行模式装配）
+│   ├── main.py                    # ✅ 主入口（三种运行模式装配：路径 A/B/C）
 │   │
 │   ├── stream/                    # ✅ 传感器抽象层 + 流式读取
 │   │   ├── __init__.py

@@ -1325,7 +1325,8 @@ class SensorFactory:
         - gnss_source == "internal" and ins.enabled == "off":
             → InternalGnssSensor(config, gnss_queue, control)  # 内部解算，无独立 IMU 流
         - gnss_source == "internal" and ins.enabled == "on":
-            → ImuSensor + InternalGnssSensor  # 🚧 预留：INS 启用后
+            → ImuSensor(imu_path, imu_queue, control)
+            → InternalGnssSensor(config, gnss_queue, control)  # 实时解算 + IMU 对齐输出
         """
         sensors = []
         gnss_source = config["gnss"]["gnss_source"]
@@ -1337,6 +1338,11 @@ class SensorFactory:
         elif gnss_source == "internal" and ins_enabled == "off":
             from src.stream.internal_gnss_sensor import InternalGnssSensor
             sensors.append(InternalGnssSensor(config, gnss_queue, control))
+        elif gnss_source == "internal" and ins_enabled == "on":
+            imu_path = config["ins"]["imu_data_path"]
+            sensors.append(ImuSensor(imu_path, imu_queue, control))
+            from src.stream.internal_gnss_sensor import InternalGnssSensor
+            sensors.append(InternalGnssSensor(config, gnss_queue, control))
         return sensors
 ```
 
@@ -1345,24 +1351,36 @@ class SensorFactory:
 ```
 IMU 数据到达（纯队列流水线，无观察者回调）:
 
-【当前实现：external 模式（IMU + 外部 GNSS 结果）】
+【当前实现：外部对齐模式 external + ins.enabled=on（路径 A）】
   ImuSensor.run()                        (StreamerBase 继承的线程入口)
     → open(file_path) 逐行读取
     → ImuFormator.decode(line)            (解码：week,sow,gx,gy,gz,ax,ay,az → ImuMeasurement)
                                           (时间戳：gpst_to_unix(week, sow) → Unix 时间戳)
     → imu_queue.put(SensorData(tag="imu")) (推入 imu_queue)
         ↓
-  Aligner / Logger                       (当前由 Aligner + AlignedWriter 消费，对齐输出)
-    → 🚧 预留：INS 启用后改为 LcIntegration.process_epoch() 消费
+  Logger                                 (消费 imu_queue + gnss_queue，对齐输出)
+    → _drain_imu_queue() → Aligner.push_imu()
+    → gnss_queue.get() → Aligner.harvest() → AlignedWriter.write(AlignedBlock)
 
-【当前实现：internal + ins.enabled=off 模式（无 IMU 流）】
+【当前实现：内部纯 GNSS 模式 internal + ins.enabled=off（路径 B，无 IMU 流）】
   InternalGnssSensor._run_impl()         (内部 GNSS 解算线程)
     → 加载 RINEX + 逐历元 pntpos/relpos
     → gnss_queue.put(SensorData(tag="gnss_solution"))
         ↓
   SolutionLogger / SolutionWriter        (消费 gnss_queue，输出 .pos 文件)
 
-【🚧 预留：INS 启用后的完整流水线（internal + ins.enabled=on）】
+【当前实现：内部对齐模式 internal + ins.enabled=on（路径 C）】
+  ImuSensor.run()                        (与路径 A 相同的 IMU 流式读取)
+    → imu_queue.put(SensorData(tag="imu"))
+        ↓
+  InternalGnssSensor._run_impl()         (实时 RTK/SPP 解算)
+    → gnss_queue.put(SensorData(tag="gnss_solution"))
+        ↓
+  Logger                                 (与路径 A 完全相同的对齐管线)
+    → _drain_imu_queue() → Aligner.push_imu()
+    → gnss_queue.get() → Aligner.harvest() → AlignedWriter.write(AlignedBlock)
+
+【🚧 预留：INS 启用后的完整流水线（路径 D，未来实现）】
   ImuSensor.run()
     → imu_queue.put(SensorData(tag="imu"))
         ↓

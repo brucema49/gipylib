@@ -17,7 +17,15 @@
 > **当前项目状态**：
 > - ✅ 已实现：内部 GNSS 模式（SPP/RTK，`gnss_source: "internal"` + `ins.enabled: "off"`）→ 输出 `.pos` 文件
 > - ✅ 已实现：外部 GNSS 模式（`gnss_source: "external"` + `ins.enabled: "on"`）→ 输出对齐块状 CSV
-> - 🚧 预留：`internal` + `ins.enabled: "on"`（INS 估计器未实现，由 `config_loader.py` 拦截抛 `NotImplementedError`）
+> - ✅ 已实现：内部 GNSS + IMU 对齐模式（`gnss_source: "internal"` + `ins.enabled: "on"`）→ 实时 RTK/SPP 解算 + IMU 流式读取 → Aligner 匹配 → 输出对齐块状 CSV（数据对齐管线，不含 INS EKF）
+> - 🚧 预留：INS 机械编排 / 双滤波 EKF / NHC / ZUPT / 紧组合接口（下一阶段实现）
+>
+> **三种运行模式对比**：
+> | 模式 | gnss_source | ins.enabled | GNSS 来源 | IMU | 输出 | Logger |
+> |------|-------------|-------------|-----------|-----|------|--------|
+> | 纯 GNSS | internal | off | 实时解算 | 无 | `.pos` | SolutionLogger |
+> | 外部对齐 | external | on | 外部文件 | 流式 | `aligned.csv` | Logger |
+> | 内部对齐 | internal | on | 实时解算 | 流式 | `aligned.csv` | Logger |
 >
 > **双滤波架构对应**（INS 启用后的设计，当前未实现）：
 > - 主滤波 P1（E 系，15 维 = 位置3+速度3+姿态3+陀螺零偏3+加计零偏3；可选 +3 维 GNSS 杆臂 = 18 维）
@@ -467,15 +475,19 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 
 | 文件 | 格式 | 内容 | 必须 |
 |------|------|------|------|
-| `output/test_spp.pos` / `output/test_rtk.pos` | POS | 内部模式解算结果（SPP/RTK），由 `src/log/solution_writer.py::SolutionWriter` 输出 | 是（internal 模式） |
-| `output/aligned.csv` | CSV | 外部模式对齐块状输出（G + N 行 I），由 `src/log/aligned_writer.py::AlignedWriter` 输出 | 是（external 模式） |
+| `output/test_spp.pos` / `output/test_rtk.pos` | POS | 内部纯 GNSS 模式解算结果（SPP/RTK），由 `src/log/solution_writer.py::SolutionWriter` 输出 | 是（internal+off 模式） |
+| `output/aligned.csv` | CSV | 外部对齐模式块状输出（G + N 行 I），由 `src/log/aligned_writer.py::AlignedWriter` 输出 | 是（external 模式） |
+| `output/aligned_internal_rtk.csv` | CSV | 内部对齐模式块状输出（G + N 行 I），实时 RTK 解算 + IMU 对齐 | 是（internal+on 模式） |
 | `output/solution.csv` | CSV | 解算结果（完整状态） | 可选（未实现） |
 | `output/solution.nmea` | NMEA | NMEA 格式 | 可选（未实现） |
 | `output/trace.txt` | 文本 | 运行轨迹/调试信息 | 可选（未实现） |
 | `output/raw/imu_raw.csv` | CSV | IMU 原始数据 | 可选（未实现） |
 | `output/raw/rover_raw.csv` | CSV | 流动站原始数据（内部模式） | 可选（未实现） |
 
-> 内部模式（`internal` + `ins.enabled: "off"`）主入口：`src/main.py` → `SolutionLogger` + `SolutionWriter`，
+> 内部纯 GNSS 模式（`internal` + `ins.enabled: "off"`）主入口：`src/main.py` → 路径 B → `SolutionLogger` + `SolutionWriter`，
 > 输出 `.pos` 文件，文件名由 `output.solution_filename` 指定（如 `test_spp.pos`、`test_rtk.pos`）。
-> 外部模式（`external` + `ins.enabled: "on"`）主入口：`src/main.py` → `Logger` + `AlignedWriter` + `Aligner`，
+> 外部对齐模式（`external` + `ins.enabled: "on"`）主入口：`src/main.py` → 路径 A → `Logger` + `AlignedWriter` + `Aligner`，
 > 输出对齐块状 CSV，文件名默认 `aligned.csv`。
+> 内部对齐模式（`internal` + `ins.enabled: "on"`）主入口：`src/main.py` → 路径 C → `Logger` + `AlignedWriter` + `Aligner`，
+> 输出对齐块状 CSV，文件名由 `output.aligned_filename` 指定（如 `aligned_internal_rtk.csv`）。
+> `config_loader.py` 校验 `internal + on` 时要求 `ins.imu_data_path` 必须存在（不再抛 `NotImplementedError`）。

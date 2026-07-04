@@ -437,13 +437,19 @@ class SolutionLogger(Thread):
             self.writer.close()
 ```
 
-### 7.3 两种 Logger 的选用规则
+### 7.3 Logger 的选用规则
 
-| 运行模式 | gnss_source | ins.enabled | 选用 Logger | 消费队列 | Writer |
-|---------|-------------|-------------|------------|---------|--------|
-| 外部结果对齐 | `external` | `off` | `Logger` | imu_queue + gnss_queue | AlignedWriter |
-| 内部 GNSS 解算 | `internal` | `off` | `SolutionLogger` | gnss_queue | SolutionWriter |
-| 🚧 INS 启用（预留） | `internal` | `on` | 完整 Logger（7.5 节） | solution_queue + trace_queue + raw_log_queue | SolutionWriter + TraceWriter + RawDataWriter |
+| 运行模式 | gnss_source | ins.enabled | 选用 Logger | 消费队列 | Writer | main.py 路径 |
+|---------|-------------|-------------|------------|---------|--------|-------------|
+| 外部对齐 | `external` | `on` | `Logger` | imu_queue + gnss_queue | AlignedWriter | 路径 A |
+| 内部纯 GNSS | `internal` | `off` | `SolutionLogger` | gnss_queue | SolutionWriter | 路径 B |
+| 内部对齐 | `internal` | `on` | `Logger` | imu_queue + gnss_queue | AlignedWriter | 路径 C |
+| 🚧 INS 启用（预留） | `internal` | `on` | 完整 Logger（7.5 节） | solution_queue + trace_queue + raw_log_queue | SolutionWriter + TraceWriter + RawDataWriter | 未来路径 D |
+
+> **路径 C 说明**：`internal + ins.enabled=on` 当前复用 external 模式的 `Logger` + `Aligner` + `AlignedWriter` 管线，
+> 传感器替换为 `InternalGnssSensor`（实时 RTK/SPP 解算）+ `ImuSensor`（IMU 流式读取）。
+> 输出文件名由 `output.aligned_filename` 指定（如 `aligned_internal_rtk.csv`）。
+> 未来 INS EKF 启用后，路径 C 将升级为路径 D（完整 Logger + Estimator 线程）。
 
 ### 7.4 Aligner — IMU 积攒 + GNSS 收割匹配器（实际实现 src/log/aligner.py）
 
@@ -793,7 +799,7 @@ def build_logger(config: dict, queues: dict, control) -> Logger:
 本模块的 `Logger` / `SolutionLogger` 与传感器层**统一采用纯队列流水线**，全程通过 `queue.put()`/`queue.get()` 传递数据，**无观察者模式、无 notify() 回调**：
 
 ```
-【当前实现：内部 GNSS 解算模式（internal + ins.enabled=off）】
+【当前实现：内部纯 GNSS 模式（internal + ins.enabled=off，路径 B）】
   InternalGnssSensor.run()
     → 逐历元 pntpos/relpos → GnssSolution
     → gnss_queue.put(SensorData(tag="gnss_solution"))   (含 None EOF sentinel)
@@ -801,7 +807,7 @@ def build_logger(config: dict, queues: dict, control) -> Logger:
   SolutionLogger.run()                                  (queue.get() 消费)
     → SolutionWriter.write(GnssSolution)                (Unix → week/sow 输出 .pos)
 
-【当前实现：外部结果对齐模式（external + ins.enabled=off）】
+【当前实现：外部对齐模式（external + ins.enabled=on，路径 A）】
   ImuSensor.run()
     → ImuFormator.decode(line) → ImuMeasurement         (gpst_to_unix 时间戳)
     → imu_queue.put(SensorData(tag="imu"))
@@ -812,7 +818,18 @@ def build_logger(config: dict, queues: dict, control) -> Logger:
         ↓                                                → AlignedWriter.write(AlignedBlock)
   (None EOF sentinel 触发 Logger 退出)
 
-【🚧 预留：INS 启用后的完整流水线（internal + ins.enabled=on）】
+【当前实现：内部对齐模式（internal + ins.enabled=on，路径 C）】
+  ImuSensor.run()
+    → ImuFormator.decode(line) → ImuMeasurement         (gpst_to_unix 时间戳)
+    → imu_queue.put(SensorData(tag="imu"))
+        ↓                                                ↓
+  InternalGnssSensor.run()                              Logger.run()（与路径 A 完全相同）
+    → 逐历元 pntpos/relpos → GnssSolution               → _drain_imu_queue() → Aligner.push_imu()
+    → gnss_queue.put(SensorData(tag="gnss_solution"))    → gnss_queue.get() → Aligner.harvest(gnss)
+        ↓                                                → AlignedWriter.write(AlignedBlock)
+  (None EOF sentinel 触发 Logger 退出)
+
+【🚧 预留：INS 启用后的完整流水线（internal + ins.enabled=on，路径 D）】
   ImuSensor/GnssRoverSensor ──put()──→ imu_queue/sensor_queue
                                                 ↓
                                      Scheduler（仅转发）          🚧 预留
