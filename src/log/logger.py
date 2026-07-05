@@ -1,7 +1,7 @@
 """日志记录器线程。
 
 从 imu_queue、gnss_queue 消费数据，做 GNSS 触发匹配，
-委托 AlignedWriter 输出 CSV。
+委托 AlignedWriter 输出 CSV。可选地同时输出纯 GNSS .pos 文件。
 """
 from queue import Queue, Empty
 from threading import Thread
@@ -13,21 +13,33 @@ from src.log.aligner import Aligner
 
 
 class Logger(Thread):
-    """日志记录器线程。"""
+    """日志记录器线程。
+
+    Args:
+        imu_queue: IMU 数据队列
+        gnss_queue: GNSS 数据队列
+        writer: AlignedWriter，输出对齐块状 CSV
+        aligner: Aligner，IMU 积攒 + GNSS 收割匹配器
+        control: ThreadControl 线程控制
+        gnss_writer: 可选的 SolutionWriter，用于同时输出纯 GNSS .pos 文件
+    """
 
     def __init__(self, imu_queue: Queue, gnss_queue: Queue,
                  writer: AlignedWriter, aligner: Aligner,
-                 control: ThreadControl):
+                 control: ThreadControl, gnss_writer=None):
         Thread.__init__(self, name="Logger", daemon=True)
         self.imu_queue = imu_queue
         self.gnss_queue = gnss_queue
         self.writer = writer
         self.aligner = aligner
         self.control = control
+        self.gnss_writer = gnss_writer
         self.imu_eof = False
 
     def run(self):
         self.writer.open()
+        if self.gnss_writer is not None:
+            self.gnss_writer.open()
         try:
             while self.control.is_running():
                 # 1. 先把 imu_queue 中的数据搬到 aligner.imu_buffer
@@ -45,6 +57,9 @@ class Logger(Thread):
                 # 4. 解包 SensorData 并匹配写出
                 if isinstance(gnss, SensorData):
                     gnss = gnss.gnss_solution
+                # 同时输出纯 GNSS .pos 文件（如有配置）
+                if self.gnss_writer is not None:
+                    self.gnss_writer.write(gnss)
                 # 等待 IMU 数据读到 >= GNSS 历元 + harvest_window，确保收割窗口内 IMU 都已到达
                 self._wait_for_imu(gnss.timestamp + self.aligner.harvest_window)
                 aligned = self.aligner.harvest(gnss)
@@ -52,6 +67,8 @@ class Logger(Thread):
                     self.writer.write(aligned)
         finally:
             self.writer.close()
+            if self.gnss_writer is not None:
+                self.gnss_writer.close()
 
     def _wait_for_imu(self, gnss_timestamp: float) -> None:
         """阻塞直到 IMU 缓冲包含 >= gnss_timestamp 的数据，或 IMU EOF。

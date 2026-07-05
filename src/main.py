@@ -68,14 +68,22 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
 
     if gnss_source == "internal" and ins_enabled == "on":
         # 路径 C: 内部 GNSS 实时解算 + IMU 对齐输出
+        # 同时输出两个文件：纯 GNSS .pos + 对齐 CSV
         sensors = SensorFactory.create_sensors(config, imu_queue, gnss_queue, control)
         filename = config["output"].get("aligned_filename", "aligned.csv")
         writer = AlignedWriter(
             output_dir=config["output"]["output_dir"],
             filename=filename,
         )
+        # 纯 GNSS 定位结果 .pos 文件（文件名通过 gnss_solution_filename 配置，默认 gnss_solution.pos）
+        gnss_filename = config["output"].get("gnss_solution_filename", "gnss_solution.pos")
+        gnss_writer = SolutionWriter(
+            output_dir=config["output"]["output_dir"],
+            filename=gnss_filename,
+        )
         aligner = Aligner(imu_dt=1.0 / config["ins"]["data_rate"])
-        logger = Logger(imu_queue, gnss_queue, writer, aligner, control)
+        logger = Logger(imu_queue, gnss_queue, writer, aligner, control,
+                        gnss_writer=gnss_writer)
         return sensors, logger
 
     raise NotImplementedError(
