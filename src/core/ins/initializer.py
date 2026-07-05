@@ -1,0 +1,374 @@
+"""INS 初始化器。
+
+参考 KF-GINS initialize + gnss_ins_lc_nhc StartAligning/AcceLeveling/MotionAligned。
+支持三种初始化模式: 静态、速度矢量、位置差分。
+"""
+import math
+from collections import deque
+from enum import Enum
+from typing import Optional, Tuple, List
+
+import numpy as np
+
+from src.core.data_types import AlignedBlock, GnssSolution, ImuMeasurement, InsState
+from src.core.ins.attitude import att_caln2e, dcm2quat, euler2dcm
+from src.core.ins.earth_param import cal_Ce2n, ecef2llh
+from src.core.ins.interpolator import find_bracket_imus, imu_interpolate
+
+
+class InitMode(Enum):
+    """初始化模式。"""
+    STATIC = "static"
+    VELOCITY_VECTOR = "velocity_vector"
+    POSITION_DIFF = "position_diff"
+
+
+class InsInitializer:
+    """INS 初始化器。
+
+    根据 GNSS 数据和 IMU 数据执行初始对准, 装配初始状态和协方差。
+    不执行机械编排, 仅完成初始化阶段。
+    """
+
+    def __init__(self, config: dict):
+        self.config = config
+        ins_cfg = config.get("ins", {})
+        # 三组独立阈值:
+        #   静态检测: GNSS 速度范数 < static_speed_threshold (0.5 m/s)
+        #   动态速度: 速度范数 > dynamic_speed_threshold (4.0 m/s)
+        #   动态角速度: 陀螺范数 < angular_velocity_threshold (30 deg/s ≈ 0.5236 rad/s)
+        self.static_speed_threshold = ins_cfg.get("static_speed_threshold", 0.5)
+        self.dynamic_speed_threshold = ins_cfg.get("dynamic_speed_threshold", 4.0)
+        self.angular_velocity_threshold = ins_cfg.get(
+            "angular_velocity_threshold", 30.0 * math.pi / 180.0
+        )
+        self.gnss_buffer_size = ins_cfg.get("gnss_buffer_size", 3)
+        self.gnss_buffer: deque = deque(maxlen=self.gnss_buffer_size)
+        self.static_duration = ins_cfg.get("static_duration", 10.0)
+        self.imu_rate = ins_cfg.get("data_rate", 100)
+
+    def initialize(self, aligned_block: AlignedBlock,
+                   mode: InitMode) -> Tuple[InsState, np.ndarray, np.ndarray]:
+        """初始化主入口。
+
+        Args:
+            aligned_block: 对齐后的 GNSS + IMU 数据块
+            mode: 初始化模式
+
+        Returns:
+            (InsState, P1, P2): 初始状态 + 主滤波协方差 + NHC 子滤波协方差
+        """
+        gnss = aligned_block.gnss
+        imu_list = aligned_block.imu_list
+
+        # 1. IMU 插值到 GNSS 时间戳 (验证包夹条件)
+        interp_imu = self._interpolate_imu(imu_list, gnss.timestamp)
+        if interp_imu is None:
+            raise ValueError(
+                "IMU 数据不满足插值包夹条件 (GNSS 时间戳前后需各有 IMU 历元)"
+            )
+
+        # 2. 动态模式下检查陀螺角速度范数 (< 30 deg/s)
+        if mode in (InitMode.VELOCITY_VECTOR, InitMode.POSITION_DIFF):
+            gyro_norm = self._compute_gyro_norm(imu_list, gnss.timestamp)
+            if gyro_norm >= self.angular_velocity_threshold:
+                raise ValueError(
+                    f"角速度范数 {gyro_norm:.4f} rad/s "
+                    f"(={math.degrees(gyro_norm):.2f} deg/s) "
+                    f"超过阈值 {self.angular_velocity_threshold:.4f} rad/s "
+                    f"(={math.degrees(self.angular_velocity_threshold):.2f} deg/s), "
+                    f"动态初始化要求角速度较小"
+                )
+
+        # 3. 按模式执行对准, 返回 (att_rpy, vel_e_for_state)
+        if mode == InitMode.STATIC:
+            result = self._align_static(aligned_block.imu_list, gnss)
+        elif mode == InitMode.VELOCITY_VECTOR:
+            result = self._align_motion_velocity(gnss)
+        elif mode == InitMode.POSITION_DIFF:
+            result = self._align_motion_displacement(gnss)
+        else:
+            raise ValueError(f"Unsupported init mode: {mode}")
+
+        if result is None:
+            raise ValueError("对准失败 (缓冲区未满或未达运动阈值)")
+        att_rpy, vel_e = result
+
+        # 4. 装配初始状态
+        state = self._assemble_state(gnss, att_rpy, vel_e)
+
+        # 5. 装配初始协方差
+        P1, P2 = self._set_initial_variance(mode)
+
+        return state, P1, P2
+
+    def _interpolate_imu(self, imu_list: List[ImuMeasurement],
+                         t_gnss: float) -> Optional[ImuMeasurement]:
+        """IMU 数据插值到 GNSS 时间戳 (初始化.md 第 4 节)。"""
+        if not imu_list:
+            return None
+        bracket = find_bracket_imus(imu_list, t_gnss)
+        if bracket is None:
+            return None
+        imu_pre, imu_cur, _ = bracket
+        return imu_interpolate(imu_pre, imu_cur, t_gnss)
+
+    def _compute_gyro_norm(self, imu_list: List[ImuMeasurement],
+                           t_gnss: float, window: float = 1.0) -> float:
+        """计算 GNSS 时间戳附近窗口内 IMU 陀螺角速度的平均范数。
+
+        动态初始化要求角速度较小 (< 30 deg/s), 确保车辆未在急转弯。
+
+        Args:
+            imu_list: IMU 数据列表
+            t_gnss: GNSS 时间戳
+            window: 时间窗口 [s] (前后各 window 秒)
+
+        Returns:
+            平均角速度范数 [rad/s], 无数据时返回 inf
+        """
+        t_start = t_gnss - window
+        t_end = t_gnss + window
+        window_imus = [imu for imu in imu_list
+                       if t_start <= imu.timestamp <= t_end]
+        if not window_imus:
+            window_imus = list(imu_list)
+        if not window_imus:
+            return float('inf')
+        gyro_norms = [float(np.linalg.norm(imu.gyro)) for imu in window_imus]
+        return float(np.mean(gyro_norms))
+
+    def _align_static(self, imu_list: List[ImuMeasurement],
+                      gnss: GnssSolution) -> Tuple[np.ndarray, np.ndarray]:
+        """静态对准: AcceLeveling 计算 roll/pitch, yaw 取配置。
+
+        参考 gnss_ins_lc_nhc AcceLeveling。
+        FRD 坐标系: x=Front, y=Right, z=Down
+        静态时加速度计测量比重力反方向的比力: accel ≈ [0, 0, -g]
+
+        静态检测阈值: GNSS 速度范数 < static_speed_threshold (0.5 m/s)
+
+        Returns:
+            (att_rpy, vel_e): 姿态 [roll, pitch, yaw] 和 ECEF 速度 (静态为 0)
+        """
+        if len(imu_list) < 2:
+            raise ValueError("IMU 数据不足, 无法执行静态对准")
+
+        # 静态检测: GNSS 速度范数必须低于静态阈值
+        if gnss.velocity is not None:
+            speed = float(np.linalg.norm(gnss.velocity))
+            if speed >= self.static_speed_threshold:
+                raise ValueError(
+                    f"GNSS 速度 {speed:.3f} m/s 超过静态阈值 "
+                    f"{self.static_speed_threshold} m/s, 不满足静态条件"
+                )
+
+        # 取 GNSS 时间戳前后的 IMU 数据做平均 (至少 static_duration 秒)
+        t_gnss = gnss.timestamp
+        t_start = t_gnss - self.static_duration
+        t_end = t_gnss + 1.0
+
+        static_imus = [imu for imu in imu_list
+                       if t_start <= imu.timestamp <= t_end]
+        if len(static_imus) < self.imu_rate:  # 至少 1 秒数据
+            static_imus = imu_list  # 退化为使用所有可用数据
+
+        # 平均加速度计
+        accel_mean = np.mean([imu.accel for imu in static_imus], axis=0)
+        ax, ay, az = accel_mean
+
+        # AcceLeveling: roll/pitch (FRD 坐标系)
+        # 静态时: accel = [g*sin(pitch), -g*sin(roll)*cos(pitch), -g*cos(roll)*cos(pitch)]
+        pitch = math.atan2(ax, math.sqrt(ay * ay + az * az))
+        roll = math.atan2(-ay, -az)
+        yaw = 0.0  # MEMS IMU 无法感知地球自转, 静态 yaw 取 0 或配置
+
+        # 检查配置是否有初始 yaw
+        ins_cfg = self.config.get("ins", {})
+        if ins_cfg.get("alignnment_attitude_mode", 0) == 1:
+            initial_att = ins_cfg.get("initial_att", [0, 0, 0])
+            if len(initial_att) >= 3:
+                yaw = math.radians(initial_att[2])
+
+        att_rpy = np.array([roll, pitch, yaw], dtype=np.float64)
+        vel_e = np.zeros(3, dtype=np.float64)  # 静态速度为 0
+        return att_rpy, vel_e
+
+    def _align_motion_velocity(self, gnss: GnssSolution
+                               ) -> Tuple[np.ndarray, np.ndarray]:
+        """速度矢量对准: GNSS 速度方向计算 yaw。
+
+        参考 gnss_ins_lc_nhc MotionAligned。
+
+        Returns:
+            (att_rpy, vel_e): 姿态和 ECEF 速度
+        """
+        if gnss.velocity is None:
+            raise ValueError("GNSS 无速度数据, 无法执行速度矢量对准")
+
+        vel_e = gnss.velocity.copy()
+        speed = np.linalg.norm(vel_e)
+        if speed < self.dynamic_speed_threshold:
+            raise ValueError(
+                f"GNSS 速度 {speed:.3f} m/s 低于动态速度阈值 "
+                f"{self.dynamic_speed_threshold} m/s"
+            )
+
+        # ECEF 速度 → NED 速度
+        lat, lon, _ = ecef2llh(gnss.position)
+        C_e_n = cal_Ce2n(lat, lon)
+        vel_n = C_e_n @ vel_e
+
+        # yaw = atan2(East, North)
+        yaw = math.atan2(vel_n[1], vel_n[0])
+
+        # pitch 从速度的垂直分量估算 (粗略)
+        # 实际动对准中 pitch 通常由加速度计或配置提供
+        pitch = math.atan2(-vel_n[2], math.sqrt(vel_n[0]**2 + vel_n[1]**2))
+        roll = 0.0  # 动态下无法从速度确定 roll
+
+        att_rpy = np.array([roll, pitch, yaw], dtype=np.float64)
+        return att_rpy, vel_e
+
+    def _align_motion_displacement(self, gnss: GnssSolution
+                                   ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """位置差分对准: 3 历元缓冲, 最新两个差分计算速度。
+
+        参考 gnss_ins_lc_nhc InterpolateGnssVel + MotionAligned。
+
+        Returns:
+            (att_rpy, vel_e) 或 None (缓冲区未满或未达运动阈值)
+        """
+        self.gnss_buffer.append(gnss)
+
+        if len(self.gnss_buffer) < self.gnss_buffer_size:
+            return None  # 缓冲区未满, 延迟初始化
+
+        # 用最新两个历元计算速度
+        gnss_prev = self.gnss_buffer[-2]
+        gnss_curr = self.gnss_buffer[-1]
+        dt = gnss_curr.timestamp - gnss_prev.timestamp
+        if dt <= 0:
+            return None
+
+        vel_e = (gnss_curr.position - gnss_prev.position) / dt
+        speed = np.linalg.norm(vel_e)
+        if speed < self.dynamic_speed_threshold:
+            return None  # 未达到动态速度阈值
+
+        # 用差分速度走速度矢量对准
+        gnss_with_vel = GnssSolution(
+            timestamp=gnss_curr.timestamp,
+            week=gnss_curr.week,
+            position=gnss_curr.position.copy(),
+            quality=gnss_curr.quality,
+            num_sv=gnss_curr.num_sv,
+            sd=gnss_curr.sd.copy(),
+            cov=gnss_curr.cov,
+            velocity=vel_e,
+            vel_sd=None,
+        )
+        return self._align_motion_velocity(gnss_with_vel)
+
+    def _assemble_state(self, gnss: GnssSolution, att_rpy: np.ndarray,
+                        vel_e: np.ndarray) -> InsState:
+        """装配初始状态 (初始化.md 第 11 节)。"""
+        ins_cfg = self.config.get("ins", {})
+
+        pos_e = gnss.position.copy()
+        if vel_e is None:
+            vel_e = np.zeros(3, dtype=np.float64)
+
+        # 姿态矩阵: C_b^e = C_n^e × C_b^n
+        lat, lon, _ = ecef2llh(pos_e)
+        C_b_n = euler2dcm(att_rpy)
+        C_b_e = att_caln2e(lat, lon, C_b_n)
+        q_b_e = dcm2quat(C_b_e)
+
+        # IMU 误差参数 (从配置读取, 默认 0)
+        gyro_bias = np.array(ins_cfg.get("gyro_bias_std_si", [0, 0, 0]),
+                             dtype=np.float64) * 0  # 初始零偏取 0
+        accel_bias = np.array(ins_cfg.get("acce_bias_std_si", [0, 0, 0]),
+                              dtype=np.float64) * 0
+        gyro_scale = np.zeros(3, dtype=np.float64)
+        accel_scale = np.zeros(3, dtype=np.float64)
+        imu_angle = np.array(ins_cfg.get("initial_imu_angle", [0, 0]),
+                             dtype=np.float64)
+        if imu_angle.size >= 2:
+            imu_angle = np.array([math.radians(imu_angle[0]),
+                                  math.radians(imu_angle[1])])
+        else:
+            imu_angle = np.zeros(2, dtype=np.float64)
+        imu_leverarm = np.array(ins_cfg.get("initial_imu_leverarm", [0, 0, 0]),
+                                dtype=np.float64)
+        leverarm = np.array(ins_cfg.get("leverarm", [0, 0, 0]),
+                            dtype=np.float64)
+
+        return InsState(
+            timestamp=gnss.timestamp,
+            pos_e=pos_e,
+            vel_e=vel_e,
+            C_b_e=C_b_e,
+            q_b_e=q_b_e,
+            att_rpy=att_rpy,
+            gyro_bias=gyro_bias,
+            accel_bias=accel_bias,
+            gyro_scale=gyro_scale,
+            accel_scale=accel_scale,
+            imu_angle=imu_angle,
+            imu_leverarm=imu_leverarm,
+            leverarm=leverarm,
+        )
+
+    def _set_initial_variance(self, mode: InitMode
+                              ) -> Tuple[np.ndarray, np.ndarray]:
+        """装配初始协方差 P1/P2 (初始化.md 第 12 节)。
+
+        P1: 主滤波 15x15 [pos(3), vel(3), att(3), gyro_bias(3), accel_bias(3)]
+        P2: NHC 子滤波 5x5 [imu_angle(2), imu_leverarm(3)]
+
+        Note: mode 参数保留用于未来按模式调整协方差。
+        """
+        ins_cfg = self.config.get("ins", {})
+
+        # 初始不确定度 (1σ, SI 单位)
+        pos_std = np.array(ins_cfg.get("initial_pos_std_si",
+                                       [30.0, 30.0, 30.0]), dtype=np.float64)
+        vel_std = np.array(ins_cfg.get("initial_vel_std_si",
+                                       [10.0, 10.0, 10.0]), dtype=np.float64)
+        att_std = np.array(ins_cfg.get("initial_att_std_si",
+                                       [0.00524, 0.00524, 0.00524]),
+                           dtype=np.float64)
+        gyro_bias_std = np.array(ins_cfg.get("gyro_bias_std_si",
+                                             [2.424e-5, 2.424e-5, 2.424e-5]),
+                                 dtype=np.float64)
+        acce_bias_std = np.array(ins_cfg.get("acce_bias_std_si",
+                                             [0.0489, 0.0489, 0.0489]),
+                                 dtype=np.float64)
+
+        # P1: 15x15 对角矩阵
+        P1 = np.diag(np.concatenate([
+            pos_std ** 2,
+            vel_std ** 2,
+            att_std ** 2,
+            gyro_bias_std ** 2,
+            acce_bias_std ** 2,
+        ]))
+
+        # P2: 5x5 (imu_angle[2] + imu_leverarm[3])
+        imu_angle_std = np.array(ins_cfg.get("imu_angle_std", [10.0, 10.0]),
+                                 dtype=np.float64)
+        imu_angle_std = np.radians(imu_angle_std)
+        imu_leverarm_std = np.array(ins_cfg.get("imu_leverarm_std",
+                                                [1.0, 1.0, 1.0]),
+                                    dtype=np.float64)
+        P2 = np.diag(np.concatenate([
+            imu_angle_std ** 2,
+            imu_leverarm_std ** 2,
+        ]))
+
+        return P1, P2
+
+    def reset_gnss_buffer(self):
+        """清空 GNSS 历元缓冲区 (reboot 时调用)。"""
+        self.gnss_buffer.clear()

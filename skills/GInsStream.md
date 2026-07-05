@@ -11,12 +11,14 @@
 >
 > **当前实现状态**：
 > - ✅ 已实现：rtklib-py 已吸收到 `src/core/gnss/rtklib/`（7 个核心模块），通过 `_CfgProxy` 单例管理配置
-> - ✅ 已实现：`SppProcessor` / `RtkProcessor` 薄封装 rtklib-py 的 `pntpos` / `relpos`
+> - ✅ 已实现：`SppProcessor` / `RtkProcessor` 薄封装 rtklib-py 的 `pntpos` / `relpos`（SPP 含多普勒测速 `estvel` / `resdop`）
 > - ✅ 已实现：`InternalGnssSensor`（内部模式传感器线程）/ `GnssSolSensor`（外部模式传感器线程）
-> - ✅ 已实现：`ImuSensor` + `ImuFormator`（IMU CSV 流式读取）+ `Aligner`（IMU 积攒 + GNSS 收割匹配）
+> - ✅ 已实现：`ImuSensor` + `ImuFormator`（IMU CSV 流式读取，含 RFU→FRD 坐标系自动转换）+ `Aligner`（IMU 积攒 + GNSS 收割匹配）
 > - ✅ 已实现：`SolutionWriter` / `AlignedWriter` / `Logger` / `SolutionLogger`
 > - ✅ 已实现：三种运行模式——internal+off（纯 GNSS，输出 .pos）/ external+on（外部对齐 CSV）/ internal+on（内部对齐 CSV，实时解算+IMU 对齐）
-> - 🚧 预留：INS 机械编排 / 双滤波 EKF / NHC / ZUPT / 紧组合接口（下一阶段实现）
+> - ✅ 已实现：`src/core/ins/initializer.py::InsInitializer`（INS 初始化，三种模式：静态 / 速度矢量 / 位置差分，三阈值检验，详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
+> - ✅ 已实现：`src/core/ins/` 下 `interpolator.py` / `earth_param.py` / `attitude.py`（初始化支撑模块）
+> - 🚧 预留：INS 机械编排核心 `InsCore` / 双滤波 EKF `LcIntegration` / NHC / ZUPT / 紧组合接口（下一阶段实现）
 
 ### 设计模式总览
 
@@ -1632,17 +1634,18 @@ gnss.pos ──→ GnssSolStreamer → gnss_sol_q┘    (时间对齐)     (EKF�
 
 **详细指导**：见 [gnss.md](gnss.md)
 
-### 9.2 src/core/imu/
+### 9.2 src/core/ins/
 
-**职责**：实现 INS 机械编排和初始化，支持增量式和速率式 IMU 数据，提供数据插值功能。
+**职责**：实现 INS 初始化与机械编排，支持增量式和速率式 IMU 数据，提供数据插值功能。
 
-**关键实现**：
-1. InsCore：INS 核心，参考 GREAT-MSF t_gsins（姿态/速度/位置更新）
-2. InsKf：INS 卡尔曼滤波基类，参考 GREAT-MSF t_gsinskf（Ft/Hk/时间更新/量测更新/反馈）
-3. IMU 预处理：增量式↔速率式转换（ImuPreprocessor 抽象体系）
-4. 数据插值：参考 GREAT-MSF t_ginterp，实现 IMU/GNSS 时间对齐
-5. 初始化：粗对准（静态/动态）+ EKF 精对准
-6. 地球参数和姿态表示工具
+**关键实现**（已实现 + 预留）：
+1. ✅ `InsInitializer`：INS 初始化，三种模式（静态 / 速度矢量 / 位置差分）+ 三阈值检验（详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
+2. ✅ `interpolator.py`：IMU/GNSS 时间对齐插值（`is_to_update` / `imu_interpolate` / `find_bracket_imus`，参考 KF-GINS `imuInterpolate`）
+3. ✅ `earth_param.py`：WGS84 地球参数、`ecef2llh` / `llh2ecef` / `cal_Ce2n` / `gravity_ecef`
+4. ✅ `attitude.py`：姿态表示与转换（`euler2dcm` / `dcm2quat` / `att_caln2e` 等）
+5. 🚧 `InsCore`：INS 核心，参考 GREAT-MSF t_gsins（姿态/速度/位置更新）— 待实现
+6. 🚧 `ImuPreprocessor`：IMU 预处理（增量式↔速率式转换）— 待实现
+7. 🚧 `ImuMechanizer`：机械编排主入口（驱动姿态/速度/位置递推 + Φ/Q 构造）— 待实现
 
 **详细指导**：见 [imu.md](imu.md)
 

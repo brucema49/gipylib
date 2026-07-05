@@ -31,6 +31,14 @@ def sol_to_gnss_solution(sol) -> Optional[GnssSolution]:
     qr3 = np.array(sol.qr[0:3, 0:3], dtype=float)
     sd = np.sqrt(np.abs(np.diag(qr3)))
 
+    velocity = None
+    vel_sd = None
+    if len(sol.rr) >= 6 and np.any(sol.rr[3:6] != 0):
+        velocity = np.array(sol.rr[3:6], dtype=float)
+        if hasattr(sol, 'qv') and sol.qv is not None:
+            qv3 = np.array(sol.qv[0:3, 0:3], dtype=float)
+            vel_sd = np.sqrt(np.abs(np.diag(qv3)))
+
     return GnssSolution(
         timestamp=unix_ts,
         week=week,
@@ -39,4 +47,6 @@ def sol_to_gnss_solution(sol) -> Optional[GnssSolution]:
         num_sv=int(sol.ns),
         sd=sd,
         cov=qr3,
+        velocity=velocity,
+        vel_sd=vel_sd,
     )

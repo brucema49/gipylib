@@ -9,11 +9,21 @@
 > 时间转换工具：`src/core/time_utils.py`（`gpst_to_unix` / `unix_to_gpst`，`GPST_EPOCH_UNIX = 315964800`）。
 >
 > **当前实现状态**：
-> - ✅ 已实现：`src/stream/imu_sensor.py::ImuSensor`（IMU 文本流式读取，逐行解码 + 队列推入）
+> - ✅ 已实现：`src/stream/imu_sensor.py::ImuSensor`（IMU 文本流式读取，逐行解码 + 队列推入，**含 RFU→FRD 坐标系自动转换** `_convert_to_frd()`）
 > - ✅ 已实现：`src/stream/formators.py::ImuFormator`（IMU CSV 解码：`week,sow,gx,gy,gz,ax,ay,az` → `ImuMeasurement`，时间戳通过 `gpst_to_unix(week, sow)` 转换）
 > - ✅ 已实现：`src/core/data_types.py::ImuMeasurement`（实际数据结构，字段：`timestamp`, `week`, `accel`, `gyro`）
 > - ✅ 已实现：`src/log/aligner.py::Aligner`（IMU 积攒 + GNSS 收割的匹配器，时间戳基于 Unix）
-> - 🚧 预留：`InsCore` / `ImuPreprocessor` / `Interpolator` / `ImuMechStrategy` 等 INS 相关类（当前未实现）
+> - ✅ 已实现：`src/core/ins/interpolator.py`（`is_to_update` / `imu_interpolate` / `find_bracket_imus`，与 [初始化.md 第 4 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#4-imu-数据插值到-gnss-时间戳) 共用）
+> - ✅ 已实现：`src/core/ins/earth_param.py`（`ecef2llh` / `llh2ecef` / `cal_Ce2n` / `gravity_ecef` + WGS84 常量）
+> - ✅ 已实现：`src/core/ins/attitude.py`（`euler2dcm` / `dcm2euler` / `dcm2quat` / `quat2dcm` / `att_caln2e`）
+> - ✅ 已实现：`src/core/ins/initializer.py::InsInitializer`（三种初始化模式：静态 / 速度矢量 / 位置差分，详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
+> - 🚧 预留：`InsCore` / `ImuPreprocessor` / `ImuMechStrategy` 等 INS 机械编排核心类（当前未实现）
+>
+> **IMU 坐标系约定**：
+> - 项目标准体坐标系 b 系：**FRD（前-右-下）**
+> - 原始 IMU 数据可能为 **RFU（右-前-上）**（如 `data/cpt_imu.csv`），由 `ImuSensor._convert_to_frd()` 在读取时自动转换
+> - 转换关系：`FRD = [RFU_y, RFU_x, -RFU_z]`（即 `gyro_frd = [gyro_rfu_y, gyro_rfu_x, -gyro_rfu_z]`，accel 同理）
+> - 配置项：`ins.imu_coordinate_system`（`FRD` / `RFU`，详见 [config.md 2.5](file:///home/mxl/workplace/gipylib/skills/config.md#25-初始对准)）
 >
 > **框架设计模式集成**（INS 启用后的设计）：
 > - **策略模式（仅前端）**：IMU 机械编排封装为 `ImuMechStrategy(OdometryStrategy)`，作为前端里程计策略，IMU 不可用时可降级为 `GnssPositioningStrategy`
@@ -48,14 +58,15 @@
 |------|------|------|---------|
 | `src/core/data_types.py` | `ImuMeasurement` 数据结构定义 | — | ✅ 已实现 |
 | `src/core/time_utils.py` | 时间转换（`gpst_to_unix` / `unix_to_gpst`） | rtklib-py gtime_t | ✅ 已实现 |
-| `src/stream/imu_sensor.py` | IMU 文本流式读取（继承 `StreamerBase`） | — | ✅ 已实现 |
+| `src/stream/imu_sensor.py` | IMU 文本流式读取（继承 `StreamerBase`，含 RFU→FRD 转换 `_convert_to_frd()`） | — | ✅ 已实现 |
 | `src/stream/formators.py` | `ImuFormator` 解码 IMU CSV | — | ✅ 已实现 |
 | `src/log/aligner.py` | IMU 积攒 + GNSS 收割的匹配器（基于 Unix 时间戳） | — | ✅ 已实现 |
+| `src/core/ins/interpolator.py` | IMU/GNSS 时间对齐插值（`is_to_update` / `imu_interpolate` / `find_bracket_imus`） | KF-GINS `imuInterpolate` / `isToUpdate` | ✅ 已实现 |
+| `src/core/ins/earth_param.py` | 地球参数（`ecef2llh` / `llh2ecef` / `cal_Ce2n` / `gravity_ecef` + WGS84 常量） | gnss_ins_lc_nhc `navearth.hpp` | ✅ 已实现 |
+| `src/core/ins/attitude.py` | 姿态表示与转换（`euler2dcm` / `dcm2euler` / `dcm2quat` / `quat2dcm` / `att_caln2e`） | gnss_ins_lc_nhc `navattitude.hpp` | ✅ 已实现 |
+| `src/core/ins/initializer.py` | `InsInitializer` 类：插值、模式选择、对准、状态装配，三阈值检验 | KF-GINS `initialize` + gnss_ins_lc_nhc `StartAligning` | ✅ 已实现 |
 | `src/core/ins/ins_core.py` | INS 核心：姿态/速度/位置更新、粗对准 | GREAT-MSF t_gsins | 🚧 预留 |
 | `src/core/ins/imu_preprocess.py` | IMU 数据预处理（增量/速率转换、异常检测） | GREAT-MSF t_gimu | 🚧 预留 |
-| `src/core/ins/interpolator.py` | IMU/GNSS 时间对齐插值 | GREAT-MSF t_ginterp / t_gpoly | 🚧 预留 |
-| `src/core/ins/earth_param.py` | 地球参数（重力、自转角速度、曲率半径） | GREAT-MSF t_gbase | 🚧 预留 |
-| `src/core/ins/attitude.py` | 姿态表示与转换（四元数/欧拉角/DCM） | GREAT-MSF t_gbase | 🚧 预留 |
 
 ### 1.2 与 Estimator 的关系
 
@@ -901,6 +912,10 @@ Q 仅有以下非零子块:
 ---
 
 ## 8. INS 初始化
+
+> **注意**：本节描述 INS 初始化在机械编排层的设计概念（`InsCore.coarse_align_*`，🚧 预留）。
+> **当前已实现的初始化模块**为独立的 `src/core/ins/initializer.py::InsInitializer`，支持三种模式（静态 / 速度矢量 / 位置差分），采用三阈值检验（`static_speed_threshold` / `dynamic_speed_threshold` / `angular_velocity_threshold_deg`）。
+> 完整实现规范详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)。
 
 ### 8.1 初始化流程
 

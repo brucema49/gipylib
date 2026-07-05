@@ -18,7 +18,11 @@
 > - ✅ 已实现：内部 GNSS 模式（SPP/RTK，`gnss_source: "internal"` + `ins.enabled: "off"`）→ 输出 `.pos` 文件
 > - ✅ 已实现：外部 GNSS 模式（`gnss_source: "external"` + `ins.enabled: "on"`）→ 输出对齐块状 CSV
 > - ✅ 已实现：内部 GNSS + IMU 对齐模式（`gnss_source: "internal"` + `ins.enabled: "on"`）→ 实时 RTK/SPP 解算 + IMU 流式读取 → Aligner 匹配 → 输出对齐块状 CSV（数据对齐管线，不含 INS EKF）
-> - 🚧 预留：INS 机械编排 / 双滤波 EKF / NHC / ZUPT / 紧组合接口（下一阶段实现）
+> - ✅ 已实现：INS 初始化模块 `src/core/ins/initializer.py::InsInitializer`（三种模式：静态 / 速度矢量 / 位置差分，三阈值检验），详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)
+> - ✅ 已实现：`src/core/ins/` 下 `interpolator.py` / `earth_param.py` / `attitude.py`（初始化支撑模块）
+> - ✅ 已实现：`ImuSensor` RFU→FRD 坐标系自动转换（`_convert_to_frd()`）
+> - ✅ 已实现：SPP 多普勒测速（`pntpos.py::estvel` / `resdop`，速度填入 `sol.rr[3:6]`）
+> - 🚧 预留：INS 机械编排核心 `InsCore` / 双滤波 EKF `LcIntegration` / NHC / ZUPT / 紧组合接口（下一阶段实现）
 >
 > **三种运行模式对比**：
 > | 模式 | gnss_source | ins.enabled | GNSS 来源 | IMU | 输出 | Logger |
@@ -259,16 +263,39 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 
 ### 4.4 初始对准
 
+> 详见 [初始化.md 第 5 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#5-初始化模式分类) 和 [第 5.4 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#54-动态初始化默认模式选择基于-gnss-解算模式)。
+> **当前实现状态**：`InsInitializer` 已实现三种模式（静态 / 速度矢量 / 位置差分），详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)。
+
 | 字段 | 类型 | 默认值 | 单位 | 说明 | gnss_ins_lc_nhc 对应 |
 |------|------|--------|------|------|---------------------|
-| `alignnment_velocity_threshold` | float | `4.0` | m/s | 运动对准速度阈值 | `alignnment_velocity_threshold` |
+| `alignnment_velocity_threshold` | float | `4.0` | m/s | **已废弃**（保留兼容），由 `static_speed_threshold` / `dynamic_speed_threshold` 替代 | `alignnment_velocity_threshold` |
+| `motion_threshold` | float | `0.5` | m/s | **已废弃**（保留兼容），由三阈值替代 | — |
+| `static_speed_threshold` | float | `0.5` | m/s | **静态检测速度阈值**：GNSS 速度范数 < 此值判定为静态，进入静对准（[初始化.md 5.4.3](file:///home/mxl/workplace/gipylib/skills/初始化.md#543-三组独立阈值static_speed--dynamic_speed--angular_velocity)） | — |
+| `dynamic_speed_threshold` | float | `4.0` | m/s | **动态速度阈值**：GNSS 速度范数 > 此值才可进入动对准（速度矢量法与位置差分法均适用） | — |
+| `angular_velocity_threshold_deg` | float | `30.0` | deg/s | **动态角速度阈值**：陀螺角速度范数 < 此值才可进入动对准（≈0.5236 rad/s），避免转弯时初始化 | — |
+| `imu_coordinate_system` | str | `"FRD"` | — | IMU 原始坐标系：`FRD`=前右下（默认） / `RFU`=右前上（`ImuSensor` 读取时自动转换为 FRD） | — |
+| `alignnment_dynamic_method` | str | `"auto"` | — | 动对准方法选择（[初始化.md 5.4.1](file:///home/mxl/workplace/gipylib/skills/初始化.md#541-默认规则)）。`auto`=按 GNSS 模式自动选择；`velocity_vector`=强制速度矢量；`position_diff`=强制位置差分 | — |
+| `gnss_velocity_fallback` | str | `"position_diff"` | — | GNSS 无速度时回退策略（[初始化.md 5.4.2](file:///home/mxl/workplace/gipylib/skills/初始化.md#542-gnss-不提供速度时的统一回退策略)）。动态模式下 GNSS 不提供速度时统一使用位置差分法 | — |
+| `gnss_buffer_size` | int | `3` | 个 | 位置差分初始化的 GNSS 历元缓冲区大小（[初始化.md 9.3](file:///home/mxl/workplace/gipylib/skills/初始化.md#93-处理流程伪代码)）。运动阈值达到时确保缓冲区存满 N 个历元，但只用最新两个历元计算差分速度 | — |
 | `alignnment_attitude_mode` | int | `1` | — | 0=自动对准 / 1=使用给定姿态 `initial_att` | `alignnment_attitude_mode` |
 | `alignnment_posvelatt_mode` | int | `0` | — | 1=使用给定位置速度姿态对准（最高优先级） | `alignnment_posvelatt_mode` |
+
+**三阈值选择建议**（[初始化.md 5.4.3](file:///home/mxl/workplace/gipylib/skills/初始化.md#543-三组独立阈值static_speed--dynamic_speed--angular_velocity)）：
+
+| 场景 | `static_speed_threshold` | `dynamic_speed_threshold` | `angular_velocity_threshold_deg` | 原因 |
+|------|--------------------------|---------------------------|----------------------------------|------|
+| 默认（车辆） | 0.5 m/s | 4.0 m/s | 30.0 deg/s | 区分静止与低速行驶；角速度约束避免转弯时初始化 |
+| 行人/低速车辆 | 0.2 m/s | 1.0 m/s | 20.0 deg/s | 避免低速被误判为静止 |
+| 高速车辆 | 1.0 m/s | 5.0 m/s | 30.0 deg/s | 避免停车等红灯时误判为运动 |
+| 严格静态启动 | 0.1 m/s | — | — | 仅在确实静止时进入静对准 |
 
 对准模式优先级（从高到低）：
 1. `alignnment_posvelatt_mode=1` → 使用 `initial_pos` / `initial_vel` / `initial_att`
 2. `alignnment_attitude_mode=1` → 位置速度取首个 GNSS 历元，姿态取 `initial_att`
-3. 自动对准：首 GNSS 速度 > 阈值 → 运动对准；否则 → 静止+运动对准
+3. 自动对准：根据三阈值决策（[初始化.md 5.4.4](file:///home/mxl/workplace/gipylib/skills/初始化.md#544-决策树)）
+   - 静态：GNSS 速度 < `static_speed_threshold` → 静对准（AcceLeveling）
+   - 动态：GNSS 速度 > `dynamic_speed_threshold` 且陀螺角速度范数 < `angular_velocity_threshold_deg` → 动对准（速度矢量 / 位置差分）
+   - 否则：延迟初始化，等待满足阈值条件的历元
 
 ### 4.5 初始状态
 

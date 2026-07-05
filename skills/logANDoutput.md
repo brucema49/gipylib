@@ -10,7 +10,8 @@
 > - ✅ 已实现：`src/log/logger.py::Logger`（外部模式：消费 imu_queue + gnss_queue，匹配后写 AlignedWriter）
 > - ✅ 已实现：`src/log/solution_logger.py::SolutionLogger`（内部模式：仅消费 gnss_queue，写 SolutionWriter）
 > - ✅ 已实现：`src/log/aligner.py::Aligner`（IMU 积攒 + GNSS 收割的匹配器，时间戳基于 Unix）
-> - 🚧 预留：TraceWriter / RawDataWriter / Solution CSV/NMEA 输出（当前未实现）
+> - ✅ 已实现：`src/core/ins/initializer.py::InsInitializer`（INS 初始化，三种模式 + 三阈值检验，详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
+> - 🚧 预留：TraceWriter / RawDataWriter / Solution CSV/NMEA 输出 / INS 状态输出（当前未实现）
 >
 > **框架设计模式集成**：
 > - **纯队列流水线**：`Logger` / `SolutionLogger` 作为估计线程或传感器线程的下游消费者，从对应队列取数据（`queue.get()`），**无观察者回调、无 notify()**，与传感器层统一为纯队列流水线

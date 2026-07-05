@@ -12,6 +12,9 @@
 > - ✅ 已实现：GNSS 解算部分（`SppProcessor` / `RtkProcessor`），可独立运行输出 `.pos` 文件
 > - ✅ 已实现：外部 GNSS 结果对齐输出（`Aligner` + `AlignedWriter`，IMU 积攒 + GNSS 收割的匹配器）
 > - ✅ 已实现：内部 GNSS + IMU 数据对齐管线（`internal + ins.enabled=on`，路径 C），实时 RTK/SPP 解算 + IMU 流式读取 → Aligner 匹配 → `aligned_internal_rtk.csv` 输出
+> - ✅ 已实现：`src/core/ins/initializer.py::InsInitializer`（INS 初始化，三种模式 + 三阈值检验，详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
+> - ✅ 已实现：`src/core/ins/` 下 `interpolator.py` / `earth_param.py` / `attitude.py`（初始化支撑模块，EKF 也可复用）
+> - ✅ 已实现：SPP 多普勒测速（`pntpos.py::estvel` / `resdop`，速度填入 `sol.rr[3:6]`，用于 INS 动态初始化）
 > - 🚧 预留：`InsKf` / `LcEstimator` / `LcIntegration` / NHC / ZUPT / 紧组合接口（下一阶段：INS 机械编排）
 >
 > **INS 机械编排的下一步**：

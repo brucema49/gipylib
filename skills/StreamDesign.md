@@ -18,11 +18,12 @@
 > - ✅ 已实现：`src/stream/base.py::BaseSensor` + `StreamerBase`（流式读取基类，逐行读取 + EOF sentinel）
 > - ✅ 已实现：`src/stream/factory.py::SensorFactory`（根据 gnss_source + ins.enabled 装配传感器）
 > - ✅ 已实现：`src/stream/formators.py::ImuFormator` / `PosSolFormator`（IMU CSV / rtklib POS 解码，时间戳 Unix 化）
-> - ✅ 已实现：`src/stream/imu_sensor.py::ImuSensor`（IMU 传感器线程）
+> - ✅ 已实现：`src/stream/imu_sensor.py::ImuSensor`（IMU 传感器线程，含 RFU→FRD 坐标系自动转换 `_convert_to_frd()`）
 > - ✅ 已实现：`src/stream/gnss_sol_sensor.py::GnssSolSensor`（外部 GNSS 结果传感器线程）
-> - ✅ 已实现：`src/stream/internal_gnss_sensor.py::InternalGnssSensor`（内部 GNSS 解算传感器线程，逐历元调用 pntpos/relpos）
+> - ✅ 已实现：`src/stream/internal_gnss_sensor.py::InternalGnssSensor`（内部 GNSS 解算传感器线程，逐历元调用 pntpos/relpos，SPP 模式含多普勒测速）
+> - ✅ 已实现：`src/core/ins/initializer.py::InsInitializer`（INS 初始化，三种模式 + 三阈值检验，详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
 > - 🚧 预留：RoverSensor / EphSensor / RefSensor（独立星历/基站流，当前由 `InternalGnssSensor` 内部 RINEX 加载完成）
-> - 🚧 预留：Scheduler / 初始化状态机（当前三种模式均无 Scheduler，传感器直接推入 queue 由 Logger/SolutionLogger 消费）
+> - 🚧 预留：Scheduler / INS 机械编排核心 `InsCore` / 双滤波 EKF `LcIntegration`（当前三种模式均无 Scheduler，传感器直接推入 queue 由 Logger/SolutionLogger 消费）
 
 ---
 

@@ -153,12 +153,12 @@ def estpos(obs, nav, rs, dts, svh):
     trace(3, 'estpos  : n=%d\n' % len(rs))
     for iter in range(MAXITR):
         v, H, az, el, var = rescode(iter, obs, nav, rs[:,0:3], dts, svh, x)
-        nv = len(v)    
+        nv = len(v)
         if nv < NX:
-            trace(3, 'estpos: lack of valid sats nsat=%d nv=%d\n' % 
+            trace(3, 'estpos: lack of valid sats nsat=%d nv=%d\n' %
                   (len(obs.sat), nv))
-            return sol
-        # weight by variance (lsq uses sqrt of weight 
+            return sol, x
+        # weight by variance (lsq uses sqrt of weight
         std = np.sqrt(var)
         v /= std
         H /= std[:,None]
@@ -174,8 +174,101 @@ def estpos(obs, nav, rs, dts, svh):
     sol.t = timeadd(obs.t, -x[3] / rCST.CLIGHT )
     sol.dtr = x[3:5] / rCST.CLIGHT
     sol.rr[0:3] = x[0:3]
-    sol.rr[3:6] = 0
-    return sol
+    return sol, x
+
+NXV = 4  # num of velocity params: vel(3) + clock drift(1)
+
+def resdop(obs, nav, rs, dts, svh, x, rr):
+    """ calculate doppler residuals for velocity estimation
+
+    Args:
+        obs: observation data
+        nav: navigation data
+        rs: satellite positions and velocities (n,6)
+        dts: satellite clock bias (n,)
+        svh: satellite health flags (n,)
+        x: state vector [vel(3), clock_drift(1)]
+        rr: receiver position (3,)
+
+    Returns:
+        v: residuals
+        H: design matrix
+    """
+    ns = len(obs.sat)
+    v = np.zeros(ns + NXV - 1)
+    H = np.zeros((ns + NXV - 1, NXV))
+    pos = ecef2pos(rr)
+    nv = 0
+
+    for i in np.argsort(obs.sat):
+        if obs.D[i, 0] == 0.0:
+            continue
+        if norm(rs[i, :]) < rCST.RE_WGS84:
+            continue
+        if gn.satexclude(obs.sat[i], 0.0, svh[i], nav):
+            continue
+        # line-of-sight vector
+        r, e = geodist(rs[i, 0:3], rr)
+        if r < 0:
+            continue
+        az, el = satazel(pos, e)
+        if el < nav.elmin:
+            continue
+        if obs.S[i, 0] < nav.cnr_min[0]:
+            continue
+        # satellite velocity relative to receiver velocity
+        vsv = rs[i, 3:6] - x[0:3]
+        # range rate (sat clock drift not available in rtklib-py, set to 0)
+        rate = np.dot(vsv, e)
+        # wavelength
+        freq = gn.sat2freq(obs.sat[i], 0, nav)
+        if freq == 0:
+            continue
+        lam = rCST.CLIGHT / freq
+        # doppler residual: v = -lam*D - (rate + c*x[3])
+        # RINEX Doppler: D = -dρ/dt/λ (positive when approaching)
+        # So: -λ*D = dρ/dt = dot(v_s - v_r, e) + c*(dt_s_dot - dt_r_dot)
+        # Residual: v = -λ*D - (dot(v_s - v_r, e) + c*x[3])
+        v[nv] = -lam * obs.D[i, 0] - (rate + rCST.CLIGHT * x[3])
+        # design matrix
+        H[nv, 0:3] = -e
+        H[nv, 3] = rCST.CLIGHT
+        nv += 1
+
+    v = v[0:nv]
+    H = H[0:nv, :]
+    return v, H
+
+def estvel(obs, nav, rs, dts, svh, rr):
+    """ estimate receiver velocity and clock drift from doppler observations
+
+    Args:
+        obs: observation data
+        nav: navigation data
+        rs: satellite positions and velocities (n,6)
+        dts: satellite clock bias (n,)
+        svh: satellite health flags (n,)
+        rr: receiver position (3,)
+
+    Returns:
+        vel: receiver velocity (3,) or None if insufficient sats
+    """
+    x = np.zeros(NXV)
+    trace(3, 'estvel  : n=%d\n' % len(rs))
+    for iter in range(MAXITR):
+        v, H = resdop(obs, nav, rs, dts, svh, x, rr)
+        nv = len(v)
+        if nv < NXV:
+            trace(3, 'estvel: lack of valid sats nsat=%d nv=%d\n' %
+                  (len(obs.sat), nv))
+            return None
+        dx = lstsq(H, v, rcond=None)[0]
+        x += dx
+        if norm(dx) < 1e-6:
+            break
+    else:
+        trace(3, 'estvel: solution did not converge\n')
+    return x[0:3]
 
 def pntpos(obs, nav):
     """ single-point positioning ----------------------------------------------------
@@ -185,7 +278,15 @@ def pntpos(obs, nav):
     *          nav      I   navigation data
     * return : sol      O   """
     rs, _, dts, svh = satposs(obs, nav)
-    sol = estpos(obs, nav, rs, dts, svh)
+    sol, x = estpos(obs, nav, rs, dts, svh)
+    if sol.stat == gn.SOLQ_SINGLE:
+        vel = estvel(obs, nav, rs, dts, svh, x[0:3])
+        if vel is not None:
+            sol.rr[3:6] = vel
+        else:
+            sol.rr[3:6] = 0
+    else:
+        sol.rr[3:6] = 0
     return sol
     
 

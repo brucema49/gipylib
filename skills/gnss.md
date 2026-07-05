@@ -359,13 +359,20 @@ timestamp,pos_e,pos_n,pos_u,vel_e,vel_n,vel_u,status,num_sat
 | `Sol.t.time + Sol.t.sec` | `timestamp` (float) | Unix 时间戳（= gtime_t.time + gtime_t.sec） |
 | `unix_to_gpst(timestamp)[0]` | `week` (int) | GPS 周号（由 timestamp 派生） |
 | `Sol.rr[0:3]` | `position` (np.ndarray [3]) | ECEF 位置 |
+| `Sol.rr[3:6]` | `velocity` (np.ndarray [3]) | ECEF 速度（由 `pntpos::estvel` 多普勒测速或 `relpos` 卡尔曼滤波速度填入） |
 | `Sol.stat` | `quality` (int) | 1=SPP, 2=RTD, 4=浮点解, 5=LC（与 rtklib `SOLQ_*` 一致） |
 | `Sol.ns` | `num_sv` (int) | 使用卫星数（rtklib-py `pntpos`/`relpos` 不写 `sol.ns`，由处理器回填） |
 | `sqrt(diag(Sol.qr[0:3,0:3]))` | `sd` (np.ndarray [3]) | ECEF 位置标准差 (sdx, sdy, sdz) |
+| `sqrt(diag(Sol.qv[0:3,0:3]))`（若可用） | `vel_sd` (np.ndarray [3], 可选) | ECEF 速度标准差 |
 | `Sol.qr[0:3, 0:3]` | `cov` (np.ndarray [3,3], 可选) | ECEF 协方差矩阵（含非对角项） |
 
 > 解算状态常量（`src/core/gnss/solution_converter.py`）：
 > `SOLQ_NONE=0`, `SOLQ_FIX=1`, `SOLQ_FLOAT=2`, `SOLQ_DGPS=4`, `SOLQ_SINGLE=5`。
+>
+> **速度字段说明**：
+> - SPP 模式下，`pntpos()` 内部调用 `estvel()`（基于多普勒观测值的最小二乘测速）将速度填入 `sol.rr[3:6]`
+> - RTK 模式下，`relpos()` 卡尔曼滤波状态向量含速度分量，直接填入 `sol.rr[3:6]`
+> - 速度用于 INS 动态初始化（速度矢量法，详见 [初始化.md 第 8 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#8-动态初始化---速度矢量初始化)）
 
 ---
 
@@ -436,13 +443,47 @@ pntpos(obs, nav)  # rtklib-py 内部实现
   │
   └── 4. 构建解算结果 Sol
         ├── Sol.rr[0:3] = 位置 (ECEF)
+        ├── Sol.rr[3:6] = 速度 (ECEF) ← estvel() 多普勒测速填入
         ├── Sol.dtr = 钟差
-        ├── Sol.qr = 协方差 = (H^T W H)^{-1}
+        ├── Sol.qr = 位置协方差 = (H^T W H)^{-1}
+        ├── Sol.qv = 速度协方差（若 estvel 计算）
         ├── Sol.stat = SOLQ_SINGLE (5)
         └── Sol.t = obs.t (gtime_t, Unix 时间戳)
 ```
 
-### 4.2 SPP 观测方程要点
+### 4.2.1 多普勒测速（estvel / resdop）
+
+> **实现说明**：本项目在 `src/core/gnss/rtklib/pntpos.py` 中实现了 `estvel()` 和 `resdop()`，
+> 由 `pntpos()` 在位置解算完成后调用，将 ECEF 速度填入 `sol.rr[3:6]`。
+> 速度用于 INS 动态初始化（速度矢量法，详见 [初始化.md 第 8 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#8-动态初始化---速度矢量初始化)）。
+
+```
+estvel(obs, nav, rs, dts, svh, rr)   # 多普勒测速主函数
+  │
+  ├── 1. 调用 resdop() 构建多普勒观测方程
+  │     对每颗卫星（有有效多普勒观测 obs.D[i,0] != 0）:
+  │       ├── 卫星速度 rs[i, 3:6]（来自星历）
+  │       ├── 视线向量 e = (rs[i, 0:3] - rr) / |·|
+  │       ├── 多普勒残差 v = -λ * D + (v_sat - v_rcv) · e + 钟漂项
+  │       └── 设计矩阵 H[i, 0:3] = -e, H[i, 3] = 1（钟漂）
+  │
+  ├── 2. 加权最小二乘求解
+  │     dx = (H^T W H)^{-1} H^T W v
+  │     其中 W 由 varerr() 仰角加权
+  │
+  └── 3. 填入 Sol
+        ├── sol.rr[3:6] = vel (ECEF 速度)
+        └── sol.dtr[1]  = 钟漂（如有）
+```
+
+**多普勒测速要点**：
+- 观测值：多普勒观测 `obs.D[i, 0]`（L1 频点）
+- 待估参数：`[vx, vy, vz, c·dt_r_dot]`（3 速度 + 1 钟漂）
+- 最小卫星数：4 颗（与位置解算一致）
+- 载波波长：`λ = c / f`（由 `nav.freq[0]` 计算）
+- 卫星速度：由星历计算，存于 `rs[i, 3:6]`
+
+### 4.3 SPP 观测方程要点
 
 - **观测值**：仅伪距（码观测值）
 - **待估参数**：[x, y, z, c·dt_r]（3 位置 + 1 钟差）
