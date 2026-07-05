@@ -1,33 +1,54 @@
 """IMU 传感器线程。"""
 from queue import Queue
-from typing import Optional
 
 import numpy as np
 
-from src.core.data_types import ImuMeasurement, SensorData
+from src.core.data_types import ImuMeasurement
 from src.core.thread_control import ThreadControl
 from src.stream.base import StreamerBase
-from src.stream.formators import ImuFormator
+from src.stream.formators import ImuFormator, EuRoCImuFormator
 
 
 class ImuSensor(StreamerBase):
-    """IMU 文本读取（GPST 格式）。
+    """IMU 文本读取，支持 GPST 和 EuRoC 两种格式。
 
     支持 IMU 坐标系转换：若 imu_coordinate_system != "FRD"，
     在读取时将原始坐标系转换到 FRD（项目标准 b 系）。
+
+    Args:
+        file_path: IMU 数据文件路径
+        output_queue: 输出队列
+        control: 线程控制
+        imu_coordinate_system: IMU 原始坐标系（FRD / RFU）
+        imu_format: 数据格式（gpst / euroc），默认 gpst
     """
 
     def __init__(self, file_path: str, output_queue: Queue,
                  control: ThreadControl,
-                 imu_coordinate_system: str = "FRD"):
+                 imu_coordinate_system: str = "FRD",
+                 imu_format: str = "gpst"):
+        formator = self._create_formator(imu_format)
         super().__init__(
             file_path=file_path,
-            formator=ImuFormator(),
+            formator=formator,
             output_queue=output_queue,
             control=control,
             tag="imu",
         )
         self.coordinate_system = imu_coordinate_system.upper()
+
+    @staticmethod
+    def _create_formator(imu_format: str):
+        """根据格式名称创建对应的解码器。"""
+        fmt = imu_format.lower()
+        if fmt == "gpst":
+            return ImuFormator()
+        elif fmt == "euroc":
+            return EuRoCImuFormator()
+        else:
+            raise ValueError(
+                f"Unsupported imu_format: {imu_format} (expected 'gpst' or 'euroc')"
+            )
 
     def run(self):
         """线程入口：逐行读取 → 解码 → 坐标系转换 → 入队 → EOF sentinel。"""

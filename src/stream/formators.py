@@ -2,10 +2,14 @@
 
 - ImuFormator: 解析 GPST 格式 IMU CSV
   列: GPS week, GPS sow, gx, gy, gz, ax, ay, az
+- EuRoCImuFormator: 解析 EuRoC 格式 IMU CSV
+  列: timestamp [ns], w_x, w_y, w_z, a_x, a_y, a_z
+  时间戳为 Unix 纳秒，坐标系为 RFU (Right-Front-Up)
 - PosSolFormator: 解析 rtklib POS 格式 GNSS 结果
   数据行: yyyy/mm/dd hh:mm:ss.s  x  y  z  Q  ns  sdx  sdy  sdz  sdxy  sdyz  sdzx  age  ratio
 
 输入的 GPS 周+周内秒在解码时转换为 Unix 时间戳（与 rtklib-py gtime_t 一致）。
+EuRoC 格式的纳秒时间戳除以 1e9 转换为 Unix 秒时间戳。
 """
 from abc import ABC, abstractmethod
 from typing import Optional
@@ -13,7 +17,7 @@ from typing import Optional
 import numpy as np
 
 from src.core.data_types import ImuMeasurement, GnssSolution, SensorData
-from src.core.time_utils import ymdhms_to_gpst, gpst_to_unix
+from src.core.time_utils import ymdhms_to_gpst, gpst_to_unix, unix_to_gpst
 
 
 class FormatorBase(ABC):
@@ -30,7 +34,10 @@ class FormatorBase(ABC):
 
 
 class ImuFormator(FormatorBase):
-    """IMU 文本解码（GPST 格式）。"""
+    """IMU 文本解码（GPST 格式）。
+
+    列: GPS week, GPS sow, gx, gy, gz, ax, ay, az
+    """
 
     def decode(self, line: str) -> Optional[SensorData]:
         line = line.strip()
@@ -55,6 +62,43 @@ class ImuFormator(FormatorBase):
             week=week,
             accel=np.array([ax, ay, az], dtype=np.float64),
             gyro=np.array([gx, gy, gz], dtype=np.float64),
+        )
+        return SensorData(tag="imu", imu=imu)
+
+
+class EuRoCImuFormator(FormatorBase):
+    """IMU 文本解码（EuRoC 格式）。
+
+    列: timestamp [ns], w_x, w_y, w_z, a_x, a_y, a_z
+    时间戳为 Unix 纳秒，除以 1e9 转换为 Unix 秒。
+    GPS 周号由 Unix 时间戳派生。
+    坐标系默认为 RFU (Right-Front-Up)，由 ImuSensor 负责转换为 FRD。
+    """
+
+    def decode(self, line: str) -> Optional[SensorData]:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return None
+        parts = line.split(",")
+        if len(parts) < 7:
+            return None
+        try:
+            timestamp_ns = int(parts[0])
+            wx = float(parts[1])
+            wy = float(parts[2])
+            wz = float(parts[3])
+            ax = float(parts[4])
+            ay = float(parts[5])
+            az = float(parts[6])
+        except (ValueError, IndexError):
+            return None
+        timestamp = timestamp_ns / 1e9
+        week, _ = unix_to_gpst(timestamp)
+        imu = ImuMeasurement(
+            timestamp=timestamp,
+            week=week,
+            accel=np.array([ax, ay, az], dtype=np.float64),
+            gyro=np.array([wx, wy, wz], dtype=np.float64),
         )
         return SensorData(tag="imu", imu=imu)
 

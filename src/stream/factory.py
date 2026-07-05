@@ -21,11 +21,12 @@ class SensorFactory:
         ins_enabled = config["ins"]["enabled"]
 
         imu_coord = config.get("ins", {}).get("imu_coordinate_system", "FRD")
+        imu_format = config.get("ins", {}).get("imu_format", "gpst")
 
         if gnss_source == "external":
             # external + ins.enabled=on: IMU + 外部 GNSS 结果
             imu_path = config["ins"]["imu_data_path"]
-            sensors.append(ImuSensor(imu_path, imu_queue, control, imu_coord))
+            sensors.append(ImuSensor(imu_path, imu_queue, control, imu_coord, imu_format))
             gnss_path = config["gnss"]["external_sol_path"]
             sensors.append(GnssSolSensor(gnss_path, gnss_queue, control))
         elif gnss_source == "internal" and ins_enabled == "off":
@@ -35,7 +36,7 @@ class SensorFactory:
         elif gnss_source == "internal" and ins_enabled == "on":
             # internal + on: IMU 流式 + 内部 GNSS 实时解算 → 对齐输出
             imu_path = config["ins"]["imu_data_path"]
-            sensors.append(ImuSensor(imu_path, imu_queue, control, imu_coord))
+            sensors.append(ImuSensor(imu_path, imu_queue, control, imu_coord, imu_format))
             from src.stream.internal_gnss_sensor import InternalGnssSensor
             sensors.append(InternalGnssSensor(config, gnss_queue, control))
 
