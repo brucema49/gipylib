@@ -1,7 +1,11 @@
 """IMU 插值工具。
 
-参考 KF-GINS gi_engine.h imuInterpolate / isToUpdate。
-速率式 IMU: gyro/accel 不变, 仅修改 timestamp。
+参考 gnss_ins_lc_nhc navdataque.cc SortData 的线性插值策略（主参考）。
+参考 KF-GINS gi_engine.h imuInterpolate / isToUpdate（概念参考）。
+
+本项目使用速率式 IMU（gyro/accel 原始测量，非增量式 dtheta/dvel）：
+- 当 |t_gnss - t_imu| < 1ms 时直接匹配，不插值
+- 否则对前后两个 IMU 历元的 gyro/accel 按时间比例 α 做线性插值
 """
 from typing import Optional
 
@@ -16,13 +20,13 @@ def is_to_update(t0: float, t2: float, t_gnss: float,
         t0: imu_pre.timestamp
         t2: imu_cur.timestamp
         t_gnss: GNSS 时间戳
-        threshold: 时间对齐阈值 (s), 默认 1ms
+        threshold: 时间对齐阈值 (s), 默认 1ms（用户指定；gnss_ins_lc_nhc 用 2ms）
 
     Returns:
         0: t_gnss 不在 [t0, t2] 之间
-        1: t_gnss 靠近 t0 (|t0 - t_gnss| < threshold)
-        2: t_gnss 靠近 t2 (|t2 - t_gnss| <= threshold)
-        3: t0 < t_gnss < t2 (需要增量切分)
+        1: t_gnss 靠近 t0 (|t0 - t_gnss| < threshold)，直接匹配
+        2: t_gnss 靠近 t2 (|t2 - t_gnss| <= threshold)，直接匹配
+        3: t0 < t_gnss < t2，需要线性插值
     """
     if abs(t0 - t_gnss) < threshold:
         return 1
@@ -36,9 +40,12 @@ def is_to_update(t0: float, t2: float, t_gnss: float,
 
 def imu_interpolate(imu_pre: ImuMeasurement, imu_cur: ImuMeasurement,
                     t_gnss: float) -> Optional[ImuMeasurement]:
-    """增量切分插值, 返回 t_gnss 时刻的 IMU 历元。
+    """线性插值, 返回 t_gnss 时刻的 IMU 历元。
 
-    速率式 IMU: gyro/accel 不变, 仅创建 timestamp=t_gnss 的新历元。
+    速率式 IMU 线性插值策略（参考 gnss_ins_lc_nhc SortData）：
+    - 情况 1/2（|t_gnss - t_imu| < 1ms）：直接匹配，不插值
+    - 情况 3（t0 < t_gnss < t2）：按 α = (t_gnss - t_pre) / (t_cur - t_pre)
+      对 gyro/accel 做线性插值
 
     Args:
         imu_pre: 前一个 IMU 历元 (timestamp < t_gnss)
@@ -52,6 +59,7 @@ def imu_interpolate(imu_pre: ImuMeasurement, imu_cur: ImuMeasurement,
     if case == 0:
         return None
     elif case == 1:
+        # 直接匹配 imu_pre，不插值
         return ImuMeasurement(
             timestamp=t_gnss,
             week=imu_pre.week,
@@ -59,19 +67,25 @@ def imu_interpolate(imu_pre: ImuMeasurement, imu_cur: ImuMeasurement,
             gyro=imu_pre.gyro.copy(),
         )
     elif case == 2:
+        # 直接匹配 imu_cur，不插值
         return ImuMeasurement(
             timestamp=t_gnss,
             week=imu_cur.week,
             accel=imu_cur.accel.copy(),
             gyro=imu_cur.gyro.copy(),
         )
-    else:  # case == 3
-        # 增量切分: 速率式 IMU 的 gyro/accel 不变, 仅修改 timestamp
+    else:  # case == 3: 线性插值
+        dt_total = imu_cur.timestamp - imu_pre.timestamp
+        if dt_total <= 0:
+            return None
+        alpha = (t_gnss - imu_pre.timestamp) / dt_total
+        gyro_interp = imu_pre.gyro + (imu_cur.gyro - imu_pre.gyro) * alpha
+        accel_interp = imu_pre.accel + (imu_cur.accel - imu_pre.accel) * alpha
         return ImuMeasurement(
             timestamp=t_gnss,
             week=imu_cur.week,
-            accel=imu_cur.accel.copy(),
-            gyro=imu_cur.gyro.copy(),
+            accel=accel_interp,
+            gyro=gyro_interp,
         )
 
 
