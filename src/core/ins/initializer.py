@@ -57,6 +57,10 @@ class InsInitializer:
         self.gnss_position_buffer: deque = deque(maxlen=int(self.static_duration) + 1)
         # 静态模式 GNSS 平均位置 (_align_static 计算, _assemble_state 使用)
         self._static_pos_mean: Optional[np.ndarray] = None
+        # 静态标定零偏 (预留接口, _calibrate_bias_from_static_imu 计算)
+        # 当前始终为 None, 未来可实现静态零偏标定
+        self._calibrated_gyro_bias: Optional[np.ndarray] = None
+        self._calibrated_accel_bias: Optional[np.ndarray] = None
 
     def initialize(self, aligned_block: AlignedBlock,
                    mode: InitMode) -> Tuple[InsState, np.ndarray, np.ndarray]:
@@ -186,10 +190,39 @@ class InsInitializer:
         # 保存平均位置供 _assemble_state 使用 (静态模式)
         self._static_pos_mean = pos_mean
 
+        # 尝试静态标定零偏 (预留接口, 当前返回 None)
+        # 未来可实现: 静止时陀螺平均 = 地球自转分量 + 零偏, 据此估计零偏
+        calibrated = self._calibrate_bias_from_static_imu(imu_list, gnss)
+        if calibrated is not None:
+            self._calibrated_gyro_bias, self._calibrated_accel_bias = calibrated
+        else:
+            self._calibrated_gyro_bias = None
+            self._calibrated_accel_bias = None
+
         # 低精度模式: 姿态全设为 0, 不做 AcceLeveling
         att_rpy = np.zeros(3, dtype=np.float64)  # roll=0, pitch=0, yaw=0
         vel_e = np.zeros(3, dtype=np.float64)  # 静态速度为 0
         return att_rpy, vel_e
+
+    def _calibrate_bias_from_static_imu(
+        self, imu_list: List[ImuMeasurement], gnss: GnssSolution
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """静态标定 IMU 零偏（预留接口，当前不实现）。
+
+        原理: 车辆静止时, 陀螺测量值 = 地球自转分量 + 零偏 + 噪声。
+        通过对静态 IMU 数据求平均可估计零偏。加速度计同理。
+
+        参考: gnss_ins_lc_nhc AcceLeveling (navinitialized.cc 行 47-59)
+        计算了平均陀螺但未用于零偏估计。本接口为后续优化预留。
+
+        Args:
+            imu_list: 静态期间的 IMU 数据列表
+            gnss: 当前 GNSS 解 (用于计算位置处的地球自转分量)
+
+        Returns:
+            (gyro_bias_rad_s, accel_bias_m_s2) 或 None (不标定)
+        """
+        return None
 
     def _align_motion_velocity(self, gnss: GnssSolution
                                ) -> Tuple[np.ndarray, np.ndarray]:
@@ -273,9 +306,12 @@ class InsInitializer:
 
         - 静态模式: 位置使用 _align_static 计算的 GNSS 历史平均位置
         - 动态模式: 位置使用 GNSS 当前历元位置
-        - IMU 零偏: 从 config 读取 initial_gyro_bias (deg/h → rad/s)
-                    和 initial_acce_bias (mGal → m/s²), 参考
-                    gnss_ins_lc_nhc StartAligning 行 81-100
+        - IMU 零偏: 优先使用静态标定结果, 否则从 config 读取
+                    initial_gyro_bias (deg/h → rad/s)
+                    initial_acce_bias (mGal → m/s²)
+        - IMU 比例因子: 从 config 读取 initial_gyro_scale / initial_acce_scale
+                        (ppm → dimensionless), 参考 gnss_ins_lc_nhc
+                        StartAligning 行 81-100
         """
         ins_cfg = self.config.get("ins", {})
 
@@ -293,25 +329,41 @@ class InsInitializer:
         C_b_e = att_caln2e(lat, lon, C_b_n)
         q_b_e = dcm2quat(C_b_e)
 
-        # IMU 误差参数 (初始化调整.md: 只初始化陀螺/加计零偏)
-        # 单位转换参考 gnss_ins_lc_nhc StartAligning 行 81-100:
-        #   initial_gyro_bias [deg/h] × dh2rs → [rad/s]
-        #   initial_acce_bias [mGal]  × constant_mGal (1e-5) → [m/s²]
+        # 单位转换常量 (与 gnss_ins_lc_nhc constant.hpp 行 20-36 一致)
+        constant_g0 = 9.7803267715
         dh2rs = math.pi / 180.0 / 3600.0       # deg/hour → rad/s
-        constant_mgal = 1e-5                     # mGal → m/s²
-        gyro_bias_deg_h = np.array(
-            ins_cfg.get("initial_gyro_bias", [0.0, 0.0, 0.0]),
+        constant_mgal = 1e-6 * constant_g0      # mGal → m/s² (gnss_ins_lc_nhc 定义)
+        constant_ppm = 1e-6                      # ppm → dimensionless
+
+        # IMU 零偏: 优先使用静态标定结果, 否则从 config 读取
+        if (mode == InitMode.STATIC
+                and self._calibrated_gyro_bias is not None):
+            gyro_bias = self._calibrated_gyro_bias.copy()
+            accel_bias = self._calibrated_accel_bias.copy()
+        else:
+            gyro_bias_deg_h = np.array(
+                ins_cfg.get("initial_gyro_bias", [0.0, 0.0, 0.0]),
+                dtype=np.float64,
+            )
+            accel_bias_mgal = np.array(
+                ins_cfg.get("initial_acce_bias", [0.0, 0.0, 0.0]),
+                dtype=np.float64,
+            )
+            gyro_bias = gyro_bias_deg_h * dh2rs
+            accel_bias = accel_bias_mgal * constant_mgal
+
+        # 比例因子: 从 config 读取 (gnss_ins_lc_nhc StartAligning 行 90-100)
+        gyro_scale_ppm = np.array(
+            ins_cfg.get("initial_gyro_scale", [0.0, 0.0, 0.0]),
             dtype=np.float64,
         )
-        accel_bias_mgal = np.array(
-            ins_cfg.get("initial_acce_bias", [0.0, 0.0, 0.0]),
+        accel_scale_ppm = np.array(
+            ins_cfg.get("initial_acce_scale", [0.0, 0.0, 0.0]),
             dtype=np.float64,
         )
-        gyro_bias = gyro_bias_deg_h * dh2rs
-        accel_bias = accel_bias_mgal * constant_mgal
-        # 比例因子本项目暂不估计 (evaluate_imu_scale=0), 置 0
-        gyro_scale = np.zeros(3, dtype=np.float64)
-        accel_scale = np.zeros(3, dtype=np.float64)
+        gyro_scale = gyro_scale_ppm * constant_ppm
+        accel_scale = accel_scale_ppm * constant_ppm
+
         imu_angle = np.array(ins_cfg.get("initial_imu_angle", [0, 0]),
                              dtype=np.float64)
         if imu_angle.size >= 2:
@@ -394,3 +446,5 @@ class InsInitializer:
         self.gnss_buffer.clear()
         self.gnss_position_buffer.clear()
         self._static_pos_mean = None
+        self._calibrated_gyro_bias = None
+        self._calibrated_accel_bias = None
