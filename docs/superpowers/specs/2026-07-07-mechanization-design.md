@@ -14,9 +14,9 @@
 
 ```
 src/core/ins/
-├── ins_core.py         (新增) InsCore：E 系机械编排正向递推
+├── ins_update.py       (新增) InsUpdate：E 系机械编排正向递推
 ├── transfer_matrix.py  (新增) TransferMatrix：F/Φ/Q 构造
-└── ins_kf.py           (新增) InsKf：协方差传播（P1）
+└── ins_propagate.py    (新增) InsPropagate：协方差传播（P1）
 
 src/log/
 └── trace_writer.py     (新增) TraceWriter：机械编排 trace 输出
@@ -30,9 +30,9 @@ tests/ins/
 ```
 InsInitializer → (InsState, P1)
        ↓
-  InsCore.update(imu)         ← 每历元正向递推
+  InsUpdate.update(imu)       ← 每历元正向递推
        ↓
-  InsKf.propagate(imu, ins_core)  ← 每历元协方差传播
+  InsPropagate.propagate(imu, ins_update)  ← 每历元协方差传播
        ↓
   TraceWriter.write(state, P1_diag)  ← 历元级 trace
        ↓
@@ -41,24 +41,24 @@ InsInitializer → (InsState, P1)
 
 ### 2.3 设计原则
 
-- InsCore 与 InsKf 解耦：正向递推不持有协方差，协方差传播不修改 InsState
+- InsUpdate 与 InsPropagate 解耦：正向递推不持有协方差，协方差传播不修改 InsState
 - TransferMatrix 独立可测：F/Φ/Q 构造逻辑复杂，单独单元测试
-- 开环模式：InsKf 只传播 P1，不反馈修正 InsState
-- IMU 补偿内联：零偏/标度补偿在 InsCore.update 内部完成
+- 开环模式：InsPropagate 只传播 P1，不反馈修正 InsState
+- IMU 补偿内联：零偏/标度补偿在 InsUpdate.update 内部完成
 
 ## 3. 组件接口
 
-### 3.1 InsCore
+### 3.1 InsUpdate
 
 ```python
-class InsCore:
+class InsUpdate:
     def __init__(self, state: InsState): ...
     def update(self, imu: ImuMeasurement) -> InsState:
         """一步递推：IMU 补偿 → 姿态 → 速度 → 位置"""
     @property
-    def f_b(self) -> np.ndarray: ...  # 当前历元比力（b 系），供 InsKf 使用
+    def f_b(self) -> np.ndarray: ...  # 当前历元比力（b 系），供 InsPropagate 使用
     @property
-    def w_b_ib(self) -> np.ndarray: ...  # 当前历元角速度（b 系），供 InsKf 使用
+    def w_b_ib(self) -> np.ndarray: ...  # 当前历元角速度（b 系），供 InsPropagate 使用
 ```
 
 ### 3.2 TransferMatrix
@@ -74,12 +74,12 @@ class TransferMatrix:
         """15x15 离散 Q 矩阵 (G*Q_diag*G' 风格)"""
 ```
 
-### 3.3 InsKf
+### 3.3 InsPropagate
 
 ```python
-class InsKf:
+class InsPropagate:
     def __init__(self, P1: np.ndarray, config: dict): ...
-    def propagate(self, imu: ImuMeasurement, ins_core: InsCore) -> None:
+    def propagate(self, imu: ImuMeasurement, ins_update: InsUpdate) -> None:
         """P1 = Φ·(P1+0.5Q)·Φ^T + 0.5Q (GINav 中间值法)"""
     @property
     def P1(self) -> np.ndarray: ...

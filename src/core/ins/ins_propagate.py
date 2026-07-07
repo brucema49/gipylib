@@ -1,4 +1,4 @@
-"""INS 卡尔曼滤波协方差传播 (P1 主滤波)。
+"""INS 协方差传播 (P1 主滤波)。
 
 参考:
 - GINav ins_time_updata.m (每历元传播, 中间值法)
@@ -17,8 +17,8 @@ from src.core.ins.transfer_matrix import TransferMatrix
 logger = logging.getLogger(__name__)
 
 
-class InsKf:
-    """INS 卡尔曼滤波器 (协方差传播)。
+class InsPropagate:
+    """INS 协方差传播器。
 
     维护 15x15 P1 主滤波协方差矩阵。
     开环模式: 只传播, 不修正状态。
@@ -28,7 +28,7 @@ class InsKf:
         self._P1 = P1.copy()
         self._tm = TransferMatrix(config)
         logger.info(
-            f"InsKf 初始化: P1 shape={P1.shape}, "
+            f"InsPropagate 初始化: P1 shape={P1.shape}, "
             f"trace={np.trace(P1):.6e}"
         )
 
@@ -36,22 +36,22 @@ class InsKf:
     def P1(self) -> np.ndarray:
         return self._P1
 
-    def propagate(self, imu: ImuMeasurement, ins_core, prev_timestamp: float) -> None:
+    def propagate(self, imu: ImuMeasurement, ins_update, prev_timestamp: float) -> None:
         """协方差传播: P1 = Φ·(P1 + 0.5Q)·Φ^T + 0.5Q。
 
         Args:
             imu: 当前 IMU 测量
-            ins_core: InsCore 实例 (提供 C_b_e, f_b, w_b_ib)
+            ins_update: InsUpdate 实例 (提供 C_b_e, f_b, w_b_ib)
             prev_timestamp: 上一历元时间戳 (用于计算 dt)
         """
         dt = imu.timestamp - prev_timestamp
         if dt <= 0.0:
             return
 
-        # 从 InsCore 获取当前状态量
-        C_b_e = ins_core.state.C_b_e
-        f_b = ins_core.f_b
-        w_b_ib = ins_core.w_b_ib
+        # 从 InsUpdate 获取当前状态量
+        C_b_e = ins_update.state.C_b_e
+        f_b = ins_update.f_b
+        w_b_ib = ins_update.w_b_ib
 
         # 构造 F, Φ, Q
         F = self._tm.build_F(C_b_e, f_b, w_b_ib)

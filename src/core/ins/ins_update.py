@@ -27,11 +27,12 @@ from src.core.ins.transfer_matrix import rodrigues, skew
 logger = logging.getLogger(__name__)
 
 
-class InsCore:
-    """INS 机械编排核心 (E 系)。
+class InsUpdate:
+    """INS 机械编排 (E 系)。
 
     维护 InsState, 每历元执行姿态/速度/位置正向递推。
-    不持有协方差 (协方差由 InsKf 维护)。
+    不持有协方差 (协方差由 InsPropagate 维护)。
+
     """
 
     def __init__(self, state: InsState):
@@ -40,7 +41,7 @@ class InsCore:
         self._prev_dtheta = np.zeros(3, dtype=np.float64)
         self._prev_dvel = np.zeros(3, dtype=np.float64)
         self._prev_timestamp = state.timestamp
-        # 当前历元的比力/角速度 (b 系), 供 InsKf 构造 F 矩阵
+        # 当前历元的比力/角速度 (b 系), 供 InsPropagate 构造 F 矩阵
         self._f_b = np.zeros(3, dtype=np.float64)
         self._w_b_ib = np.zeros(3, dtype=np.float64)
 
@@ -79,7 +80,7 @@ class InsCore:
         dtheta_comp = (dtheta - self.state.gyro_bias * dt) * (1.0 - self.state.gyro_scale)
         dvel_comp = (dvel - self.state.accel_bias * dt) * (1.0 - self.state.accel_scale)
 
-        # 记录当前历元比力/角速度 (b 系, 速率) 供 InsKf 使用
+        # 记录当前历元比力/角速度 (b 系, 速率) 供 InsPropagate 使用
         self._w_b_ib = dtheta_comp / dt
         self._f_b = dvel_comp / dt
 
