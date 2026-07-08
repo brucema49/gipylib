@@ -54,7 +54,7 @@ class InsPropagate:
         w_b_ib = ins_update.w_b_ib
 
         # 构造 F, Φ, Q
-        F = self._tm.build_F(C_b_e, f_b, w_b_ib)
+        F = self._tm.build_F(C_b_e, f_b, w_b_ib, ins_update.state.pos_e)
         Phi = self._tm.build_Phi(F, dt)
         Q = self._tm.build_Q(dt, C_b_e)
 
