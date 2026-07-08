@@ -142,9 +142,19 @@ class TransferMatrix:
         return F
 
     def build_Phi(self, F: np.ndarray, dt: float) -> np.ndarray:
-        """离散化: Φ = I + F·dt + 0.5·(F·dt)² (二阶 Taylor)。"""
+        """离散化: 自适应精度 (对齐 ignav precPhi)。
+
+        - dt <= 0.005s  (≥200Hz): 一阶 Φ = I + F·dt
+        - dt <= 0.01s   (100-200Hz): 二阶 Φ = I + F·dt + 0.5·(F·dt)²
+        - dt > 0.01s    (<100Hz): 矩阵指数 Φ = expm(F·dt)
+        """
         Fdt = F * dt
-        return np.eye(15, dtype=np.float64) + Fdt + 0.5 * (Fdt @ Fdt)
+        if dt <= 0.005:
+            return np.eye(15, dtype=np.float64) + Fdt
+        elif dt <= 0.01:
+            return np.eye(15, dtype=np.float64) + Fdt + 0.5 * (Fdt @ Fdt)
+        else:
+            return _expm(Fdt)
 
     def build_Q(self, dt: float, C_b_e: np.ndarray) -> np.ndarray:
         """构造 15x15 离散 Q 矩阵 (GINav G·Q_diag·G^T 风格)。
