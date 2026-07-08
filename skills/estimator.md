@@ -360,7 +360,7 @@ class LcEstimator(InsKf):
         - GNSS 速度 (仅 H1): H1[:, 3:6] = I, H1[:, 6:9] = 姿态项, H1[:, GNSS_LEVER] = 杆臂旋转项
         - NHC (H1+H2 拆分，参考 gnss_ins_lc_nhc navstate.cc:343-353):
           H1_vel  = R_b^v * C_e^b^T              (速度对 δv^e)
-          H1_att  = -R_b^v * C_e^b^T * [v^e ×]  (速度对 δφ^e)
+          H1_att  = +R_b^v * C_e^b^T * [v^e ×]  (速度对 δψ^e, ψ-error 正号)
           H1_gyro = R_b^v * [l_imu^b ×]          (速度对 δb_g)
           H2_angle = [v^v ×]_{:,2:3}              (速度对 δθ_imu，仅 2 列)
           H2_lever = R_b^v * [ω_eb^b ×]           (速度对 δl_imu)
@@ -373,7 +373,7 @@ class LcEstimator(InsKf):
         P1 反馈 (参考 gnss_ins_lc_nhc navfilter.cc:262-268):
         - 位置: r^e ← r^e - δr^e
         - 速度: v^e ← v^e - δv^e
-        - 姿态: C_b^e ← (I - [δφ^e×]) * C_b^e
+        - 姿态: C_b^e ← (I + [δψ^e×]) * C_b^e  (ψ-error: 加号)
         - 零偏: b_g ← b_g - δb_g, b_a ← b_a - δb_a
         - GNSS 杆臂: l_gnss ← l_gnss - δl_gnss（可选）
 
@@ -592,7 +592,7 @@ class MainStateIndex(IntEnum):
     参考 gnss_ins_lc_nhc 主滤波设计。
     状态向量 x1（固定 15 维 + 可选 3 维 GNSS 杆臂 = 15 或 18 维）:
 
-      x1 = [δr^e, δv^e, δφ^e, δb_g, δb_a, (δl_gnss)]^T
+      x1 = [δr^e, δv^e, δψ^e, δb_g, δb_a, (δl_gnss)]^T
 
     主滤波独立维护 P1/F1/H1/Q1/R1 矩阵和反馈机制。
     """
@@ -684,7 +684,7 @@ IMU_LEVER_SLICE = slice(2, 5)
 主滤波（P1，E 系）:
   δr^e    : E 系下位置误差 (m)
   δv^e    : E 系下速度误差 (m/s)
-  δφ^e    : E 系下姿态误差角 (rad)，φ 系
+  δψ^e    : E 系下姿态误差角 (rad)，ψ 系 (对齐 ignav)
   δb_g    : 陀螺零偏误差 (rad/s)
   δb_a    : 加计零偏误差 (m/s²)
   δl_gnss : GNSS天线杆臂误差 [δlx, δly, δlz] (m, b系)（可选）
@@ -694,17 +694,17 @@ NHC 子滤波（P2，v 系）:
   δl_imu  : IMU杆臂误差 [δlx, δly, δlz] (m, b系)
 ```
 
-**姿态误差定义（E 系 φ 系）**：
+**姿态误差定义（E 系 ψ 系, 对齐 ignav）**：
 
 ```
-C_b^e_true = (I - [δφ^e×]) * C_b^e_est
+C_b^e_true = (I + [δψ^e×]) * C_b^e_est
 ```
 
-**双滤波架构说明（参考 gnss_ins_lc_nhc）**：
+**双滤波架构说明（参考 gnss_ins_lc_nhc, F 矩阵对齐 ignav ψ-error）**：
 
 ```
 主滤波（P1，E 系，15/18 维）:
-  - 固定 15 状态: δr^e, δv^e, δφ^e, δb_g, δb_a
+  - 固定 15 状态: δr^e, δv^e, δψ^e, δb_g, δb_a
   - 可选扩展: GNSS 杆臂 δl_gnss(3)（b系表示，E系下估计，estimate_gnss_leverarm=true）
   - 用于: INS 机械编排预测、GNSS 位置/速度量测更新、ZUPT 量测更新
   - F1/H1/Q1/R1 矩阵在 E 系下构造（参考 gnss_ins_lc_nhc navmech.cc / navstate.cc）
@@ -742,23 +742,29 @@ NHC 子滤波（P2，v 系，5 维）:
    F1 为 15×15 或 18×18 矩阵（E 系，可选 GNSS 杆臂扩展），E 系下分块结构:
 
    F1 = [F_rr  F_rv  0     0     0     0    ]   位置误差方程(E系)
-       [F_vr  F_vv  F_vφ  F_vb  F_va  0    ]   速度误差方程(E系)
-       [0     0     F_φφ  F_φb  0     0    ]   姿态误差方程(E系)
+       [F_vr  F_vv  F_vψ  F_vb  F_va  0    ]   速度误差方程(E系, ψ-error)
+       [0     0     F_ψψ  F_ψb  0     0    ]   姿态误差方程(E系, ψ-error)
        [0     0     0     F_bb  0     0    ]   陀螺零偏方程
        [0     0     0     0     F_aa  0    ]   加计零偏方程
        [0     0     0     0     0     0    ]   GNSS杆臂方程（常数，可选）
 
    GNSS杆臂假设为常数，F1 中对应行为 0。
 
-   E 系下 F1 矩阵关键子块（参考 gnss_ins_lc_nhc navmech.cc）:
+   E 系下 F1 矩阵关键子块 (ψ-error 模型, 对齐 ignav getF):
    - F_rv: 位置对速度的偏导 (E系下 = I_3)
+   - F_vr: 速度对位置的偏导 (重力梯度, -2/(re·|pos|)·ge⊗pos, 参考 ignav getF)
    - F_vv: 速度对速度的偏导 (-[2ω_ie^e ×])，E系下地球自转为常数
-   - F_vφ: 速度对姿态的偏导 ([f^e ×])，E系下比力反对称
-   - F_vba: 速度对加计零偏的偏导 (-C_b^e)
-   - F_φφ: 姿态对姿态的偏导 (-[ω_ie^e ×])，E系下无ω_en^n项
-   - F_φbg: 姿态对陀螺零偏的偏导 (-C_b^e)
+   - F_vψ: 速度对姿态的偏导 (-[f^e ×])，ψ-error 负号 (对齐 ignav)
+   - F_vba: 速度对加计零偏的偏导 (+C_b^e)
+   - F_ψψ: 姿态对姿态的偏导 (-[ω_ie^e ×])，E系下无ω_en^n项
+   - F_ψbg: 姿态对陀螺零偏的偏导 (+C_b^e)，ψ-error 正号 (对齐 ignav)
    - F_bgbg: 陀螺零偏一阶马尔可夫 (-I/τ_g)
    - F_baba: 加计零偏一阶马尔可夫 (-I/τ_a)
+
+   ψ-error vs φ-error 差异 (本项目从 φ-error 切换到 ψ-error):
+   - F_vψ = -[f^e×]  (φ-error 为 +[f^e×])
+   - F_ψbg = +C_b^e  (φ-error 为 -C_b^e)
+   - 姿态反馈符号相反: C_b^e ← (I + [δψ^e×])·C_b^e  (φ-error 为减号)
 
    E 系 vs n 系 F1 矩阵差异:
    - E 系无需计算导航系旋转角速度 ω_en^n（不存在）
@@ -771,15 +777,18 @@ NHC 子滤波（P2，v 系，5 维）:
    F2 ≈ I (或带小量随机游走)
    F2 = diag([0, 0, 0, 0, 0])  或  diag([1/τ_angle, 1/τ_angle, 1/τ_lever, 1/τ_lever, 1/τ_lever])
 
-5. 离散化（双滤波分别处理）
-   Φ1 = I + F1 * dt     (15×15 或 18×18)
-   Φ2 = I + F2 * dt     (5×5)
+5. 离散化（双滤波分别处理, 自适应精度, 对齐 ignav precPhi）
+   Φ1 自适应精度 (基于 dt):
+     - dt ≤ 0.005s  (≥200Hz): 一阶 Φ = I + F·dt
+     - dt ≤ 0.01s   (100-200Hz): 二阶 Φ = I + F·dt + 0.5·(F·dt)²
+     - dt > 0.01s   (<100Hz): 矩阵指数 Φ = expm(F·dt) (自实现 _expm, 不依赖 scipy)
+   Φ2 = I + F2 * dt     (5×5, NHC 子滤波用一阶)
    Q_d1 = Q1 * dt
    Q_d2 = Q2 * dt
 
-6. 协方差预测（双滤波独立）
-   P1 = Φ1 * P1 * Φ1^T + Q_d1
-   P2 = Φ2 * P2 * Φ2^T + Q_d2
+6. 协方差预测（双滤波独立, GINav 中间值法）
+   P1 = Φ1·(P1 + 0.5·Q_d1)·Φ1^T + 0.5·Q_d1
+   P2 = Φ2·(P2 + 0.5·Q_d2)·Φ2^T + 0.5·Q_d2
    P1 = 0.5 * (P1 + P1^T)  (确保对称性)
    P2 = 0.5 * (P2 + P2^T)
 
@@ -875,7 +884,7 @@ NHC 子滤波 P2 更新（NHC 的 H2 部分）:
 ### 5.4 NHC 约束量测模型（v 系下，双滤波 H 矩阵拆分）
 
 > **真正双滤波下的 H 矩阵分离**（参考 gnss_ins_lc_nhc navstate.cc:343-353）：
-> NHC 量测同时依赖主滤波状态（δv^e、δφ^e、δb_g）和 NHC 子滤波状态（δθ_imu、δl_imu）。
+> NHC 量测同时依赖主滤波状态（δv^e、δψ^e、δb_g）和 NHC 子滤波状态（δθ_imu、δl_imu）。
 > 为保持两套 P 矩阵独立，将 H 矩阵拆分为 H1（作用于 P1）和 H2（作用于 P2）两部分。
 
 ```
@@ -897,7 +906,7 @@ H 矩阵拆分（参考 gnss_ins_lc_nhc navstate.cc:343-353）:
 
 主滤波贡献 H1（作用于 P1，仅更新 P1 中速度/姿态/陀螺零偏部分）:
   H1_vel   = R_b^v * C_e^b^T              (速度对速度误差 δv^e)
-  H1_att   = -R_b^v * C_e^b^T * [v^e ×]  (速度对姿态误差 δφ^e)
+  H1_att   = +R_b^v * C_e^b^T * [v^e ×]  (速度对姿态误差 δψ^e, ψ-error 正号)
   H1_gyro  = R_b^v * [l_imu^b ×]          (速度对陀螺零偏 δb_g)
   对应 MainStateIndex.VEL_X..VEL_Z / ATT_X..ATT_Z / GYRO_BX..GYRO_BZ
 
@@ -919,7 +928,7 @@ NHC 子滤波贡献 H2（作用于 P2，仅更新 P2 中安装角/杆臂部分�
 NHC 子滤波特点:
   - 安装角和 IMU 杆臂只在 NHC 子滤波中估计，不在主滤波的状态中
   - H1/H2 在 v 系下构造，需要安装角旋转矩阵 R_b^v
-  - 主滤波的 δv^e/δφ^e/δb_g 通过 C_e^b 转换到 v 系参与 NHC 更新
+  - 主滤波的 δv^e/δψ^e/δb_g 通过 C_e^b 转换到 v 系参与 NHC 更新
   - NHC 子滤波的反馈结果（R_b^v, l_imu）仅用于下次 NHC 量测构造，不修改主滤波状态
 
 可用性判断:
@@ -995,7 +1004,7 @@ EKF 更新后得到误差状态 δx1（主滤波）和 δx2（NHC 子滤波）�
 主滤波 P1 反馈:
 位置反馈:   r^e ← r^e - δr^e
 速度反馈:   v^e ← v^e - δv^e
-姿态反馈:   C_b^e ← (I - [δφ^e×]) * C_b^e  → 正交化
+姿态反馈:   C_b^e ← (I + [δψ^e×]) * C_b^e  → 正交化  (ψ-error: 加号, 与 φ-error 减号相反)
 陀螺零偏:   b_g ← b_g - δb_g
 加计零偏:   b_a ← b_a - δb_a
 GNSS杆臂反馈: l_gnss ← l_gnss - δl_gnss（可选，estimate_gnss_leverarm=true）
@@ -1178,7 +1187,7 @@ LcIntegration.process_epoch(epoch_data)   ← 从 estimate_queue 取数据
 
 ---
 
-## 9. 时间同步与 IMU 插值
+## 9. 时间同步与 IMU 对齐
 
 > **时间系统**：本节所有时间戳（`imu.timestamp`、`gnss.timestamp`、`t0`/`t1`/`t2`/`t_gnss`）均为 **Unix 时间戳（float 秒，与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）**。
 > 时间差 `dt` 通过 Unix 时间戳相减直接得到，无需 GPST/Unix 转换。
@@ -1186,21 +1195,22 @@ LcIntegration.process_epoch(epoch_data)   ← 从 estimate_queue 取数据
 >
 > **IMU 数据结构说明**：本节代码使用**早期设计版本** `ImuMeasurement_Design`（含 `dt`、`angular_velocity`、`acceleration` 字段，详见 StreamDesign.md 第 3.1 节），
 > 该版本将在 INS 启用后实现。当前实际 `ImuMeasurement`（`src/core/data_types.py`）字段为 `timestamp` / `week` / `accel` / `gyro`，无 `dt` 字段（`dt` 由相邻历元 timestamp 差计算）。
+>
+> **时间对齐策略**（2026-07-07 修订）：原计划参考 KF-GINS 的 `imuInterpolate()`（增量切分）实现机械编排阶段的时间同步，但经调查发现 KF-GINS / gnss_ins_lc_nhc / GINav 三个参考项目均使用**增量式 IMU**（dtheta/dvel），其增量切分方法不适用于本项目的**速率式 IMU**（gyro/accel）。因此本项目统一采用 **GNSS 时间最近邻匹配** 策略（详见 [imu.md 第 5 节](file:///home/mxl/workplace/gipylib/skills/imu.md#5-imugnss-时间对齐最近邻匹配) 和 [初始化.md 第 4 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#4-imu-时间对齐到-gnss-时间戳最近邻匹配)）。时间对齐误差（最大半个 IMU 采样周期 ≈ 5ms @100Hz）将由 EKF 作为状态参数 `δt` 在线估计（详见第 9.12 节）。
 
 ### 9.1 设计原则
 
-> 参考 KF-GINS 的 `GIEngine::newImuProcess()` 和 `imuInterpolate()` 实现。
+> **策略演变**：原参考 KF-GINS 的 `GIEngine::newImuProcess()` 和 `imuInterpolate()` 实现增量切分，现已改为最近邻匹配。
 
-**核心问题**：当 GNSS 量测时刻 t1（Unix 时间戳）落在两个 IMU 时刻 t0 和 t2 之间时，如何在不丢失 t2 数据的前提下进行精确插值？
+**核心问题**：当 GNSS 量测时刻 `t_gnss`（Unix 时间戳）落在两个 IMU 时刻 `t0` 和 `t2` 之间时，选择哪个 IMU 历元作为 `t_gnss` 时刻的代表性测量？
 
-**KF-GINS 的解决方案**：**增量切分而非弹出**。将 t2 的增量按比例切分，前半段用于 t0→t1 的机械编排，后半段保留在 imucur 中用于 t1→t2 的机械编排。
-
-**本项目的适配方案**：
+**本项目方案**（最近邻匹配）：
 1. **估计器内部维护 `imupre`/`imucur`**（参考 KF-GINS 的成员变量设计）
 2. **GNSS 数据暂存为 `pending_gnss`**，在 IMU 处理时同步消费
-3. **4 种时间对齐情况处理**（参考 KF-GINS 的 `isToUpdate`）
-4. **增量切分时只修改 `dt`**（本项目使用角速度/加速度，非增量形式）
-5. **Scheduler 简化为直接转发**，时间同步逻辑下沉到估计器
+3. **2 种时间对齐情况处理**（在区间内选最近邻 / 不在区间内）
+4. **最近邻匹配不修改原始 IMU 历元**，仅生成标记为 `t_gnss` 时刻的新 `ImuMeasurement`
+5. **时间对齐误差由 KF 在线估计**（`δt` 作为状态参数，详见第 9.12 节）
+6. **Scheduler 简化为直接转发**，时间同步逻辑下沉到估计器
 
 ### 9.2 估计器内部状态
 
@@ -1523,6 +1533,32 @@ class EstimatorThread:
             if solution:
                 self.solution_queue.put(solution)
 ```
+
+### 9.12 时间对齐误差的 KF 在线估计（预留接口）
+
+> **状态**：预留接口，当前未实现。最近邻匹配策略已上线，时间对齐误差暂时容忍（最大 5ms @100Hz），后续通过 EKF 状态扩维在线估计。
+
+**背景**：最近邻匹配策略的时间对齐误差为半个 IMU 采样周期（100Hz 下约 5ms）。该误差会耦合到位置/速度量测中，影响高精度场景下的融合精度。通过将时间误差 `δt` 作为 EKF 状态参数在线估计，可补偿该误差。
+
+**状态扩维方案**：
+
+| 维度 | 当前状态（15 维） | 扩维后（16 维） |
+|------|------------------|-----------------|
+| 状态向量 | `[δr^e(3), δv^e(3), δψ^e(3), δb_g(3), δb_a(3)]` | `[δr^e(3), δv^e(3), δψ^e(3), δb_g(3), δb_a(3), δt(1)]` |
+| F 矩阵 | 15×15 | 16×16（新增 `δt` 行/列，`F_δt,δt = -1/τ_δt`） |
+| Q 矩阵 | 15×15 | 16×16（新增 `Q_δt = σ_δt² · dt`） |
+| 量测模型 | `H = [I_3, 0, ..., 0]`（位置量测） | `H = [I_3, 0, ..., 0, ∂r/∂δt]`（新增时间误差耦合项） |
+
+**观测模型耦合**：
+- 时间误差 `δt` 通过 IMU 采样时刻与 GNSS 时刻的偏差耦合到位置/速度量测
+- `∂r/∂δt ≈ v^e`（位置误差 ≈ 速度 × 时间误差）
+- `∂v/∂δt ≈ a^e`（速度误差 ≈ 加速度 × 时间误差）
+
+**实现计划**：
+1. 扩展 `InsState` 增加 `time_bias` 字段
+2. 扩展 `TransferMatrix.build_F` / `build_Q` 增加 `δt` 维度
+3. 扩展量测雅可比 `H` 增加时间误差耦合项
+4. 初始协方差 `P0_δt` 设为 (半个采样周期)² ≈ (5ms)² = 2.5e-5 s²
 
 ---
 
