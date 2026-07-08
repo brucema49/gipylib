@@ -15,7 +15,10 @@
 > - ✅ 已实现：`src/core/ins/initializer.py::InsInitializer`（INS 初始化，三种模式 + 三阈值检验，详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
 > - ✅ 已实现：`src/core/ins/` 下 `interpolator.py` / `earth_param.py` / `attitude.py`（初始化支撑模块，EKF 也可复用）
 > - ✅ 已实现：SPP 多普勒测速（`pntpos.py::estvel` / `resdop`，速度填入 `sol.rr[3:6]`，用于 INS 动态初始化）
-> - 🚧 预留：`InsKf` / `LcEstimator` / `LcIntegration` / NHC / ZUPT / 紧组合接口（下一阶段：INS 机械编排）
+> - ✅ 已实现：`InsUpdate`（E 系机械编排，对齐 ignav ψ-error）
+> - ✅ 已实现：`InsPropagate`（P1 开环协方差传播）+ `TransferMatrix`（F/Φ/Q，ψ-error）
+> - 🚧 下一阶段：EKF 融合（`LcEstimator` / `LcIntegration` / `Nhc` / NHC / ZUPT / 闭环反馈）
+> - 🚧 预留：紧组合接口（`TcEstimator` / `TcIntegration`）
 >
 > **INS 机械编排的下一步**：
 > 路径 C（数据对齐管线）已打通 `ImuSensor` → `imu_queue` 和 `InternalGnssSensor` → `gnss_queue` 的数据通路，
@@ -911,8 +914,8 @@ H 矩阵拆分（参考 gnss_ins_lc_nhc navstate.cc:343-353）:
   对应 MainStateIndex.VEL_X..VEL_Z / ATT_X..ATT_Z / GYRO_BX..GYRO_BZ
 
 NHC 子滤波贡献 H2（作用于 P2，仅更新 P2 中安装角/杆臂部分）:
-  H2_angle = [v^v ×]_{:,2:3}              (速度对安装角误差 δθ_imu，仅 2 列)
-            参考 gnss_ins_lc_nhc: H_angle = [Vvv×]_{:,2:3}
+  H2_angle = [v^v ×][:, 1:3]              (skew(v^v) 第 1,2 列, 对应 pitch/yaw; Python 0-indexed)
+            参考 gnss_ins_lc_nhc: H_angle = [Vvv×]_{:,2:3} (1-indexed 等价)
   H2_lever = R_b^v * [ω_eb^b ×]           (速度对 IMU 杆臂误差 δl_imu)
             参考 gnss_ins_lc_nhc: H_lever = Rbv*[webb×]
   对应 NhcSubStateIndex.IMU_ANGLE_PITCH..IMU_ANGLE_YAW / IMU_LEVER_X..IMU_LEVER_Z
@@ -974,19 +977,19 @@ GnssProcessor 统一处理 SPP/RTD/RTK:
 ### 5.6 时间对齐策略
 
 ```
-本项目不估计时间同步参数，而是通过增量切分精确对齐 IMU/GNSS 时间
-（参考 KF-GINS newImuProcess + imuInterpolate）:
+本项目不估计时间同步参数 δt，而是通过最近邻匹配对齐 IMU/GNSS 时间。
+时间对齐误差（最大半个 IMU 采样周期 ≈ 5ms @100Hz）由 P1 速度协方差自然吸收。
+δt 在线估计作为未来扩展预留（详见 §9.12），不在当前实现范围。
 
 ※ 所有 timestamp 均为 Unix 时间戳（float 秒，与 rtklib-py gtime_t 一致）
 
 1. Estimator 内部维护 imupre/imucur 两个 IMU 历元
 2. GNSS 历元到达时，进入 pending_gnss (deque 缓冲，避免丢失多个 GNSS 历元)
-3. 当 imupre.timestamp ≤ gnss.timestamp ≤ imucur.timestamp 时，按 4 种时间对齐情况处理:
-   - 情况 0: imupre.timestamp == imucur.timestamp == gnss.timestamp  → 直接 GNSS 量测更新
-   - 情况 1: imupre.timestamp < imucur.timestamp == gnss.timestamp   → 直接 GNSS 量测更新（imucur 即对齐）
-   - 情况 2: imupre.timestamp == gnss.timestamp < imucur.timestamp   → 直接 GNSS 量测更新（imupre 即对齐）
-   - 情况 3: imupre.timestamp < gnss.timestamp < imucur.timestamp    → 增量切分，修改 dt 后重新机械编排
-4. 时间对齐由 Estimator 内部处理，Scheduler 仅转发
+3. 新 IMU 到达触发 time_update 后，检查 pending_gnss[0]:
+   - 若 |imucur.t - gnss.t| ≤ |imupre.t - gnss.t| (imucur 更近):
+     触发 meas_update + feedback，弹出该 GNSS
+   - 否则: 等下一个 IMU (imupre 已被消费)
+4. 最近邻不修改原始 IMU 历元，仅用最近 IMU 时刻的状态做量测更新
 5. 详见第 9 节
 ```
 
@@ -1258,178 +1261,94 @@ def add_gnss(self, gnss: GnssSolution) -> Optional[Solution]:
     return None
 ```
 
-### 9.4 时间对齐判断
+### 9.4 最近邻时间对齐（替换 KF-GINS 增量切分）
 
-参考 KF-GINS 的 `isToUpdate()` 函数，判断 GNSS 更新时机：
+> **策略演变**：原参考 KF-GINS 的 `isToUpdate()` + `imuInterpolate()` 实现增量切分，
+> 但 KF-GINS/gnss_ins_lc_nhc/GINav 三个参考项目均使用增量式 IMU（dtheta/dvel），
+> 其增量切分方法不适用于本项目的速率式 IMU（gyro/accel）。
+> 本项目统一采用 **GNSS 时间最近邻匹配** 策略。
 
 ```python
-def _is_to_update(self, t0: float, t2: float, t_gnss: float) -> int:
-    """判断 GNSS 更新时机（参考 KF-GINS isToUpdate）
+def _try_gnss_update(self) -> None:
+    """最近邻判断: 若 imucur 距 gnss 最近, 触发 meas_update + feedback。
 
-    参数（均为 Unix 时间戳，float 秒）:
-        t0: imupre 时间戳
-        t2: imucur 时间戳
-        t_gnss: GNSS 量测时间戳
-
-    返回值:
-        0: GNSS 时间不在 [t0, t2] 之间，只做 INS 传播
-        1: GNSS 时间靠近 t0，先 GNSS 更新再 INS 传播
-        2: GNSS 时间靠近 t2，先 INS 传播再 GNSS 更新
-        3: GNSS 时间在 (t0, t2) 之间但不靠近任一，需增量切分
+    当 GNSS 时间戳落在 [imupre.t, imucur.t] 之间时,
+    选时间戳最近者作为 GNSS 时刻的代表性测量。
+    最近邻不修改原始 IMU 历元, 时间对齐误差由 P1 速度协方差吸收。
     """
-    if abs(t0 - t_gnss) < self.time_align_threshold:
-        return 1  # 靠近 t0
-    elif abs(t2 - t_gnss) <= self.time_align_threshold:
-        return 2  # 靠近 t2
-    elif t0 < t_gnss < t2:
-        return 3  # 在中间
-    else:
-        return 0  # 不在区间内
+    while self.pending_gnss:
+        gnss = self.pending_gnss[0]
+        d_cur = abs(self.imucur.timestamp - gnss.timestamp)
+        d_pre = abs(self.imupre.timestamp - gnss.timestamp)
+        if d_cur <= d_pre:
+            # imucur 更近: time_update 已完成, 现在做量测更新
+            self.estimator.meas_update_pos(gnss)
+            if gnss.velocity is not None:
+                self.estimator.meas_update_vel(gnss)
+            self._apply_nhc_or_zupt()
+            self.estimator.feedback()
+            self.pending_gnss.popleft()
+        else:
+            # imupre 更近, 但 imupre 已被消费, 等下一个 IMU
+            # 若 GNSS 时间戳远小于 imupre (过时数据), 丢弃
+            if gnss.timestamp < self.imupre.timestamp - 1.0:
+                self.pending_gnss.popleft()
+                continue
+            break
 ```
 
-### 9.5 IMU 增量切分
-
-参考 KF-GINS 的 `imuInterpolate()`，本项目使用角速度/加速度形式（非增量形式），切分时只需修改 `dt`：
+### 9.5 主处理流程
 
 ```python
-def _imu_interpolate(self, imu_pre: ImuMeasurement,
-                     imu_cur: ImuMeasurement,
-                     timestamp: float) -> ImuMeasurement:
-    """IMU 增量切分（参考 KF-GINS imuInterpolate）
-
-    关键：imu_cur 被原地修改，保留剩余增量！
-
-    与 KF-GINS 的差异:
-      - KF-GINS 使用增量形式 (dtheta/dvel)，按比例切分增量
-      - 本项目使用角速度/加速度形式，切分时只修改 dt
-      - 机械编排时通过 dt 计算增量: dtheta = omega * dt
-
-    ※ 本代码使用早期设计版本 ImuMeasurement_Design（含 dt/angular_velocity/acceleration 字段）。
-      实际实现时（INS 启用后），imu_cur.angular_velocity → imu_cur.gyro,
-      imu_cur.acceleration → imu_cur.accel；dt 由相邻 timestamp 差计算或新增字段。
-    ※ timestamp 参数为 Unix 时间戳（float 秒）。
-    """
-    dt_total = imu_cur.timestamp - imu_pre.timestamp
-    lamda = (timestamp - imu_pre.timestamp) / dt_total
-
-    # 创建中间时刻 IMU（前半段）
-    midimu = ImuMeasurement(
-        timestamp=timestamp,
-        angular_velocity=imu_cur.angular_velocity,  # 角速度不变
-        acceleration=imu_cur.acceleration,          # 加速度不变
-        dt=timestamp - imu_pre.timestamp            # 前半段 dt
-    )
-
-    # 关键：imu_cur 原地保留剩余增量（只修改 dt）
-    imu_cur.dt = imu_cur.timestamp - timestamp
-
-    return midimu
-```
-
-### 9.6 主处理流程
-
-参考 KF-GINS 的 `newImuProcess()`，处理 4 种时间对齐情况：
-
-```python
-def _new_imu_process(self) -> Optional[Solution]:
-    """处理新的 IMU 数据（参考 KF-GINS newImuProcess）"""
-    if self.imupre is None or self.imucur is None:
+def add_imu(self, imu: ImuMeasurement) -> Optional[Solution]:
+    """添加 IMU: imupre←imucur, imucur←imu; time_update; 检查 pending_gnss。"""
+    if self.imucur is not None:
+        self.imupre = self.imucur
+    self.imucur = imu
+    # 第一个 IMU 不触发 time_update (无 imupre)
+    if self.imupre is None:
         return None
-
-    # 当前 IMU 时间作为系统时间
-    timestamp = self.imucur.timestamp
-
-    # 判断是否需要 GNSS 更新（从 deque 取最早一个 GNSS 历元）
-    if self.pending_gnss:
-        gnss = self.pending_gnss[0]   # 窥视队首，不弹出
-        updatetime = gnss.timestamp
-        res = self._is_to_update(self.imupre.timestamp,
-                                 self.imucur.timestamp,
-                                 updatetime)
-    else:
-        res = 0
-
-    if res == 0:
-        # 只传播导航状态
-        self._ins_propagation(self.imupre, self.imucur)
-    elif res == 1:
-        # GNSS 靠近 imupre：先 GNSS 更新，再传播
-        gnss = self.pending_gnss.popleft()
-        self._gnss_update(gnss)
-        self._state_feedback()
-        self.pvapre = self.pvacur
-        self._ins_propagation(self.imupre, self.imucur)
-    elif res == 2:
-        # GNSS 靠近 imucur：先传播，再 GNSS 更新
-        self._ins_propagation(self.imupre, self.imucur)
-        gnss = self.pending_gnss.popleft()
-        self._gnss_update(gnss)
-        self._state_feedback()
-    else:  # res == 3
-        # GNSS 在两个 IMU 之间：增量切分
-        gnss = self.pending_gnss.popleft()
-        midimu = self._imu_interpolate(self.imupre, self.imucur, updatetime)
-
-        # 前半段传播
-        self._ins_propagation(self.imupre, midimu)
-
-        # GNSS 更新
-        self._gnss_update(gnss)
-        self._state_feedback()
-
-        # 后半段传播（imucur 已被切分，dt 变小）
-        self.pvapre = self.pvacur
-        self._ins_propagation(midimu, self.imucur)
-
-    # deque 中剩余 GNSS 历元保留，等下次 IMU 到达时继续处理
-    self.pvapre = self.pvacur
+    self.estimator.time_update(imu)
+    self._try_gnss_update()
     return self._get_solution()
+
+def add_gnss(self, gnss: GnssSolution) -> None:
+    """添加 GNSS: append 到 pending_gnss deque。"""
+    self.pending_gnss.append(gnss)
+
+def _apply_nhc_or_zupt(self) -> None:
+    """NHC/ZUPT 互斥选择 (三阈值系统)。"""
+    speed = float(np.linalg.norm(self.estimator.state.vel_e))
+    w_b_ib = self.estimator.ins_update.w_b_ib
+    omega_norm = float(np.linalg.norm(w_b_ib))
+    if speed < self.static_speed_threshold:
+        self.estimator.meas_update_zupt()
+    elif omega_norm < self.angular_velocity_threshold:
+        self.estimator.meas_update_nhc(self.imucur)
+    # else: 急转弯, 两者都不用
 ```
 
-### 9.7 四种情况处理流程图
+### 9.6 时间对齐流程图
 
 ```
-GNSS(t1) 到达，IMU 缓冲区有 t0, t2
+GNSS(t1) 到达, IMU 缓冲区有 t0, t2 (t0 < t2)
 ─────────────────────────────────────────────────────────────
-
-情况1 (res=1): |t1 - t0| < 阈值 (GNSS 靠近 t0)
+情况 A: |t1 - t2| ≤ |t1 - t0| (t2 即 imucur 更近)
   ┌─────────────────────────────────────┐
-  │ 1. GNSS 更新 (使用 t0 时刻状态)     │
-  │ 2. 状态反馈                          │
-  │ 3. INS 传播: t0 → t2 (完整增量)     │
+  │ 1. time_update: t0 → t2 (完整 dt)  │
+  │ 2. GNSS 量测更新 (使用 t2 时刻状态) │
+  │ 3. NHC/ZUPT (互斥)                  │
+  │ 4. feedback                          │
   └─────────────────────────────────────┘
 
-情况2 (res=2): |t1 - t2| < 阈值 (GNSS 靠近 t2)
+情况 B: |t1 - t0| < |t1 - t2| (t0 即 imupre 更近)
   ┌─────────────────────────────────────┐
-  │ 1. INS 传播: t0 → t2 (完整增量)     │
-  │ 2. GNSS 更新 (使用 t2 时刻状态)     │
-  │ 3. 状态反馈                          │
+  │ 1. time_update: t0 → t2 (完整 dt)  │
+  │ 2. 不触发量测更新 (imupre 已消费)   │
+  │ 3. 等下一个 IMU 到达后重新判断      │
   └─────────────────────────────────────┘
-
-情况3 (res=3): t0 < t1 < t2 且不靠近任一 (GNSS 在中间)
-  ┌─────────────────────────────────────┐
-  │ 1. 增量切分:                         │
-  │    midimu = t0→t1 增量               │
-  │    imucur 保留 t1→t2 剩余增量        │
-  │                                      │
-  │ 2. INS 传播: t0 → t1 (前半段)        │
-  │ 3. GNSS 更新 (t1 时刻状态)           │
-  │ 4. 状态反馈                          │
-  │ 5. INS 传播: t1 → t2 (后半段)        │
-  │    (imucur 已切分，dt 变小)          │
-  └─────────────────────────────────────┘
-
-情况0 (res=0): GNSS 时间不在 [t0, t2] 之间
-  ┌─────────────────────────────────────┐
-  │ 只做 INS 传播: t0 → t2 (完整增量)   │
-  └─────────────────────────────────────┘
-
-下一次 IMU 数据 t3 到达:
-  ┌─────────────────────────────────────┐
-  │ imupre = imucur (t2, 剩余增量)      │
-  │ imucur = 新数据 t3                   │
-  │ 正常处理 t2 → t3                     │
-  └─────────────────────────────────────┘
+  ※ 若 GNSS 始终靠近已消费的 imupre, 会在下一个 IMU 周期
+    作为 pending_gnss 被消费 (此时新 imucur 可能更近)
 ```
 
 ### 9.8 与 E 系机械编排的适配
