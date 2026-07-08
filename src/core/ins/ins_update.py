@@ -116,9 +116,9 @@ class InsUpdate:
             leverarm=self.state.leverarm,
         )
 
-        # 6. 更新历史增量 (用于下一历元锥补/划桨)
-        self._prev_dtheta = dtheta.copy()
-        self._prev_dvel = dvel.copy()
+        # 6. 更新历史增量 (用于下一历元锥补/划桨, 存储已补偿值, 参考 ignav omgbp/fbp)
+        self._prev_dtheta = dtheta_comp.copy()
+        self._prev_dvel = dvel_comp.copy()
         self._prev_timestamp = imu.timestamp
 
         return self.state
@@ -156,8 +156,17 @@ class InsUpdate:
           delta_v = C_ee_v @ C_b_e @ (dvel + v_rot + v_scul)
           vel_new = vel + delta_v_cor + delta_v
         """
-        # 旋转补偿
-        v_rot = 0.5 * np.cross(dtheta_comp, dvel_comp)
+        # 旋转补偿 (精确 Rodrigues, 参考 ignav rotscull_corr)
+        dak = dtheta_comp
+        dvk = dvel_comp
+        dak_norm = float(np.linalg.norm(dak))
+        if dak_norm < 1e-12:
+            v_rot = np.zeros(3, dtype=np.float64)
+        else:
+            dak_sq = dak_norm * dak_norm
+            a1 = (1.0 - math.cos(dak_norm)) / dak_sq
+            a2 = (1.0 - math.sin(dak_norm) / dak_norm) / dak_sq
+            v_rot = a1 * np.cross(dak, dvk) + a2 * np.cross(dak, np.cross(dak, dvk))
         # 划桨补偿
         v_scul = (np.cross(self._prev_dtheta, dvel_comp)
                   + np.cross(self._prev_dvel, dtheta_comp)) / 12.0
