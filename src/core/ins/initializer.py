@@ -76,11 +76,11 @@ class InsInitializer:
         gnss = aligned_block.gnss
         imu_list = aligned_block.imu_list
 
-        # 1. IMU 插值到 GNSS 时间戳 (验证包夹条件)
-        interp_imu = self._interpolate_imu(imu_list, gnss.timestamp)
+        # 1. IMU 时间对齐到 GNSS 时间戳 (最近邻匹配, 验证包夹条件)
+        interp_imu = self._align_imu_to_gnss(imu_list, gnss.timestamp)
         if interp_imu is None:
             raise ValueError(
-                "IMU 数据不满足插值包夹条件 (GNSS 时间戳前后需各有 IMU 历元)"
+                "IMU 数据不满足包夹条件 (GNSS 时间戳前后需各有 IMU 历元)"
             )
 
         # 2. 动态模式下检查陀螺角速度范数 (< 30 deg/s)
@@ -117,9 +117,13 @@ class InsInitializer:
 
         return state, P1, P2
 
-    def _interpolate_imu(self, imu_list: List[ImuMeasurement],
-                         t_gnss: float) -> Optional[ImuMeasurement]:
-        """IMU 数据插值到 GNSS 时间戳 (初始化.md 第 4 节)。"""
+    def _align_imu_to_gnss(self, imu_list: List[ImuMeasurement],
+                           t_gnss: float) -> Optional[ImuMeasurement]:
+        """IMU 数据时间对齐到 GNSS 时间戳 (最近邻匹配, 初始化.md 第 4 节)。
+
+        从 imu_list 中找包夹 t_gnss 的两个历元，选时间戳最近者返回。
+        时间对齐误差 (最大半个 IMU 采样周期) 后续由 KF 估计。
+        """
         if not imu_list:
             return None
         bracket = find_bracket_imus(imu_list, t_gnss)

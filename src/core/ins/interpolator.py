@@ -1,11 +1,12 @@
-"""IMU 插值工具。
+"""IMU 时间对齐工具（最近邻匹配策略）。
 
-参考 gnss_ins_lc_nhc navdataque.cc SortData 的线性插值策略（主参考）。
-参考 KF-GINS gi_engine.h imuInterpolate / isToUpdate（概念参考）。
+原线性插值策略参考 gnss_ins_lc_nhc navdataque.cc SortData，但经调查发现：
+- gnss_ins_lc_nhc 使用增量式 IMU（gyro_/acce_ 实为 dtheta/dvel），SortData
+  做的是增量切分（按比例分割增量），不适用于速率式 IMU
+- tools/GINav 也使用增量式 IMU（imu.dw/dv），初始化时无时间插值
 
-本项目使用速率式 IMU（gyro/accel 原始测量，非增量式 dtheta/dvel）：
-- 当 |t_gnss - t_imu| < 1ms 时直接匹配，不插值
-- 否则对前后两个 IMU 历元的 gyro/accel 按时间比例 α 做线性插值
+因此改为 GNSS 时间最近邻匹配 IMU 数据，不进行精细化插值。
+时间对齐误差（最大半个 IMU 采样周期 ≈ 5ms @100Hz）后续由 KF 在线估计。
 """
 from typing import Optional
 
@@ -14,79 +15,56 @@ from src.core.data_types import ImuMeasurement
 
 def is_to_update(t0: float, t2: float, t_gnss: float,
                  threshold: float = 1e-3) -> int:
-    """判断 GNSS 时间戳与 IMU 时间区间的关系。
+    """判断 GNSS 时间戳与 IMU 时间区间的关系（最近邻版）。
 
     Args:
         t0: imu_pre.timestamp
         t2: imu_cur.timestamp
         t_gnss: GNSS 时间戳
-        threshold: 时间对齐阈值 (s), 默认 1ms（用户指定；gnss_ins_lc_nhc 用 2ms）
+        threshold: 保留参数（最近邻策略不使用，兼容接口）
 
     Returns:
         0: t_gnss 不在 [t0, t2] 之间
-        1: t_gnss 靠近 t0 (|t0 - t_gnss| < threshold)，直接匹配
-        2: t_gnss 靠近 t2 (|t2 - t_gnss| <= threshold)，直接匹配
-        3: t0 < t_gnss < t2，需要线性插值
+        1: 最近邻为 imu_pre（t_gnss 靠近 t0）
+        2: 最近邻为 imu_cur（t_gnss 靠近 t2）
     """
-    if abs(t0 - t_gnss) < threshold:
-        return 1
-    elif abs(t2 - t_gnss) <= threshold:
-        return 2
-    elif t0 < t_gnss < t2:
-        return 3
-    else:
-        return 0
+    if t0 <= t_gnss <= t2:
+        dt0 = abs(t0 - t_gnss)
+        dt2 = abs(t2 - t_gnss)
+        return 1 if dt0 <= dt2 else 2
+    return 0
 
 
 def imu_interpolate(imu_pre: ImuMeasurement, imu_cur: ImuMeasurement,
                     t_gnss: float) -> Optional[ImuMeasurement]:
-    """线性插值, 返回 t_gnss 时刻的 IMU 历元。
+    """最近邻匹配：返回时间戳最接近 t_gnss 的 IMU 历元（不插值）。
 
-    速率式 IMU 线性插值策略（参考 gnss_ins_lc_nhc SortData）：
-    - 情况 1/2（|t_gnss - t_imu| < 1ms）：直接匹配，不插值
-    - 情况 3（t0 < t_gnss < t2）：按 α = (t_gnss - t_pre) / (t_cur - t_pre)
-      对 gyro/accel 做线性插值
+    速率式 IMU 最近邻策略：
+    - 在包夹区间 [imu_pre, imu_cur] 内，选时间戳最接近 t_gnss 的历元
+    - 时间对齐误差（最大半个 IMU 采样周期）后续由 KF 估计
 
     Args:
-        imu_pre: 前一个 IMU 历元 (timestamp < t_gnss)
+        imu_pre: 前一个 IMU 历元 (timestamp <= t_gnss)
         imu_cur: 当前 IMU 历元 (timestamp >= t_gnss)
         t_gnss: GNSS 时间戳
 
     Returns:
-        t_gnss 时刻的 ImuMeasurement, 或 None (时间戳不在区间内)
+        t_gnss 时刻标记的 ImuMeasurement（数据来自最近邻历元），或 None
     """
     case = is_to_update(imu_pre.timestamp, imu_cur.timestamp, t_gnss)
     if case == 0:
         return None
-    elif case == 1:
-        # 直接匹配 imu_pre，不插值
-        return ImuMeasurement(
-            timestamp=t_gnss,
-            week=imu_pre.week,
-            accel=imu_pre.accel.copy(),
-            gyro=imu_pre.gyro.copy(),
-        )
-    elif case == 2:
-        # 直接匹配 imu_cur，不插值
-        return ImuMeasurement(
-            timestamp=t_gnss,
-            week=imu_cur.week,
-            accel=imu_cur.accel.copy(),
-            gyro=imu_cur.gyro.copy(),
-        )
-    else:  # case == 3: 线性插值
-        dt_total = imu_cur.timestamp - imu_pre.timestamp
-        if dt_total <= 0:
-            return None
-        alpha = (t_gnss - imu_pre.timestamp) / dt_total
-        gyro_interp = imu_pre.gyro + (imu_cur.gyro - imu_pre.gyro) * alpha
-        accel_interp = imu_pre.accel + (imu_cur.accel - imu_pre.accel) * alpha
-        return ImuMeasurement(
-            timestamp=t_gnss,
-            week=imu_cur.week,
-            accel=accel_interp,
-            gyro=gyro_interp,
-        )
+
+    dt_pre = abs(imu_pre.timestamp - t_gnss)
+    dt_cur = abs(imu_cur.timestamp - t_gnss)
+    nearest = imu_pre if dt_pre <= dt_cur else imu_cur
+
+    return ImuMeasurement(
+        timestamp=t_gnss,
+        week=nearest.week,
+        accel=nearest.accel.copy(),
+        gyro=nearest.gyro.copy(),
+    )
 
 
 def find_bracket_imus(imu_list, t_gnss: float
@@ -105,7 +83,7 @@ def find_bracket_imus(imu_list, t_gnss: float
         t0 = imu_list[i].timestamp
         t2 = imu_list[i + 1].timestamp
         case = is_to_update(t0, t2, t_gnss)
-        if case in (1, 2, 3):
+        if case in (1, 2):
             return (imu_list[i], imu_list[i + 1], case)
 
     # 检查是否 t_gnss 在所有 IMU 之前或之后

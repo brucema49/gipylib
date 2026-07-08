@@ -236,6 +236,7 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 | `data_rate` | double | `100` | Hz | >0 | IMU 采样率。`external` 模式仅支持 100 Hz |
 | `result_output_rate` | double | `1` | Hz | >0 | 结果输出率 |
 | `imudatalen` | int | `7` | — | ≥7 | IMU 文件列数（只用前 7 列） |
+| `imu_format` | str | `"gpst"` | — | `gpst` / `euroc` | IMU 数据文件格式。`gpst`=GPS 周+周内秒（`week,sow,gx,gy,gz,ax,ay,az`），由 `ImuFormator` 解码；`euroc`=Unix 纳秒时间戳（`timestamp_ns,wx,wy,wz,ax,ay,az`），由 `EuRoCImuFormator` 解码。`ImuSensor._create_formator()` 根据此参数工厂创建对应解码器（详见 [imu.md](file:///home/mxl/workplace/gipylib/skills/imu.md) / [StreamDesign.md](file:///home/mxl/workplace/gipylib/skills/StreamDesign.md)） |
 
 ### 2.5 初始对准
 
@@ -253,6 +254,8 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 | `alignnment_dynamic_method` | str | `"auto"` | — | `auto` / `velocity_vector` / `position_diff` | 动对准方法选择（[初始化.md 5.4.1](file:///home/mxl/workplace/gipylib/skills/初始化.md#541-默认规则)）。`auto`=按 GNSS 模式自动选择；`velocity_vector`=强制速度矢量；`position_diff`=强制位置差分 |
 | `gnss_velocity_fallback` | str | `"position_diff"` | — | `doppler` / `position_diff` / `auto` | GNSS 无速度时回退策略（[初始化.md 5.4.2](file:///home/mxl/workplace/gipylib/skills/初始化.md#542-gnss-不提供速度时的统一回退策略)）。**注意**：动态模式下 GNSS 不提供速度时统一使用位置差分法 |
 | `gnss_buffer_size` | int | `3` | 个 | ≥2 | 位置差分初始化的 GNSS 历元缓冲区大小（[初始化.md 9.3](file:///home/mxl/workplace/gipylib/skills/初始化.md#93-处理流程伪代码)）。运动阈值达到时确保缓冲区存满 N 个历元，但**只用最新两个历元**计算差分速度。第 3 个历元提供历史冗余（fallback） |
+| `high_precision_ins_mode` | bool | `false` | — | true / false | 高精度 INS 初始化模式（[初始化调整.md](file:///home/mxl/workplace/gipylib/skills/初始化调整.md)）。`false`=低精度模式（本项目当前实现：静态位置 GNSS 历史平均 + 姿态置 0 + 速度置 0）；`true`=高精度模式（预留，AcceLeveling + 解析寻北，后续实现） |
+| `static_duration` | double | `10.0` | s | >0 | 静态初始化 GNSS 位置平均窗口（[初始化.md 7.3](file:///home/mxl/workplace/gipylib/skills/初始化.md#73-静态位置平均)）。GNSS 历史少于 `static_duration` 秒时用全部历元求平均；多于时取最新 `static_duration` 秒内的历元求平均 |
 
 **`alignnment_dynamic_method="auto"` 时的默认规则**：
 
@@ -287,12 +290,12 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 | `initial_acce_scale` | array[3] | `[0, 0, 0]` | ppm | — | 初始加计比例因子 [x, y, z] |
 | `evaluate_imu_scale` | int | `0` | — | 0 / 1 | 1=估计 IMU 比例因子（P1 扩展 6 维） |
 
-**单位转换**（参考 KF-GINS `loadConfig`，[初始化.md 11.2 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#112-单位转换参考-kf-gins-loadconfig)）：
+**单位转换**（参考 `tools/gnss_ins_lc_nhc` `StartAligning` 与 `constant.hpp`，[初始化.md 11.2 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#112-单位转换参考-kf-gins-loadconfig)）：
 - 纬度/经度：度 → 弧度（`rad = deg * D2R`）
 - 姿态角：度 → 弧度
-- 陀螺零偏：°/h → rad/s（`rad/s = deg/h * D2R / 3600`）
-- 加计零偏：mGal → m/s²（`m/s² = mGal * 1e-5`）
-- 比例因子：ppm → 无量纲（`= ppm * 1e-6`）
+- 陀螺零偏：deg/h → rad/s（`rad/s = deg/h * dh2rs`，`dh2rs = π / 180.0 / 3600.0`）
+- 加计零偏：mGal → m/s²（`m/s² = mGal * 1e-6 * g0`，`g0 = 9.7803267715`，即 `constant_mGal ≈ 9.78e-6`；**注意：非标准 `1e-5`**）
+- 比例因子：ppm → 无量纲（`= ppm * 1e-6`，`constant_ppm = 1e-6`）
 
 ### 2.7 IMU 噪声参数
 

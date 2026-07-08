@@ -17,7 +17,7 @@
 > **当前实现状态**：
 > - ✅ 已实现：`src/stream/base.py::BaseSensor` + `StreamerBase`（流式读取基类，逐行读取 + EOF sentinel）
 > - ✅ 已实现：`src/stream/factory.py::SensorFactory`（根据 gnss_source + ins.enabled 装配传感器）
-> - ✅ 已实现：`src/stream/formators.py::ImuFormator` / `PosSolFormator`（IMU CSV / rtklib POS 解码，时间戳 Unix 化）
+> - ✅ 已实现：`src/stream/formators.py::ImuFormator`（GPST 格式）/ `EuRoCImuFormator`（EuRoC 格式）/ `PosSolFormator`（rtklib POS 解码，时间戳 Unix 化）
 > - ✅ 已实现：`src/stream/imu_sensor.py::ImuSensor`（IMU 传感器线程，含 RFU→FRD 坐标系自动转换 `_convert_to_frd()`）
 > - ✅ 已实现：`src/stream/gnss_sol_sensor.py::GnssSolSensor`（外部 GNSS 结果传感器线程）
 > - ✅ 已实现：`src/stream/internal_gnss_sensor.py::InternalGnssSensor`（内部 GNSS 解算传感器线程，逐历元调用 pntpos/relpos，SPP 模式含多普勒测速）
@@ -152,11 +152,21 @@ class ImuMeasurement_Design:
     #   - 机械编排时通过 dt 计算增量: dtheta = omega * dt, dvel = f * dt
 ```
 
-**IMU CSV 输入格式**（由 `ImuFormator` 解码）：
+**IMU CSV 输入格式**（由 `src/stream/formators.py` 解码，支持两种格式，由配置项 `ins.imu_format` 选择）：
+
+**GPST 格式**（`imu_format: "gpst"`，由 `ImuFormator` 解码）：
 ```
 GPS week, GPS sow, gx, gy, gz, ax, ay, az
 ```
 解码时通过 `gpst_to_unix(week, sow)` 转换为 Unix 时间戳。
+
+**EuRoC 格式**（`imu_format: "euroc"`，由 `EuRoCImuFormator` 解码）：
+```
+timestamp_ns, wx, wy, wz, ax, ay, az
+```
+解码时 `timestamp = timestamp_ns / 1e9`（Unix 纳秒 → Unix 秒），GPS 周号由 `unix_to_gpst(timestamp)` 派生。原始坐标系默认为 RFU，由 `ImuSensor._convert_to_frd()` 转 FRD。
+
+**格式选择**：`ImuSensor._create_formator(imu_format)` 工厂方法根据 `imu_format` 配置值创建对应解码器实例。
 
 ### 3.2 GNSS 观测值
 
@@ -361,7 +371,8 @@ SensorFactory                            # ✅ 工厂模式：根据 gnss_source
   解码层（Formator，自定义格式适配）
 ═══════════════════════════════════════════════════════════
 FormatorBase (抽象基类, 自定义解码接口)   # ✅
-├── ImuFormator       — ✅ IMU CSV 解码（GPST week,sow → Unix 时间戳）
+├── ImuFormator       — ✅ IMU CSV 解码（GPST 格式: week,sow → Unix 时间戳）
+├── EuRoCImuFormator  — ✅ IMU CSV 解码（EuRoC 格式: timestamp_ns → Unix 时间戳, GPS 周号派生）
 └── PosSolFormator    — ✅ rtklib POS 格式解码（ymdhms → GPST → Unix 时间戳）
 ```
 
@@ -437,9 +448,10 @@ class StreamerBase(BaseSensor, Thread):
 - `get_data()` 从 `output_queue` 非阻塞取数据，无数据返回 `None`
 - `Thread.__init__` 必须先于 `BaseSensor.__init__` 调用（因为 `Thread.name` 是 property）
 
-### 5.3 ImuFormator 与 PosSolFormator（实际实现）
+### 5.3 ImuFormator / EuRoCImuFormator / PosSolFormator（实际实现）
 
-> 两个 Formator 都在 `src/stream/formators.py` 中实现，时间戳在解码时统一转为 Unix 时间戳。
+> 三个 Formator 都在 `src/stream/formators.py` 中实现，时间戳在解码时统一转为 Unix 时间戳。
+> `ImuSensor._create_formator(imu_format)` 工厂方法根据配置项 `ins.imu_format`（`gpst` / `euroc`）创建对应 IMU 解码器实例。
 
 ```python
 # src/stream/formators.py
@@ -455,6 +467,27 @@ class ImuFormator(FormatorBase):
             week=week,
             accel=np.array([ax, ay, az], dtype=np.float64),
             gyro=np.array([gx, gy, gz], dtype=np.float64),
+        )
+        return SensorData(tag="imu", imu=imu)
+
+
+class EuRoCImuFormator(FormatorBase):
+    """IMU 文本解码（EuRoC 格式）。
+    输入列: timestamp [ns], w_x, w_y, w_z, a_x, a_y, a_z
+    时间戳为 Unix 纳秒，除以 1e9 转换为 Unix 秒。
+    GPS 周号由 Unix 时间戳派生（unix_to_gpst）。
+    坐标系默认为 RFU (Right-Front-Up)，由 ImuSensor 负责转换为 FRD。
+    """
+    def decode(self, line: str) -> Optional[SensorData]:
+        parts = line.strip().split(",")
+        timestamp_ns = int(parts[0])
+        timestamp = timestamp_ns / 1e9  # Unix 纳秒 → Unix 秒
+        week, _ = unix_to_gpst(timestamp)  # GPS 周号派生
+        imu = ImuMeasurement(
+            timestamp=timestamp,
+            week=week,
+            accel=np.array([ax, ay, az], dtype=np.float64),
+            gyro=np.array([wx, wy, wz], dtype=np.float64),
         )
         return SensorData(tag="imu", imu=imu)
 
@@ -2191,7 +2224,7 @@ gipylib/
 │   │   ├── __init__.py
 │   │   ├── base.py              # ✅ BaseSensor（抽象基类）+ StreamerBase（流式读取基类，继承 BaseSensor + Thread）
 │   │   ├── factory.py           # ✅ SensorFactory 工厂模式动态创建传感器
-│   │   ├── formators.py         # ✅ FormatorBase + ImuFormator + PosSolFormator（解码器统一在此文件）
+│   │   ├── formators.py         # ✅ FormatorBase + ImuFormator (GPST) + EuRoCImuFormator (EuRoC) + PosSolFormator（解码器统一在此文件）
 │   │   ├── imu_sensor.py        # ✅ ImuSensor IMU 传感器线程（继承 StreamerBase）
 │   │   ├── gnss_sol_sensor.py   # ✅ GnssSolSensor 外部 GNSS 结果传感器线程（继承 StreamerBase）
 │   │   ├── internal_gnss_sensor.py # ✅ InternalGnssSensor 内部 GNSS 解算传感器线程（直接 Thread 子类）
@@ -2222,7 +2255,7 @@ gipylib/
 ```
 
 **与早期设计的差异**：
-- `formators/` 目录已合并为单文件 `formators.py`（含 `FormatorBase` + `ImuFormator` + `PosSolFormator`）
+- `formators/` 目录已合并为单文件 `formators.py`（含 `FormatorBase` + `ImuFormator` (GPST) + `EuRoCImuFormator` (EuRoC) + `PosSolFormator`）
 - `base_sensor.py` + `streamer_base.py` 已合并为 `base.py`（`BaseSensor` + `StreamerBase`）
 - `sensor_factory.py` 实际为 `factory.py`
 - `imu_streamer.py` / `gnss_sol_streamer.py` 实际为 `imu_sensor.py` / `gnss_sol_sensor.py`

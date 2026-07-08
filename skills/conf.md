@@ -260,6 +260,7 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 | `data_rate` | int | `100` | Hz | IMU 采样率 | `data_rate` |
 | `result_output_rate` | int | `1` | Hz | 结果输出率 | `result_output_rate` |
 | `imudatalen` | int | `7` | — | IMU 文件列数（只用前 7 列） | 参考 kf-gins |
+| `imu_format` | str | `"gpst"` | — | IMU 数据文件格式。`gpst`=GPS 周+周内秒（`week,sow,gx,gy,gz,ax,ay,az`），由 `ImuFormator` 解码；`euroc`=Unix 纳秒时间戳（`timestamp_ns,wx,wy,wz,ax,ay,az`），由 `EuRoCImuFormator` 解码。`ImuSensor._create_formator()` 根据此参数工厂创建对应解码器（详见 [imu.md](file:///home/mxl/workplace/gipylib/skills/imu.md) / [StreamDesign.md](file:///home/mxl/workplace/gipylib/skills/StreamDesign.md)） | GInsStream 扩展 |
 
 ### 4.4 初始对准
 
@@ -279,6 +280,8 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 | `gnss_buffer_size` | int | `3` | 个 | 位置差分初始化的 GNSS 历元缓冲区大小（[初始化.md 9.3](file:///home/mxl/workplace/gipylib/skills/初始化.md#93-处理流程伪代码)）。运动阈值达到时确保缓冲区存满 N 个历元，但只用最新两个历元计算差分速度 | — |
 | `alignnment_attitude_mode` | int | `1` | — | 0=自动对准 / 1=使用给定姿态 `initial_att` | `alignnment_attitude_mode` |
 | `alignnment_posvelatt_mode` | int | `0` | — | 1=使用给定位置速度姿态对准（最高优先级） | `alignnment_posvelatt_mode` |
+| `high_precision_ins_mode` | bool | `false` | — | 高精度 INS 初始化模式（[初始化调整.md](file:///home/mxl/workplace/gipylib/skills/初始化调整.md)）。`false`=低精度模式（本项目当前实现：静态位置 GNSS 历史平均 + 姿态置 0 + 速度置 0）；`true`=高精度模式（预留，AcceLeveling + 解析寻北，后续实现） | GInsStream 扩展 |
+| `static_duration` | double | `10.0` | s | 静态初始化 GNSS 位置平均窗口（[初始化.md 7.3](file:///home/mxl/workplace/gipylib/skills/初始化.md#73-静态位置平均)）。GNSS 历史少于 `static_duration` 秒时用全部历元求平均；多于时取最新 `static_duration` 秒内的历元求平均 | GInsStream 扩展 |
 
 **三阈值选择建议**（[初始化.md 5.4.3](file:///home/mxl/workplace/gipylib/skills/初始化.md#543-三组独立阈值static_speed--dynamic_speed--angular_velocity)）：
 
@@ -474,8 +477,11 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 | `data/cpt_euroc.csv` | EuRoC 格式 | EuRoC 格式的 IMU 文件 |
 | `data/cpt_imu.csv` | ADIS 格式 | ADIS 格式的 IMU 文件，逗号和空格都可以做分隔符 |
 
-> IMU 文件解码由 `src/stream/formators.py::ImuFormator` 实现，列格式：`week,sow,gx,gy,gz,ax,ay,az`。
-> 解码时通过 `gpst_to_unix(week, sow)` 转为 Unix 时间戳。
+> IMU 文件解码由 `src/stream/formators.py` 实现，支持两种格式（由配置项 `ins.imu_format` 选择）：
+> - **GPST 格式**（`imu_format: "gpst"`，由 `ImuFormator` 解码，对应 `data/cpt_imu.csv`）：列格式 `week,sow,gx,gy,gz,ax,ay,az`，解码时通过 `gpst_to_unix(week, sow)` 转为 Unix 时间戳。
+> - **EuRoC 格式**（`imu_format: "euroc"`，由 `EuRoCImuFormator` 解码，对应 `data/cpt_euroc.csv`）：列格式 `timestamp_ns,wx,wy,wz,ax,ay,az`，解码时 `timestamp = timestamp_ns / 1e9`（Unix 纳秒 → Unix 秒），GPS 周号由 `unix_to_gpst` 派生；坐标系默认 RFU，由 `ImuSensor._convert_to_frd()` 转 FRD。
+>
+> `ImuSensor._create_formator(imu_format)` 工厂方法根据 `imu_format` 配置值创建对应解码器实例。
 
 ### 7.2 GNSS 观测值文件
 

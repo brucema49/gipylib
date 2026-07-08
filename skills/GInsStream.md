@@ -13,7 +13,7 @@
 > - ✅ 已实现：rtklib-py 已吸收到 `src/core/gnss/rtklib/`（7 个核心模块），通过 `_CfgProxy` 单例管理配置
 > - ✅ 已实现：`SppProcessor` / `RtkProcessor` 薄封装 rtklib-py 的 `pntpos` / `relpos`（SPP 含多普勒测速 `estvel` / `resdop`）
 > - ✅ 已实现：`InternalGnssSensor`（内部模式传感器线程）/ `GnssSolSensor`（外部模式传感器线程）
-> - ✅ 已实现：`ImuSensor` + `ImuFormator`（IMU CSV 流式读取，含 RFU→FRD 坐标系自动转换）+ `Aligner`（IMU 积攒 + GNSS 收割匹配）
+> - ✅ 已实现：`ImuSensor` + `ImuFormator`（GPST 格式）/ `EuRoCImuFormator`（EuRoC 格式）双解码器（IMU CSV 流式读取，含 RFU→FRD 坐标系自动转换）+ `Aligner`（IMU 积攒 + GNSS 收割匹配）
 > - ✅ 已实现：`SolutionWriter` / `AlignedWriter` / `Logger` / `SolutionLogger`
 > - ✅ 已实现：三种运行模式——internal+off（纯 GNSS，输出 .pos）/ external+on（外部对齐 CSV）/ internal+on（内部对齐 CSV，实时解算+IMU 对齐）
 > - ✅ 已实现：`src/core/ins/initializer.py::InsInitializer`（INS 初始化，三种模式：静态 / 速度矢量 / 位置差分，三阈值检验，详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
@@ -385,7 +385,7 @@ gipylib/
 │   │   ├── __init__.py
 │   │   ├── base.py                # ✅ BaseSensor 传感器抽象基类（强制 get_data）
 │   │   ├── factory.py             # ✅ SensorFactory 工厂模式动态创建传感器
-│   │   ├── formators.py           # ✅ ImuFormator / PosSolFormator 解码器
+│   │   ├── formators.py           # ✅ ImuFormator (GPST) / EuRoCImuFormator (EuRoC) / PosSolFormator (rtklib POS) 解码器
 │   │   ├── imu_sensor.py          # ✅ ImuSensor IMU 传感器线程
 │   │   ├── gnss_sol_sensor.py     # ✅ GnssSolSensor 外部 GNSS 结果传感器线程
 │   │   └── internal_gnss_sensor.py # ✅ InternalGnssSensor 内部 GNSS 解算传感器线程
