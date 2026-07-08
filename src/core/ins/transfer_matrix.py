@@ -12,7 +12,12 @@ import math
 
 import numpy as np
 
-from src.core.ins.earth_param import EARTH_ROTATION_RATE
+from src.core.ins.earth_param import (
+    EARTH_ROTATION_RATE,
+    ecef2llh,
+    georadi,
+    gravity_ecef,
+)
 
 
 def skew(v: np.ndarray) -> np.ndarray:
@@ -87,13 +92,14 @@ class TransferMatrix:
         self.w_ie_e = np.array([0.0, 0.0, EARTH_ROTATION_RATE], dtype=np.float64)
 
     def build_F(self, C_b_e: np.ndarray, f_b: np.ndarray,
-                w_b_ib: np.ndarray) -> np.ndarray:
-        """构造 15x15 连续时间 F 矩阵。
+                w_b_ib: np.ndarray, pos_e: np.ndarray) -> np.ndarray:
+        """构造 15x15 连续时间 F 矩阵 (ψ-error 模型, 对齐 ignav)。
 
         Args:
             C_b_e: 3x3 旋转矩阵 b→e
             f_b: 3 比力 (b 系, m/s²)
             w_b_ib: 3 角速度 (b 系, rad/s)
+            pos_e: 3 ECEF 位置 (m)
 
         Returns:
             15x15 F 矩阵
@@ -103,21 +109,29 @@ class TransferMatrix:
         # F_rv = I (位置-速度耦合)
         F[0:3, 3:6] = np.eye(3)
 
-        # F_vv = -2*[ω_ie^e×]  (Coriolis, 保留)
+        # F_vr = -2/(re·|pos|) · ge ⊗ pos  (重力梯度, 参考 ignav getF)
+        ge = gravity_ecef(pos_e)
+        lat, _, _ = ecef2llh(pos_e)
+        re = georadi(lat)
+        pos_norm = np.linalg.norm(pos_e)
+        if pos_norm > 1.0:
+            F[3:6, 0:3] = -2.0 / (re * pos_norm) * np.outer(ge, pos_e)
+
+        # F_vv = -2*[ω_ie^e×]  (Coriolis)
         F[3:6, 3:6] = -2.0 * skew(self.w_ie_e)
 
-        # F_vφ = [C_b_e · f_b×]  (速度-姿态耦合, 比力叉乘)
+        # F_vψ = -[C_b_e·f_b×]  (ψ-error: 负号, 对齐 ignav)
         f_e = C_b_e @ f_b
-        F[3:6, 6:9] = skew(f_e)
+        F[3:6, 6:9] = -skew(f_e)
 
         # F_vba = C_b_e  (加计零偏 → 速度)
         F[3:6, 12:15] = C_b_e
 
-        # F_φφ = -[ω_ie^e×]  (Coriolis, 保留)
+        # F_ψψ = -[ω_ie^e×]  (Coriolis)
         F[6:9, 6:9] = -skew(self.w_ie_e)
 
-        # F_φbg = -C_b_e  (陀螺零偏 → 姿态)
-        F[6:9, 9:12] = -C_b_e
+        # F_ψbg = +C_b_e  (ψ-error: 正号, 对齐 ignav)
+        F[6:9, 9:12] = C_b_e
 
         # F_bgbg = -I / tau_gyro  (陀螺零偏一阶马尔可夫)
         F[9:12, 9:12] = -np.eye(3) / self.tau_gyro
