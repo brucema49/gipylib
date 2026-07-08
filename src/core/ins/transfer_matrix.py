@@ -41,6 +41,32 @@ def rodrigues(phi: np.ndarray) -> np.ndarray:
     return np.eye(3, dtype=np.float64) + s * K + (1.0 - c) * (K @ K)
 
 
+def _expm(A: np.ndarray, order: int = 10) -> np.ndarray:
+    """矩阵指数 (scaling-and-squaring + Taylor 级数, 不依赖 scipy)。
+
+    参考 ignav precPhi (ins-gnss.cc line 1064-1088) 的矩阵指数实现。
+
+    Args:
+        A: 方阵
+        order: Taylor 级数阶数
+
+    Returns:
+        exp(A)
+    """
+    n = A.shape[0]
+    norm = float(np.linalg.norm(A, np.inf))
+    s = int(np.ceil(np.log2(norm))) if norm > 1.0 else 0
+    A_scaled = A / (2.0 ** s)
+    result = np.eye(n, dtype=np.float64)
+    term = np.eye(n, dtype=np.float64)
+    for k in range(1, order + 1):
+        term = term @ A_scaled / k
+        result += term
+    for _ in range(s):
+        result = result @ result
+    return result
+
+
 class TransferMatrix:
     """F / Φ / Q 矩阵构造器。
 
