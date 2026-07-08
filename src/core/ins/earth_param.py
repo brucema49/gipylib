@@ -98,3 +98,19 @@ def gravity_ecef(pos_e: np.ndarray) -> np.ndarray:
     gamma_e[0] += omega2 * x
     gamma_e[1] += omega2 * y
     return gamma_e
+
+
+def georadi(lat: float) -> float:
+    """地心半径 (参考 ignav georadi, ins-gnss.cc line 214-218)。
+
+    Args:
+        lat: 纬度 (rad)
+
+    Returns:
+        地心半径 (m)
+    """
+    s = math.sin(lat)
+    c = math.cos(lat)
+    e_sq = EARTH_ECCENTRICITY_SQ
+    return EARTH_SEMI_MAJOR / math.sqrt(1.0 - e_sq * s * s) * \
+        math.sqrt(c * c + (1.0 - e_sq) ** 2 * s * s)
