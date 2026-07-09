@@ -39,11 +39,10 @@ class InsState:
     att_rpy: np.ndarray           # [3] 欧拉角 [roll,pitch,yaw] (rad)
     gyro_bias: np.ndarray         # [3] 陀螺零偏 (rad/s)
     accel_bias: np.ndarray        # [3] 加计零偏 (m/s²)
-    gyro_scale: np.ndarray        # [3] 陀螺比例因子 (无量纲)
-    accel_scale: np.ndarray       # [3] 加计比例因子 (无量纲)
     imu_angle: np.ndarray         # [2] IMU 安装角 [pitch,yaw] (rad)
     imu_leverarm: np.ndarray      # [3] IMU 杆臂 b→v (m)
     leverarm: np.ndarray          # [3] GNSS 天线杆臂 (b 系, m)
+    time_sync: float = 0.0        # IMU-GNSS 时间对齐误差 (s)
 
 
 @dataclass

@@ -1,12 +1,13 @@
-"""松组合 EKF 估计器 (P1 主滤波 + P2 NHC 子滤波)。
+"""松组合 EKF 估计器 (单滤波, StateIndex 参数块管理)。
 
 参考:
 - gnss_ins_lc_nhc navfilter.cc (TimeUpdate/MeasureUpdate/ReviseState)
 - ignav ins-gnss.cc (H 矩阵 + 序贯 Joseph form)
 - GINav ins_time_updata.m (中间值法 P 传播)
 
-P1: 15 维 E 系 [δr^e, δv^e, δψ^e, δb_g, δb_a] (ψ-error)
-P2: 5 维 v 系 [δθ_imu(2), δl_imu(3)] (NHC 子滤波)
+状态向量 (N = si.dim):
+  固定 15 维: [δr^e, δv^e, δψ^e, δb_g, δb_a] (ψ-error, E 系)
+  可选: lever_arm(3), imu_angle(2), imu_leverarm(3), time_sync(1)
 """
 import dataclasses
 import logging
@@ -19,27 +20,26 @@ from src.core.ins.attitude import dcm2euler, dcm2quat
 from src.core.ins.earth_param import cal_Ce2n, ecef2llh
 from src.core.ins.ins_update import InsUpdate
 from src.core.ins.nhc import Nhc
+from src.core.ins.state_index import StateIndex
 from src.core.ins.transfer_matrix import TransferMatrix, skew
 
 logger = logging.getLogger(__name__)
 
 
 class LcEstimator:
-    """松组合 EKF 估计器 (双滤波 P1 + P2)。
+    """松组合 EKF 估计器 (单滤波, StateIndex 参数块管理)。
 
-    P1 主滤波: 15 维 E 系, 复用 TransferMatrix (F/Φ/Q, ψ-error)
-    P2 NHC 子滤波: 5 维 v 系, F2=0 (常数过程)
+    参考 gnss_ins_lc_nhc (单滤波 + StateIndex) 和 GREAT-MSF (block 矩阵操作)。
+    算法参考 ignav (H 矩阵公式, ψ-error 模型)。
     """
 
-    def __init__(self, state: InsState, P1: np.ndarray, P2: np.ndarray,
-                 config: dict):
+    def __init__(self, state: InsState, P: np.ndarray, config: dict):
         self.ins_update = InsUpdate(state)
-        self.tm = TransferMatrix(config)
+        self.si = StateIndex.from_config(config)
+        self.tm = TransferMatrix(config, self.si)
         self._nhc = Nhc(config)
-        self.P1 = P1.copy().astype(np.float64)
-        self.P2 = P2.copy().astype(np.float64)
-        self.x1 = np.zeros(15, dtype=np.float64)
-        self.x2 = np.zeros(5, dtype=np.float64)
+        self.P = P.copy().astype(np.float64)
+        self.x = np.zeros(self.si.dim, dtype=np.float64)
 
         ins_cfg = config.get("ins", {})
         self.static_speed_threshold = ins_cfg.get("static_speed_threshold", 0.5)
@@ -47,11 +47,11 @@ class LcEstimator:
             "angular_velocity_threshold", 30.0 * math.pi / 180.0)
         self.zupt_std = ins_cfg.get("zupt_std", 0.05)
         self._gnss_pos_std = {
-            1: 10.0,   # SPP
-            2: 1.0,    # RTD
-            4: 1.0,    # DGPS
-            5: 0.02,   # RTK fix
-            0: 0.5,    # RTK float / unknown
+            1: 0.02,   # SOLQ_FIX (RTK fix)
+            2: 0.05,   # SOLQ_FLOAT (RTK float)
+            4: 1.0,    # SOLQ_DGPS
+            5: 10.0,   # SOLQ_SINGLE (SPP)
+            0: 10.0,   # SOLQ_NONE (fallback)
         }
         self._gnss_vel_std = ins_cfg.get("gnss_vel_std", 0.5)
 
@@ -66,14 +66,11 @@ class LcEstimator:
     # ===== 时间更新 =====
 
     def time_update(self, imu: ImuMeasurement) -> None:
-        """IMU 机械编排 + P1/P2 协方差传播。
+        """IMU 机械编排 + P 协方差传播。
 
-        P1: Φ1·(P1+0.5Q1)·Φ1^T + 0.5Q1 (GINav 中间值法)
-        P2: P2 + Q2·dt (Φ2=I, F2=0)
+        P: Φ·(P+0.5Q)·Φ^T + 0.5Q (GINav 中间值法)
         """
-        # 捕获 prev_timestamp (update 会覆盖它)
         prev_ts = self.ins_update._prev_timestamp
-        # 机械编排 (更新 state, f_b, w_b_ib, _prev_timestamp)
         self.ins_update.update(imu)
 
         dt = imu.timestamp - prev_ts
@@ -87,112 +84,142 @@ class LcEstimator:
 
         F = self.tm.build_F(C_b_e, f_b, w_b_ib, pos_e)
         Phi = self.tm.build_Phi(F, dt)
-        Q1 = self.tm.build_Q(dt, C_b_e)
-        P0 = self.P1 + 0.5 * Q1
-        self.P1 = Phi @ P0 @ Phi.T + 0.5 * Q1
-        self.P1 = 0.5 * (self.P1 + self.P1.T)
-
-        Q2 = self._build_Q2(dt)
-        self.P2 = self.P2 + Q2
-        self.P2 = 0.5 * (self.P2 + self.P2.T)
-
-    def _build_Q2(self, dt: float) -> np.ndarray:
-        """P2 过程噪声 (5x5, 小量随机游走)。"""
-        sigma_angle = 1e-3
-        sigma_lever = 1e-4
-        q = np.array([sigma_angle ** 2, sigma_angle ** 2,
-                      sigma_lever ** 2, sigma_lever ** 2, sigma_lever ** 2])
-        return np.diag(q * dt).astype(np.float64)
+        Q = self.tm.build_Q(dt, C_b_e)
+        P0 = self.P + 0.5 * Q
+        self.P = Phi @ P0 @ Phi.T + 0.5 * Q
+        self.P = 0.5 * (self.P + self.P.T)
 
     # ===== 量测更新 =====
 
     def meas_update_pos(self, gnss: GnssSolution) -> None:
-        """GNSS 位置量测更新 (仅 P1, 3 维, Joseph form)。"""
+        """GNSS 位置量测更新 (3 维, Joseph form)。
+
+        H 矩阵参考 ignav build_HVR:
+          pos: I(3)
+          lever_arm: -C_b_e (jacobian: H[ila,pos]=-Cbe)
+          time_sync: C_b_e @ skew(w_b_ib) @ lever + v_e (jacobian_p_dt)
+        """
         state = self.ins_update.state
+        si = self.si
         Z = state.pos_e - gnss.position
-        H = np.zeros((3, 15), dtype=np.float64)
-        H[:, 0:3] = np.eye(3)
-        if gnss.sd is not None and np.all(gnss.sd > 0):
-            R = np.diag(gnss.sd ** 2).astype(np.float64)
-        else:
-            sigma = self._gnss_pos_std.get(gnss.quality, 0.5)
-            R = np.diag([sigma ** 2] * 3).astype(np.float64)
-        self._joseph_update_P1(Z, H, R)
+        H = np.zeros((3, si.dim), dtype=np.float64)
+        H[:, si.pos:si.pos+3] = np.eye(3)
+
+        if si.has_lever_arm():
+            H[:, si.lever_arm:si.lever_arm+3] = -state.C_b_e
+
+        if si.has_time_sync():
+            lever = state.leverarm
+            dt1 = state.C_b_e @ skew(self.ins_update.w_b_ib) @ lever + state.vel_e
+            H[:, si.time_sync] = dt1
+
+        R = self._build_pos_R(gnss)
+        self._joseph_update(Z, H, R)
+
+    def _build_pos_R(self, gnss: GnssSolution) -> np.ndarray:
+        """构造位置量测噪声协方差 (固定 sigma per quality)。
+
+        time_sync 未估计时, R 中加入时间偏差不确定性 (speed × dt_offset)。
+        time_sync 估计时, 时间偏差由状态处理, R 不含 timing 项。
+        """
+        base_sigma = self._gnss_pos_std.get(gnss.quality, 0.5)
+        sigma = np.array([base_sigma] * 3, dtype=np.float64)
+        R = np.diag(sigma ** 2).astype(np.float64)
+
+        if not self.si.has_time_sync():
+            speed = float(np.linalg.norm(self.ins_update.state.vel_e))
+            dt_offset = 0.005
+            sigma_timing = speed * dt_offset
+            R = R + (sigma_timing ** 2) * np.eye(3) / 3.0
+
+        return 0.5 * (R + R.T)
 
     def meas_update_vel(self, gnss: GnssSolution) -> None:
-        """GNSS 速度量测更新 (仅 P1, 3 维, Joseph form)。"""
+        """GNSS 速度量测更新 (3 维, Joseph form)。
+
+        H 矩阵参考 ignav build_HVR:
+          vel: I(3)
+          att: -skew(C_b_e @ lever) (杆臂姿态贡献)
+          lever_arm: skew(w_ie_e) @ C_b_e - C_b_e @ skew(w_b_ib) (jacobian_v_dla)
+          time_sync: C_b_e @ skew(w_b_ib)² @ lever + a_e (jacobian_v_dt)
+        """
         if gnss.velocity is None:
             return
         state = self.ins_update.state
+        si = self.si
         Z = state.vel_e - gnss.velocity
-        H = np.zeros((3, 15), dtype=np.float64)
-        H[:, 3:6] = np.eye(3)
+        H = np.zeros((3, si.dim), dtype=np.float64)
+        H[:, si.vel:si.vel+3] = np.eye(3)
+
         if np.linalg.norm(state.leverarm) > 1e-9:
-            H[:, 6:9] = -skew(state.C_b_e @ state.leverarm)
+            H[:, si.att:si.att+3] = -skew(state.C_b_e @ state.leverarm)
+
+        if si.has_lever_arm():
+            dla = skew(self.tm.w_ie_e) @ state.C_b_e \
+                - state.C_b_e @ skew(self.ins_update.w_b_ib)
+            H[:, si.lever_arm:si.lever_arm+3] = dla
+
+        if si.has_time_sync():
+            lever = state.leverarm
+            w_skew = skew(self.ins_update.w_b_ib)
+            dt2 = state.C_b_e @ w_skew @ w_skew @ lever + self.ins_update.a_e
+            H[:, si.time_sync] = dt2
+
+        R = self._build_vel_R(gnss)
+        self._joseph_update(Z, H, R)
+
+    def _build_vel_R(self, gnss: GnssSolution) -> np.ndarray:
+        """构造速度量测噪声协方差。"""
         if gnss.vel_sd is not None and np.all(gnss.vel_sd > 0):
             R = np.diag(gnss.vel_sd ** 2).astype(np.float64)
         else:
             R = np.diag([self._gnss_vel_std ** 2] * 3).astype(np.float64)
-        self._joseph_update_P1(Z, H, R)
+        return 0.5 * (R + R.T)
 
     def meas_update_zupt(self) -> None:
-        """ZUPT 量测更新 (仅 P1, 3 维速度约束)。"""
+        """ZUPT 量测更新 (3 维速度约束)。"""
         state = self.ins_update.state
+        si = self.si
         Z = state.vel_e.copy()
-        H = np.zeros((3, 15), dtype=np.float64)
-        H[:, 3:6] = np.eye(3)
+        H = np.zeros((3, si.dim), dtype=np.float64)
+        H[:, si.vel:si.vel+3] = np.eye(3)
         R = np.diag([self.zupt_std ** 2] * 3).astype(np.float64)
-        self._joseph_update_P1(Z, H, R)
+        self._joseph_update(Z, H, R)
 
     def meas_update_nhc(self, imu: ImuMeasurement) -> None:
-        """NHC 量测更新 (P1 的 H1 部分 + P2 的 H2 部分, 2 维)。"""
-        Z, H1, H2, R_nhc = self._nhc.build_meas(self.ins_update.state, imu)
-        self._joseph_update_P1(Z, H1, R_nhc)
-        self._joseph_update_P2(Z, H2, R_nhc)
+        """NHC 量测更新 (2 维, 单 H 矩阵)。"""
+        Z, H, R = self._nhc.build_meas(self.ins_update.state, imu, self.si)
+        self._joseph_update(Z, H, R)
 
-    def _joseph_update_P1(self, Z: np.ndarray, H: np.ndarray,
-                          R: np.ndarray) -> None:
-        """P1 Joseph form 量测更新。"""
-        S = H @ self.P1 @ H.T + R
-        K = self.P1 @ H.T @ np.linalg.inv(S)
-        innov = Z - H @ self.x1
-        self.x1 = self.x1 + K @ innov
-        I_KH = np.eye(15) - K @ H
-        self.P1 = I_KH @ self.P1 @ I_KH.T + K @ R @ K.T
-        self.P1 = 0.5 * (self.P1 + self.P1.T)
-
-    def _joseph_update_P2(self, Z: np.ndarray, H: np.ndarray,
-                          R: np.ndarray) -> None:
-        """P2 Joseph form 量测更新。"""
-        S = H @ self.P2 @ H.T + R
-        K = self.P2 @ H.T @ np.linalg.inv(S)
-        innov = Z - H @ self.x2
-        self.x2 = self.x2 + K @ innov
-        I_KH = np.eye(5) - K @ H
-        self.P2 = I_KH @ self.P2 @ I_KH.T + K @ R @ K.T
-        self.P2 = 0.5 * (self.P2 + self.P2.T)
+    def _joseph_update(self, Z: np.ndarray, H: np.ndarray,
+                       R: np.ndarray) -> None:
+        """Joseph form 量测更新 (单滤波, N = si.dim)。"""
+        n = self.si.dim
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        innov = Z - H @ self.x
+        self.x = self.x + K @ innov
+        I_KH = np.eye(n) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
+        self.P = 0.5 * (self.P + self.P.T)
 
     # ===== 反馈 =====
 
     def feedback(self) -> None:
-        """双滤波独立反馈校正。P1: pos/vel/att(ψ+)/bias; P2: 安装角+杆臂。"""
-        self._feedback_P1()
-        self._feedback_P2()
-        self.x1[:] = 0.0
-        self.x2[:] = 0.0
-
-    def _feedback_P1(self) -> None:
-        """P1 反馈 (ψ-error: 姿态加号)。"""
+        """统一反馈校正 (ψ-error + 可选参数块)。"""
         state = self.ins_update.state
-        delta_pos = self.x1[0:3]
-        delta_vel = self.x1[3:6]
-        delta_psi = self.x1[6:9]
-        delta_bg = self.x1[9:12]
-        delta_ba = self.x1[12:15]
+        si = self.si
+
+        # 基础 15 维 (ψ-error, 对齐 ignav lcclp)
+        delta_pos = self.x[si.pos:si.pos+3]
+        delta_vel = self.x[si.vel:si.vel+3]
+        delta_psi = self.x[si.att:si.att+3]
+        delta_bg = self.x[si.gyro_bias:si.gyro_bias+3]
+        delta_ba = self.x[si.accel_bias:si.accel_bias+3]
 
         new_pos = state.pos_e - delta_pos
         new_vel = state.vel_e - delta_vel
-        C_b_e_new = (np.eye(3) + skew(delta_psi)) @ state.C_b_e
+        C_b_e_new = (np.eye(3) - skew(delta_psi)) @ state.C_b_e
         U, _, Vt = np.linalg.svd(C_b_e_new)
         C_b_e_new = U @ Vt
         lat, lon, _ = ecef2llh(new_pos)
@@ -206,12 +233,25 @@ class LcEstimator:
         new_state.C_b_e = C_b_e_new
         new_state.q_b_e = dcm2quat(C_b_e_new)
         new_state.att_rpy = att_rpy
-        new_state.gyro_bias = state.gyro_bias - delta_bg
-        new_state.accel_bias = state.accel_bias - delta_ba
-        self.ins_update.state = new_state
+        new_state.gyro_bias = state.gyro_bias + delta_bg
+        new_state.accel_bias = state.accel_bias + delta_ba
 
-    def _feedback_P2(self) -> None:
-        """P2 反馈: 安装角 + 杆臂。"""
-        new_state = self._nhc.feedback(self.x2, self.ins_update.state)
+        # 可选: GNSS 杆臂 (δlever = lever_true - lever_est, 反馈加)
+        if si.has_lever_arm():
+            new_state.leverarm = state.leverarm + self.x[si.lever_arm:si.lever_arm+3]
+
+        # 可选: 安装角 (δangle = angle_true - angle_est, 反馈加)
+        if si.has_imu_angle():
+            new_state.imu_angle = state.imu_angle + self.x[si.imu_angle:si.imu_angle+2]
+
+        # 可选: IMU 杆臂 (δlever = lever_est - lever_true, 反馈减)
+        if si.has_imu_leverarm():
+            new_state.imu_leverarm = state.imu_leverarm - self.x[si.imu_leverarm:si.imu_leverarm+3]
+
+        # 可选: 时间对齐 (δt = t_true - t_est, 反馈加)
+        if si.has_time_sync():
+            new_state.time_sync = state.time_sync + float(self.x[si.time_sync])
+
         self.ins_update.state = new_state
         self._nhc.update_from_state(new_state)
+        self.x[:] = 0.0

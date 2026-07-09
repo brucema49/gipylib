@@ -19,6 +19,7 @@ from src.core.data_types import AlignedBlock, GnssSolution, ImuMeasurement, InsS
 from src.core.ins.attitude import att_caln2e, dcm2quat, euler2dcm
 from src.core.ins.earth_param import cal_Ce2n, ecef2llh
 from src.core.ins.interpolator import find_bracket_imus, imu_interpolate
+from src.core.ins.state_index import StateIndex
 
 
 class InitMode(Enum):
@@ -63,7 +64,7 @@ class InsInitializer:
         self._calibrated_accel_bias: Optional[np.ndarray] = None
 
     def initialize(self, aligned_block: AlignedBlock,
-                   mode: InitMode) -> Tuple[InsState, np.ndarray, np.ndarray]:
+                   mode: InitMode) -> Tuple[InsState, np.ndarray]:
         """初始化主入口。
 
         Args:
@@ -71,7 +72,7 @@ class InsInitializer:
             mode: 初始化模式
 
         Returns:
-            (InsState, P1, P2): 初始状态 + 主滤波协方差 + NHC 子滤波协方差
+            (InsState, P): 初始状态 + 单滤波协方差 (维度 = si.dim)
         """
         gnss = aligned_block.gnss
         imu_list = aligned_block.imu_list
@@ -113,9 +114,9 @@ class InsInitializer:
         state = self._assemble_state(gnss, att_rpy, vel_e, mode)
 
         # 5. 装配初始协方差
-        P1, P2 = self._set_initial_variance(mode)
+        P = self._set_initial_variance(mode)
 
-        return state, P1, P2
+        return state, P
 
     def _align_imu_to_gnss(self, imu_list: List[ImuMeasurement],
                            t_gnss: float) -> Optional[ImuMeasurement]:
@@ -313,9 +314,6 @@ class InsInitializer:
         - IMU 零偏: 优先使用静态标定结果, 否则从 config 读取
                     initial_gyro_bias (deg/h → rad/s)
                     initial_acce_bias (mGal → m/s²)
-        - IMU 比例因子: 从 config 读取 initial_gyro_scale / initial_acce_scale
-                        (ppm → dimensionless), 参考 gnss_ins_lc_nhc
-                        StartAligning 行 81-100
         """
         ins_cfg = self.config.get("ins", {})
 
@@ -337,7 +335,6 @@ class InsInitializer:
         constant_g0 = 9.7803267715
         dh2rs = math.pi / 180.0 / 3600.0       # deg/hour → rad/s
         constant_mgal = 1e-6 * constant_g0      # mGal → m/s² (gnss_ins_lc_nhc 定义)
-        constant_ppm = 1e-6                      # ppm → dimensionless
 
         # IMU 零偏: 优先使用静态标定结果, 否则从 config 读取
         if (mode == InitMode.STATIC
@@ -355,18 +352,6 @@ class InsInitializer:
             )
             gyro_bias = gyro_bias_deg_h * dh2rs
             accel_bias = accel_bias_mgal * constant_mgal
-
-        # 比例因子: 从 config 读取 (gnss_ins_lc_nhc StartAligning 行 90-100)
-        gyro_scale_ppm = np.array(
-            ins_cfg.get("initial_gyro_scale", [0.0, 0.0, 0.0]),
-            dtype=np.float64,
-        )
-        accel_scale_ppm = np.array(
-            ins_cfg.get("initial_acce_scale", [0.0, 0.0, 0.0]),
-            dtype=np.float64,
-        )
-        gyro_scale = gyro_scale_ppm * constant_ppm
-        accel_scale = accel_scale_ppm * constant_ppm
 
         imu_angle = np.array(ins_cfg.get("initial_imu_angle", [0, 0]),
                              dtype=np.float64)
@@ -389,25 +374,26 @@ class InsInitializer:
             att_rpy=att_rpy,
             gyro_bias=gyro_bias,
             accel_bias=accel_bias,
-            gyro_scale=gyro_scale,
-            accel_scale=accel_scale,
             imu_angle=imu_angle,
             imu_leverarm=imu_leverarm,
             leverarm=leverarm,
         )
 
-    def _set_initial_variance(self, mode: InitMode
-                              ) -> Tuple[np.ndarray, np.ndarray]:
-        """装配初始协方差 P1/P2 (初始化.md 第 12 节)。
+    def _set_initial_variance(self, mode: InitMode) -> np.ndarray:
+        """装配初始协方差 P (单滤波, 维度 = si.dim)。
 
-        P1: 主滤波 15x15 [pos(3), vel(3), att(3), gyro_bias(3), accel_bias(3)]
-        P2: NHC 子滤波 5x5 [imu_angle(2), imu_leverarm(3)]
+        基础 15 维 [pos(3), vel(3), att(3), gyro_bias(3), accel_bias(3)]
+        可选块按 StateIndex 位置填充: lever_arm(3), imu_angle(2),
+        imu_leverarm(3), time_sync(1)
 
         Note: mode 参数保留用于未来按模式调整协方差。
         """
         ins_cfg = self.config.get("ins", {})
+        si = StateIndex.from_config(self.config)
 
-        # 初始不确定度 (1σ, SI 单位)
+        P = np.zeros((si.dim, si.dim), dtype=np.float64)
+
+        # 基础 15 维初始不确定度 (1σ, SI 单位)
         pos_std = np.array(ins_cfg.get("initial_pos_std_si",
                                        [30.0, 30.0, 30.0]), dtype=np.float64)
         vel_std = np.array(ins_cfg.get("initial_vel_std_si",
@@ -422,28 +408,44 @@ class InsInitializer:
                                              [0.0489, 0.0489, 0.0489]),
                                  dtype=np.float64)
 
-        # P1: 15x15 对角矩阵
-        P1 = np.diag(np.concatenate([
-            pos_std ** 2,
-            vel_std ** 2,
-            att_std ** 2,
-            gyro_bias_std ** 2,
-            acce_bias_std ** 2,
-        ]))
+        P[0:3, 0:3] = np.diag(pos_std ** 2)
+        P[3:6, 3:6] = np.diag(vel_std ** 2)
+        P[6:9, 6:9] = np.diag(att_std ** 2)
+        P[9:12, 9:12] = np.diag(gyro_bias_std ** 2)
+        P[12:15, 12:15] = np.diag(acce_bias_std ** 2)
 
-        # P2: 5x5 (imu_angle[2] + imu_leverarm[3])
-        imu_angle_std = np.array(ins_cfg.get("imu_angle_std", [10.0, 10.0]),
-                                 dtype=np.float64)
-        imu_angle_std = np.radians(imu_angle_std)
-        imu_leverarm_std = np.array(ins_cfg.get("imu_leverarm_std",
-                                                [1.0, 1.0, 1.0]),
-                                    dtype=np.float64)
-        P2 = np.diag(np.concatenate([
-            imu_angle_std ** 2,
-            imu_leverarm_std ** 2,
-        ]))
+        # 可选块: GNSS 杆臂 (随机常数, 初始不确定度 lever_arm_std)
+        if si.has_lever_arm():
+            lever_arm_std = np.array(
+                ins_cfg.get("lever_arm_std", [0.1, 0.1, 0.1]),
+                dtype=np.float64)
+            i = si.lever_arm
+            P[i:i+3, i:i+3] = np.diag(lever_arm_std ** 2)
 
-        return P1, P2
+        # 可选块: IMU 安装角 (imu_angle_std, deg → rad)
+        if si.has_imu_angle():
+            imu_angle_std = np.array(
+                ins_cfg.get("imu_angle_std", [10.0, 10.0]),
+                dtype=np.float64)
+            imu_angle_std = np.radians(imu_angle_std)
+            i = si.imu_angle
+            P[i:i+2, i:i+2] = np.diag(imu_angle_std ** 2)
+
+        # 可选块: IMU 杆臂 (imu_leverarm_std)
+        if si.has_imu_leverarm():
+            imu_leverarm_std = np.array(
+                ins_cfg.get("imu_leverarm_std", [1.0, 1.0, 1.0]),
+                dtype=np.float64)
+            i = si.imu_leverarm
+            P[i:i+3, i:i+3] = np.diag(imu_leverarm_std ** 2)
+
+        # 可选块: 时间对齐 (time_sync_std)
+        if si.has_time_sync():
+            time_sync_std = float(ins_cfg.get("time_sync_std", 0.01))
+            i = si.time_sync
+            P[i, i] = time_sync_std ** 2
+
+        return P
 
     def reset_gnss_buffer(self):
         """清空 GNSS 历元缓冲区 (reboot 时调用)。"""

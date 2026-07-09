@@ -44,6 +44,8 @@ class InsUpdate:
         # 当前历元的比力/角速度 (b 系), 供 InsPropagate 构造 F 矩阵
         self._f_b = np.zeros(3, dtype=np.float64)
         self._w_b_ib = np.zeros(3, dtype=np.float64)
+        # 当前历元 ECEF 加速度 (供 time_sync H 矩阵使用)
+        self._a_e = np.zeros(3, dtype=np.float64)
 
     @property
     def f_b(self) -> np.ndarray:
@@ -54,6 +56,11 @@ class InsUpdate:
     def w_b_ib(self) -> np.ndarray:
         """当前历元角速度 (b 系, rad/s)。"""
         return self._w_b_ib
+
+    @property
+    def a_e(self) -> np.ndarray:
+        """当前历元 ECEF 加速度 (m/s²)。"""
+        return self._a_e
 
     def update(self, imu: ImuMeasurement) -> InsState:
         """一步 INS 递推: 姿态 → 速度 → 位置 (E 系)。
@@ -74,11 +81,11 @@ class InsUpdate:
         if dt > 1.0:
             logger.warning(f"异常大 dt={dt:.4f}s, 继续递推")
 
-        # 1. IMU 补偿: 速率 → 增量, 减零偏, 乘 (1-scale)
+        # 1. IMU 补偿: 速率 → 增量, 减零偏
         dtheta = imu.gyro * dt
         dvel = imu.accel * dt
-        dtheta_comp = (dtheta - self.state.gyro_bias * dt) * (1.0 - self.state.gyro_scale)
-        dvel_comp = (dvel - self.state.accel_bias * dt) * (1.0 - self.state.accel_scale)
+        dtheta_comp = dtheta - self.state.gyro_bias * dt
+        dvel_comp = dvel - self.state.accel_bias * dt
 
         # 记录当前历元比力/角速度 (b 系, 速率) 供 InsPropagate 使用
         self._w_b_ib = dtheta_comp / dt
@@ -89,6 +96,7 @@ class InsUpdate:
 
         # 3. 速度更新 (含旋转/划桨补偿)
         vel_e_new = self._velocity_update(dtheta_comp, dvel_comp, dt)
+        self._a_e = (vel_e_new - self.state.vel_e) / dt
 
         # 4. 位置更新 (梯形)
         pos_e_new = self._position_update(vel_e_new, dt)
@@ -109,11 +117,10 @@ class InsUpdate:
             att_rpy=att_rpy,
             gyro_bias=self.state.gyro_bias,
             accel_bias=self.state.accel_bias,
-            gyro_scale=self.state.gyro_scale,
-            accel_scale=self.state.accel_scale,
             imu_angle=self.state.imu_angle,
             imu_leverarm=self.state.imu_leverarm,
             leverarm=self.state.leverarm,
+            time_sync=self.state.time_sync,
         )
 
         # 6. 更新历史增量 (用于下一历元锥补/划桨, 存储已补偿值, 参考 ignav omgbp/fbp)

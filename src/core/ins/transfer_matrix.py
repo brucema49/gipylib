@@ -4,9 +4,11 @@
 - gnss_ins_lc_nhc navmech.cc MechTransferMat (E 系 F 矩阵结构)
 - GINav ins_time_updata.m / update_trans_mat.m (Q 构造与中间值法)
 - 项目约定: 保留 Coriolis 项 (F_vv = -2*[ω_ie^e×], F_φφ = -[ω_ie^e×])
+- ignav ins-gnss.cc (可选参数块 F=0, Q=random walk PSD)
 
-状态顺序 (15 维):
-  [δr^e(3), δv^e(3), δφ^e(3), δb_g(3), δb_a(3)]
+状态顺序 (基础 15 维 + 可选块):
+  固定: [δr^e(3), δv^e(3), δφ^e(3), δb_g(3), δb_a(3)]
+  可选: [lever_arm(3), imu_angle(2), imu_leverarm(3), time_sync(1)]
 """
 import math
 
@@ -18,6 +20,7 @@ from src.core.ins.earth_param import (
     georadi,
     gravity_ecef,
 )
+from src.core.ins.state_index import StateIndex
 
 
 def skew(v: np.ndarray) -> np.ndarray:
@@ -73,13 +76,17 @@ def _expm(A: np.ndarray, order: int = 10) -> np.ndarray:
 
 
 class TransferMatrix:
-    """F / Φ / Q 矩阵构造器。
+    """F / Φ / Q 矩阵构造器 (支持 StateIndex 动态维度)。
 
-    15 维状态: [pos(3), vel(3), att(3), gyro_bias(3), accel_bias(3)]
+    基础 15 维: [pos(3), vel(3), att(3), gyro_bias(3), accel_bias(3)]
+    可选块: lever_arm(3), imu_angle(2), imu_leverarm(3), time_sync(1)
+
+    可选块 F=0 (常数或随机游走), Q 按参数类型填充。
     """
 
-    def __init__(self, config: dict):
-        ins_cfg = config.get("ins", {})
+    def __init__(self, config: dict, state_index: StateIndex = None):
+        ins_cfg = config.get("ins", {}) if config else {}
+        self.si = state_index if state_index is not None else StateIndex.from_config(config or {})
         # 相关时间 (h → s)
         self.tau_gyro = ins_cfg.get("corr_time_of_gyro_bias", 0.01) * 3600.0
         self.tau_acce = ins_cfg.get("corr_time_of_acce_bias", 0.01) * 3600.0
@@ -88,12 +95,21 @@ class TransferMatrix:
         self.accel_psd = ins_cfg.get("accel_psd", 2.60420170553977e-06)
         self.gyro_bias_psd = ins_cfg.get("gyro_bias_psd", 2.61160339323310e-14)
         self.acce_bias_psd = ins_cfg.get("acce_bias_psd", 1.66067346797506e-09)
+        # 位置随机游走 PSD (m²/s): 计入未建模的位置不确定性 (RTK 跳变/多径等)
+        self.pos_psd = ins_cfg.get("pos_psd", 0.0)
+        # 可选参数过程噪声 PSD
+        self.lever_arm_psd = ins_cfg.get("lever_arm_psd", 0.0)
+        self.imu_angle_psd = ins_cfg.get("imu_angle_psd", 1.0e-6)
+        self.imu_leverarm_psd = ins_cfg.get("imu_leverarm_psd", 1.0e-8)
+        self.time_sync_psd = ins_cfg.get("time_sync_psd", 1.0e-4)
         # 地球自转角速度 (E 系常数向量)
         self.w_ie_e = np.array([0.0, 0.0, EARTH_ROTATION_RATE], dtype=np.float64)
 
     def build_F(self, C_b_e: np.ndarray, f_b: np.ndarray,
                 w_b_ib: np.ndarray, pos_e: np.ndarray) -> np.ndarray:
-        """构造 15x15 连续时间 F 矩阵 (ψ-error 模型, 对齐 ignav)。
+        """构造 N×N 连续时间 F 矩阵 (ψ-error 模型, 对齐 ignav)。
+
+        基础 15×15 块复用现有逻辑, 可选块 F=0 (常数/随机游走)。
 
         Args:
             C_b_e: 3x3 旋转矩阵 b→e
@@ -102,9 +118,10 @@ class TransferMatrix:
             pos_e: 3 ECEF 位置 (m)
 
         Returns:
-            15x15 F 矩阵
+            N×N F 矩阵 (N = si.dim)
         """
-        F = np.zeros((15, 15), dtype=np.float64)
+        n = self.si.dim
+        F = np.zeros((n, n), dtype=np.float64)
 
         # F_rv = I (位置-速度耦合)
         F[0:3, 3:6] = np.eye(3)
@@ -139,6 +156,7 @@ class TransferMatrix:
         # F_baba = -I / tau_acce  (加计零偏一阶马尔可夫)
         F[12:15, 12:15] = -np.eye(3) / self.tau_acce
 
+        # 可选块: F=0 (lever_arm/imu_angle/imu_leverarm/time_sync 均为常数或随机游走)
         return F
 
     def build_Phi(self, F: np.ndarray, dt: float) -> np.ndarray:
@@ -148,37 +166,60 @@ class TransferMatrix:
         - dt <= 0.01s   (100-200Hz): 二阶 Φ = I + F·dt + 0.5·(F·dt)²
         - dt > 0.01s    (<100Hz): 矩阵指数 Φ = expm(F·dt)
         """
+        n = self.si.dim
         Fdt = F * dt
         if dt <= 0.005:
-            return np.eye(15, dtype=np.float64) + Fdt
+            return np.eye(n, dtype=np.float64) + Fdt
         elif dt <= 0.01:
-            return np.eye(15, dtype=np.float64) + Fdt + 0.5 * (Fdt @ Fdt)
+            return np.eye(n, dtype=np.float64) + Fdt + 0.5 * (Fdt @ Fdt)
         else:
             return _expm(Fdt)
 
     def build_Q(self, dt: float, C_b_e: np.ndarray) -> np.ndarray:
-        """构造 15x15 离散 Q 矩阵 (GINav G·Q_diag·G^T 风格)。
+        """构造 N×N 离散 Q 矩阵 (GINav G·Q_diag·G^T 风格 + 可选块)。
 
         Args:
             dt: 时间步长 (s)
             C_b_e: 3x3 旋转矩阵 b→e
 
         Returns:
-            15x15 Q 矩阵 (状态噪声协方差)
+            N×N Q 矩阵 (N = si.dim)
         """
-        # G 矩阵 (15x15): 将噪声映射到状态空间
-        G = np.zeros((15, 15), dtype=np.float64)
-        G[6:9, 6:9] = C_b_e       # 陀螺噪声 → 姿态 (ψ-error: 正号)
-        G[3:6, 3:6] = C_b_e       # 加计噪声 → 速度
-        G[9:12, 9:12] = np.eye(3)  # 陀螺零偏驱动噪声
-        G[12:15, 12:15] = np.eye(3)  # 加计零偏驱动噪声
+        n = self.si.dim
+        si = self.si
 
-        # Q_diag (15x15 对角): 噪声 PSD × dt
+        # 基础 15×15: G·Q_diag·G^T
+        G = np.zeros((n, 15), dtype=np.float64)
+        G[0:3, 0:3] = np.eye(3)
+        G[6:9, 6:9] = C_b_e
+        G[3:6, 3:6] = C_b_e
+        G[9:12, 9:12] = np.eye(3)
+        G[12:15, 12:15] = np.eye(3)
+
         Q_diag = np.zeros((15, 15), dtype=np.float64)
+        Q_diag[0:3, 0:3] = np.diag([self.pos_psd * dt] * 3)
         Q_diag[3:6, 3:6] = np.diag([self.accel_psd * dt] * 3)
         Q_diag[6:9, 6:9] = np.diag([self.gyro_psd * dt] * 3)
         Q_diag[9:12, 9:12] = np.diag([self.gyro_bias_psd * dt] * 3)
         Q_diag[12:15, 12:15] = np.diag([self.acce_bias_psd * dt] * 3)
 
-        # Q0 = G · Q_diag · G^T
-        return G @ Q_diag @ G.T
+        Q = G @ Q_diag @ G.T
+
+        # 可选块 Q (随机游走: PSD × dt)
+        if si.has_lever_arm() and self.lever_arm_psd > 0.0:
+            i = si.lever_arm
+            Q[i:i+3, i:i+3] = np.diag([self.lever_arm_psd * dt] * 3)
+
+        if si.has_imu_angle():
+            i = si.imu_angle
+            Q[i:i+2, i:i+2] = np.diag([self.imu_angle_psd * dt] * 2)
+
+        if si.has_imu_leverarm():
+            i = si.imu_leverarm
+            Q[i:i+3, i:i+3] = np.diag([self.imu_leverarm_psd * dt] * 3)
+
+        if si.has_time_sync():
+            i = si.time_sync
+            Q[i, i] = self.time_sync_psd * dt
+
+        return Q
