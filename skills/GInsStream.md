@@ -1,7 +1,16 @@
 # GInsStream 整体代码框架
 
 > GNSS/INS 松/紧组合流式导航项目，基于纯 threading + 队列流水线流式读取架构，实现 SPP+RTK/NHC/ZUPT 松组合融合导航。
-> 矩阵运算使用 numpy，框架参考 gnss_ins_lc_nhc、GINav、GREAT-MSF，采用面向对象三大特性（封装/继承/多态）+ ABC 类继承体系设计，保留紧组合扩展接口。
+> 矩阵运算使用 numpy，框架参考 gnss_ins_lc_nhc、GINav、GREAT-MSF。
+>
+> **⚠️ 架构更新说明（2026-07）**：
+> - 滤波器已从双滤波（P1/P2）迁移到**单滤波**架构，统一使用 `P`（维度 = `StateIndex.dim`，15~24 维）
+> - 不再使用 `InsKf(ABC)` 基类和 `OdometryStrategy`/`FusionStrategy` 策略层（YAGNI）
+> - `LcEstimator` / `LcIntegration` / `Nhc` 为普通类，不继承 ABC
+> - 状态索引由 `StateIndex` dataclass 管理（替代 `MainStateIndex`/`NhcSubStateIndex`）
+> - 已放弃比例因子误差估计
+> - 详见 [estimator.md](file:///home/mxl/workplace/gipylib/skills/estimator.md) 获取当前实现的权威描述
+> - 本文档中涉及 InsKf/P1/P2/OdometryStrategy 的描述为早期设计，仅供参考
 >
 > **时间系统约定**：全框架内部统一使用 **Unix 时间戳（float 秒，与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）**。
 > rtklib-py 的 `gtime_t.time` 即 Unix 整数秒，`gtime_t.sec` 为不足秒的小数部分。

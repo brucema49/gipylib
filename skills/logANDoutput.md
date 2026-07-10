@@ -88,14 +88,14 @@ Stream ─────→ raw_log_queue ─────────────�
 (Streamer)
 ```
 
-> 说明：`LcIntegration` 作为估计线程，将双滤波（P1 主滤波 + P2 NHC 子滤波）解算结果 `Solution` 通过 `solution_queue.put()` 推入队列；`Logger` 通过 `solution_queue.get()` 消费，**全程无观察者回调**。`trace_queue` 同理由 `LcIntegration` 生产，用于记录双滤波预测/更新事件。
+> 说明：`LcIntegration` 作为估计线程，将单滤波解算结果 `Solution` 通过 `solution_queue.put()` 推入队列；`Logger` 通过 `solution_queue.get()` 消费，**全程无观察者回调**。`trace_queue` 同理由 `LcIntegration` 生产，用于记录单滤波预测/更新事件。
 
 ### 2.3 队列定义
 
 | 队列 | 生产者 | 消费者 | 容量 | 数据类型 | 说明 |
 |------|--------|--------|------|---------|------|
-| `solution_queue` | `LcIntegration` 估计线程 | Logger 线程 | 200 | `Solution` | 双滤波融合解（P1+P2 反馈后输出） |
-| `trace_queue` | `LcIntegration` 估计线程 | Logger 线程 | 500 | `TraceData` | 双滤波预测/更新事件（P1/P2 独立） |
+| `solution_queue` | `LcIntegration` 估计线程 | Logger 线程 | 200 | `Solution` | 单滤波融合解（反馈后输出） |
+| `trace_queue` | `LcIntegration` 估计线程 | Logger 线程 | 500 | `TraceData` | 单滤波预测/更新事件 |
 | `raw_log_queue` | 各 Streamer（ImuSensor/GnssRoverSensor 等） | Logger 线程 | 500 | `SensorData` | 原始观测数据，由传感器线程 `put()` |
 
 > 三条队列均为 `queue.Queue`（线程安全），生产者通过 `put()` 推数据，Logger 通过 `get()` 消费，**无 notify() 回调、无观察者模式**。队列满时 `trace_queue` / `raw_log_queue` 静默丢弃，`solution_queue` 阻塞或丢弃（由配置决定）。
@@ -225,20 +225,19 @@ class GnssSolution:
 > 内部模式由 `src/core/gnss/solution_converter.py::sol_to_gnss_solution` 把 rtklib-py `Sol` 对象转换为本项目 `GnssSolution`：
 > `unix_ts = sol.t.time + sol.t.sec`，`week, _ = unix_to_gpst(unix_ts)`，`cov = sol.qr[0:3, 0:3]`。
 
-### 4.5 双滤波 Solution（INS 启用后，预留）
+### 4.5 单滤波 Solution（INS 启用后，预留）
 
 INS 启用后（`internal` + `ins.enabled: "on"`），输出 Solution 会扩展为含 IMU 状态的完整字段：
 
 ```python
 @dataclass
 class Solution:  # 预留，当前未实现
-    """解算结果（双滤波反馈后输出）"""
+    """解算结果（单滤波反馈后输出）"""
     timestamp: float                          # Unix 时间戳 (s)
     position_enu: Optional[np.ndarray] = None # [3] ENU 位置 (m)
     velocity_enu: Optional[np.ndarray] = None # [3] ENU 速度 (m/s)
     attitude: Optional[np.ndarray] = None     # [3] 横滚/俯仰/航向 (rad)
-    covariance_p1: Optional[np.ndarray] = None # [15,15] 或 [18,18] 主滤波协方差 P1 (E 系)
-    covariance_p2: Optional[np.ndarray] = None # [5,5] NHC 子滤波协方差 P2 (v 系)
+    covariance_p: Optional[np.ndarray] = None # [15,15]~[24,24] 单滤波协方差 P (E 系)，维度 = StateIndex.dim
     status: str = "None"                      # None/SPP/RTD/RTK/LC/External
     num_satellites: int = 0
     pdop: float = 0.0
@@ -249,7 +248,7 @@ class Solution:  # 预留，当前未实现
     gnss_leverarm: Optional[np.ndarray] = None # [3] GNSS天线杆臂 (m, 可选)
 ```
 
-> 协方差字段拆分为 `covariance_p1`（主滤波 P1，E 系，15/18 维）和 `covariance_p2`（NHC 子滤波 P2，v 系，5 维），对应双滤波架构的两套独立协方差矩阵。输出时 P2 为可选（仅启用 NHC 时存在）。
+> 协方差字段为 `covariance_p`（单滤波协方差 P，E 系，维度 = StateIndex.dim，15~24 维），对应单滤波架构的统一协方差矩阵。
 
 ---
 
@@ -281,10 +280,10 @@ class TraceWriter(WriterBase):
 | 方法 | 最低 trace_level | 输出内容 |
 |------|-----------------|---------|
 | `write_state_change()` | 1 | 状态变化：`from → to` |
-| `write_gnss_update()` | 2 | GNSS 更新（作用于 P1）：模式、卫星数、残差范数 |
-| `write_nhc_update()` | 2 | NHC 更新（H1 作用于 P1 + H2 作用于 P2）：横向/垂向速度约束残差 |
-| `write_zupt_update()` | 2 | ZUPT 更新（3D，作用于 P1，与 NHC 互斥）：零速约束残差 |
-| `write_ekf_predict()` | 3 | 双滤波预测：dt、trace(P1)、trace(P2) |
+| `write_gnss_update()` | 2 | GNSS 更新（作用于 P）：模式、卫星数、残差范数 |
+| `write_nhc_update()` | 2 | NHC 更新（作用于 P）：横向/垂向速度约束残差 |
+| `write_zupt_update()` | 2 | ZUPT 更新（3D，作用于 P，与 NHC 互斥）：零速约束残差 |
+| `write_ekf_predict()` | 3 | 单滤波预测：dt、trace(P) |
 
 `write(trace)` 方法根据 `trace.event` 和 `self.trace_level` 分发到对应方法，`trace_level == 0` 时直接返回。
 
@@ -293,17 +292,17 @@ class TraceWriter(WriterBase):
 ```python
 @dataclass
 class TraceData:
-    """轨迹/调试数据（双滤波事件）"""
+    """轨迹/调试数据（单滤波事件）"""
     timestamp: float
     event: str    # 事件类型标识
     data: dict    # 事件数据字典
 
     # 事件类型:
-    # "ekf_predict"    — 双滤波 EKF 预测 (P1 + P2 独立)
-    # "gnss_update"    — GNSS 量测更新 (仅作用于 P1)
-    # "nhc_update"     — NHC 量测更新 (H1 作用于 P1 + H2 作用于 P2)
-    # "zupt_update"    — ZUPT 零速更新 (3D, 仅作用于 P1, 与 NHC 互斥)
-    # "feedback"       — 双滤波独立反馈 (P1 反馈 + P2 反馈)
+    # "ekf_predict"    — 单滤波 EKF 预测
+    # "gnss_update"    — GNSS 量测更新 (作用于 P)
+    # "nhc_update"     — NHC 量测更新 (作用于 P)
+    # "zupt_update"    — ZUPT 零速更新 (3D, 作用于 P, 与 NHC 互斥)
+    # "feedback"       — 单滤波反馈
     # "time_align"     — 时间对齐 (增量切分, 4 种情况)
     # "init_state"     — 初始化状态变化
     # "outlier"        — 异常检测
@@ -521,7 +520,7 @@ run() 主循环:
 
 ### 7.6 LcIntegration 端 Trace 数据生成（🚧 预留）
 
-`LcIntegration` 估计线程在双滤波 EKF 预测/量测更新/反馈后将 `TraceData` 通过 `trace_queue.put()` 放入队列，队列满时静默丢弃。Trace 事件记录双滤波独立的状态（P1/P2 矩阵迹、H1/H2 残差、时间对齐情况等）。
+`LcIntegration` 估计线程在单滤波 EKF 预测/量测更新/反馈后将 `TraceData` 通过 `trace_queue.put()` 放入队列，队列满时静默丢弃。Trace 事件记录单滤波的状态（P 矩阵迹、H 残差、时间对齐情况等）。
 
 ---
 
@@ -649,7 +648,7 @@ StreamDesign.md 定义的队列（纯队列流水线，无观察者回调）：
 
 | 队列 | 生产者 | 说明 |
 |------|--------|------|
-| `trace_queue` | `LcIntegration` 估计线程 | Logger → TraceWriter → 文件（双滤波事件） |
+| `trace_queue` | `LcIntegration` 估计线程 | Logger → TraceWriter → 文件（单滤波事件） |
 
 ### 9.4 配置衔接
 
@@ -838,8 +837,8 @@ def build_logger(config: dict, queues: dict, control) -> Logger:
                                        estimate_queue
                                                 ↓
   LcIntegration ──get()──→ estimate_queue
-       │   时间对齐 + 双滤波 EKF (P1 主滤波 + P2 NHC 子滤波)
-       │   独立反馈 P1 + P2
+       │   时间对齐 + 单滤波 EKF (P)
+       │   反馈 P
        ↓
   LcIntegration ──put()──→ solution_queue ──get()──→ Logger ──→ SolutionWriter
                          trace_queue                          ──→ TraceWriter
@@ -848,7 +847,7 @@ def build_logger(config: dict, queues: dict, control) -> Logger:
 
 数据通路统一性：
 - **传感器 → 输出（当前）**：`InternalGnssSensor` / `ImuSensor` / `GnssSolSensor` 通过 `output_queue.put()` 推入 `gnss_queue` / `imu_queue`，Logger/SolutionLogger 通过 `queue.get()` 消费，**无 Scheduler 中转**
-- **传感器 → 估计 → 输出（预留）**：`LcIntegration` 通过 `solution_queue.put()` / `trace_queue.put()` 推入双滤波解算结果与事件
+- **传感器 → 估计 → 输出（预留）**：`LcIntegration` 通过 `solution_queue.put()` / `trace_queue.put()` 推入单滤波解算结果与事件
 - **全程无回调**：Logger 通过 `queue.get()` 消费，缓冲削峰，异步落盘，避免 IO 阻塞融合
 
 ### 10.5 OOP 三大特性体现

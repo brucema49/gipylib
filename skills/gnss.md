@@ -28,7 +28,7 @@
 > - **前端策略（仅 IMU 不可用降级时启用，当前未实现）**：作为 `GnssPositioningStrategy(OdometryStrategy)`，
 >   当无 IMU 或 IMU 不可用时，直接用 SPP/RTK/RTD 产生里程计（位置/速度），与 `ImuMechStrategy` 可互换
 > - **后端量测源**：松组合后端 EKF 的量测输入（GnssSolution），由 GnssSolutionProvider 统一提供，
->   仅作用于主滤波 P1（NHC 子滤波 P2 不直接使用 GNSS 量测）
+>   作用于单滤波 P 矩阵（StateIndex 参数块）
 >
 > 当前内部模式下，`InternalGnssSensor` 直接调用 `SppProcessor` / `RtkProcessor`，把 `GnssSolution` 通过 `gnss_queue` 推入下游 `SolutionLogger` 输出 `.pos` 文件。
 > 外部模式下，`GnssSolSensor` 通过 `PosSolFormator` 解析 `.pos` 文件得到 `GnssSolution`。
@@ -844,7 +844,7 @@ GNSS 解算在 GInsStream 框架中承担两种角色：
 
 | 角色 | 集成方式 | 实现类 | 触发场景 | 实现状态 |
 |------|---------|--------|---------|---------|
-| **后端量测源（仅作用于主滤波 P1）** | 纯队列流水线 | `InternalGnssSensor` / `GnssSolSensor` | 当前实现：internal/external 两种模式 | ✅ 已实现 |
+| **后端量测源（作用于单滤波 P）** | 纯队列流水线 | `InternalGnssSensor` / `GnssSolSensor` | 当前实现：internal/external 两种模式 | ✅ 已实现 |
 | **前端里程计（仅 IMU 不可用降级时）** | 策略模式（仅前端） | `GnssPositioningStrategy(OdometryStrategy)` | IMU 不可用时，直接用 SPP/RTK 产生里程计 | 🚧 预留 |
 
 > **不使用观察者模式**：GNSS 传感器不持有观察者列表，无 `attach/detach/notify`，无 `on_data()` 回调。
@@ -1029,15 +1029,15 @@ class GnssPositioningStrategy(OdometryStrategy):
     → output_queue.put(SensorData(tag="gnss_solution"))   (推入 gnss_queue)
     → LcIntegration.process_epoch(epoch_data)
         → GnssInternalProvider.get_solution()
-        → _gnss_update()                                   (EKF 量测更新，仅作用 P1)
-        → 双滤波独立反馈
+        → _gnss_update()                                   (EKF 量测更新，作用 P)
+        → 单滤波统一反馈
 ```
 
 **关键点**：
 - GNSS 数据通过 `queue.put()` 流转，**无 `notify()` 调用**
 - `LcIntegration` 从 `estimate_queue` 取数据，**无 `on_data()` 回调**
 - 后端融合（EKF + NHC + ZUPT）由 `LcIntegration` 直接承担，**无 `LcFusionStrategy` 中间层**
-- GNSS 量测仅作用于主滤波 P1，NHC 子滤波 P2 不直接使用 GNSS 量测
+- GNSS 量测作用于单滤波 P 矩阵
 
 ### 9.5 OOP 三大特性体现
 

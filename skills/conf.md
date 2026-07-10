@@ -22,7 +22,7 @@
 > - ✅ 已实现：`src/core/ins/` 下 `interpolator.py` / `earth_param.py` / `attitude.py`（初始化支撑模块）
 > - ✅ 已实现：`ImuSensor` RFU→FRD 坐标系自动转换（`_convert_to_frd()`）
 > - ✅ 已实现：SPP 多普勒测速（`pntpos.py::estvel` / `resdop`，速度填入 `sol.rr[3:6]`）
-> - 🚧 预留：INS 机械编排核心 `InsCore` / 双滤波 EKF `LcIntegration` / NHC / ZUPT / 紧组合接口（下一阶段实现）
+> - 🚧 预留：INS 机械编排核心 `InsCore` / 单滤波 EKF `LcIntegration` / NHC / ZUPT / 紧组合接口（下一阶段实现）
 >
 > **三种运行模式对比**：
 > | 模式 | gnss_source | ins.enabled | GNSS 来源 | IMU | 输出 | Logger |
@@ -31,10 +31,9 @@
 > | 外部对齐 | external | on | 外部文件 | 流式 | `aligned.csv` | Logger |
 > | 内部对齐 | internal | on | 实时解算 | 流式 | `aligned.csv` | Logger |
 >
-> **双滤波架构对应**（INS 启用后的设计，当前未实现）：
-> - 主滤波 P1（E 系，15 维 = 位置3+速度3+姿态3+陀螺零偏3+加计零偏3；可选 +3 维 GNSS 杆臂 = 18 维）
-> - NHC 子滤波 P2（v 系，5 维 = IMU 安装角 2 + IMU 杆臂 3）
-> - NHC/ZUPT 互斥：静止时仅 ZUPT（3D，作用于 P1），运动时仅 NHC（H1 作用于 P1 + H2 作用于 P2）
+> **单滤波架构对应**（INS 启用后的设计，参考 [estimator.md](file:///home/mxl/workplace/gipylib/skills/estimator.md)）：
+> - 单一 P 矩阵（E 系，StateIndex 参数块，15~24 维 = 固定 15 维 + 可选 GNSS 杆臂 3 / IMU 安装角 2 / IMU 杆臂 3 / 时间对齐 1）
+> - NHC/ZUPT 互斥：静止时仅 ZUPT（3D，作用于 P），运动时仅 NHC（2D，作用于 P）
 
 ---
 
@@ -67,9 +66,9 @@
     - [4.10 初始协方差](#410-初始协方差)
     - [4.11 GNSS 中断模拟](#411-gnss-中断模拟)
   - [5. 输出配置](#5-输出配置)
-  - [6. 双滤波状态向量对应](#6-双滤波状态向量对应)
-    - [6.1 主滤波 P1（E 系，误差状态）](#61-主滤波-p1e-系误差状态)
-    - [6.2 NHC 子滤波 P2（v 系，误差状态）](#62-nhc-子滤波-p2v-系误差状态)
+  - [6. 状态向量对应（单滤波, StateIndex）](#6-状态向量对应单滤波-stateindex)
+    - [6.1 固定 15 维（E 系, ψ-error）](#61-固定-15-维e-系-ψ-error)
+    - [6.2 可选参数块](#62-可选参数块)
     - [6.3 反馈机制](#63-反馈机制)
   - [7. 数据文件说明](#7-数据文件说明)
     - [7.1 IMU 数据文件](#71-imu-数据文件)
@@ -84,7 +83,7 @@
 GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，涵盖：
 
 1. **GNSS 解算配置**（SPP/RTK/RTD，参考 rtklib-py）
-2. **组合导航配置**（INS 机械编排 + 双滤波 EKF + NHC/ZUPT，参考 gnss_ins_lc_nhc）
+2. **组合导航配置**（INS 机械编排 + 单滤波 EKF + NHC/ZUPT，参考 gnss_ins_lc_nhc）
 3. **输出配置**（POS/CSV/NMEA 格式、日志级别）
 
 配置文件支持两种 GNSS 数据源模式：
@@ -309,9 +308,6 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 | `initial_att` | [float, float, float] | `[0, 0, 0]` | deg | 初始姿态 [roll, pitch, yaw]（ZYX 旋转） | `initial_att` |
 | `initial_gyro_bias` | [float, float, float] | `[0, 0, 0]` | deg/h | 初始陀螺零偏 | `initial_gyro_bias` |
 | `initial_acce_bias` | [float, float, float] | `[0, 0, 0]` | mGal | 初始加计零偏 | `initial_acce_bias` |
-| `initial_gyro_scale` | [float, float, float] | `[0, 0, 0]` | ppm | 初始陀螺比例因子 | `initial_gyro_scale` |
-| `initial_acce_scale` | [float, float, float] | `[0, 0, 0]` | ppm | 初始加计比例因子 | `initial_acce_scale` |
-| `evaluate_imu_scale` | int | `0` | — | 1=估计 IMU 比例因子（P1 扩展 6 维） | `evaluate_imu_scale` |
 
 ### 4.6 IMU 噪声参数
 
@@ -321,12 +317,8 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 | `attitude_random_walk` | [float, float, float] | `[0.1, 0.1, 0.1]` | deg/√hr | 姿态随机游走 (ARW) | `attitude_random_walk` |
 | `gyro_bias_std` | [float, float, float] | `[25, 25, 25]` | deg/h | 陀螺零偏标准差 | `gyro_bias_std` |
 | `acce_bias_std` | [float, float, float] | `[200, 200, 200]` | mGal | 加计零偏标准差 | `acce_bias_std` |
-| `gyro_scale_std` | [float, float, float] | `[500, 500, 500]` | ppm | 陀螺比例因子标准差 | `gyro_scale_std` |
-| `acce_scale_std` | [float, float, float] | `[500, 500, 500]` | ppm | 加计比例因子标准差 | `acce_scale_std` |
 | `corr_time_of_gyro_bias` | float | `0.01` | h | 陀螺零偏相关时间 | `corr_time_of_gyro_bias` |
 | `corr_time_of_acce_bias` | float | `0.01` | h | 加计零偏相关时间 | `corr_time_of_acce_bias` |
-| `corr_time_of_gyro_scale` | float | `0.01` | h | 陀螺比例因子相关时间 | `corr_time_of_gyro_scale` |
-| `corr_time_of_acce_scale` | float | `0.01` | h | 加计比例因子相关时间 | `corr_time_of_acce_scale` |
 | `position_random_walk` | [float, float, float] | `[0, 0, 0]` | — | 位置随机游走 | `position_random_walk` |
 
 ### 4.7 NHC 配置
@@ -338,15 +330,15 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 | `nhc_enable` | 观测维度 | 坐标系 | 观测量 | 作用目标 | 备注 |
 |:---:|:---:|:---:|---|---|---|
 | `0` | — | — | 不启用 NHC | — | — |
-| `1` | 1D | v 系 | 侧向速度 | P1（H1）+ P2（H2） | 需开启 `evaluate_imu_angle` |
-| `2` | 2D | v 系 | 侧向 + 垂向速度 | P1（H1）+ P2（H2） | 默认策略 |
-| `3` | 3D | v 系 | 前向 + 侧向 + 垂向 | P1（H1）+ P2（H2） | 高速时放宽前向 R |
-| `4` | 3D | n 系 | 姿态（roll/pitch/yaw） | P1 | LSTM/GT 姿态虚拟观测 |
-| `5` | 6D | v+n | 姿态 3D + 速度 3D | P1 + P2 | 联合约束 |
-| `6` | 2D | v 系 | 侧向 + 垂向 | P1 + P2 | Ga-St VBAKF 自适应 |
-| `7` | 1D | v 系 | 侧向 | P1 + P2 | Ga-St VBAKF 自适应 |
-| `8` | 3D | n 系（ENU） | 东+北+天速度 | P1 | LSTM/GT ENU 速度 |
-| `9` | 2D | v 系 | 前向 + 侧向 | P1 + P2 | 速度大时放宽 R |
+| `1` | 1D | v 系 | 侧向速度 | P（H_nhc） | 需开启 `evaluate_imu_angle` |
+| `2` | 2D | v 系 | 侧向 + 垂向速度 | P（H_nhc） | 默认策略 |
+| `3` | 3D | v 系 | 前向 + 侧向 + 垂向 | P（H_nhc） | 高速时放宽前向 R |
+| `4` | 3D | n 系 | 姿态（roll/pitch/yaw） | P | LSTM/GT 姿态虚拟观测 |
+| `5` | 6D | v+n | 姿态 3D + 速度 3D | P | 联合约束 |
+| `6` | 2D | v 系 | 侧向 + 垂向 | P | Ga-St VBAKF 自适应 |
+| `7` | 1D | v 系 | 侧向 | P | Ga-St VBAKF 自适应 |
+| `8` | 3D | n 系（ENU） | 东+北+天速度 | P | LSTM/GT ENU 速度 |
+| `9` | 2D | v 系 | 前向 + 侧向 | P | 速度大时放宽 R |
 
 **NHC 通用参数**：
 
@@ -375,7 +367,7 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 
 ### 4.8 ZUPT 配置
 
-> ZUPT（零速更新）与 NHC 互斥：静止时仅 ZUPT（3D，作用于 P1），运动时仅 NHC。
+> ZUPT（零速更新）与 NHC 互斥：静止时仅 ZUPT（3D，作用于 P），运动时仅 NHC。
 > 框架通过速度阈值自动切换（参考 NHC 速度检测逻辑）。
 
 | 字段 | 类型 | 默认值 | 单位 | 说明 |
@@ -393,23 +385,23 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 | `antlever` | [float, float, float] | `[0, 0, 0]` | m | 天线杆臂（IMU 系前右下，参考 kf-gins） | `antlever` |
 | `initial_imu_angle` | [float, float] | `[0, 0]` | deg | 初始 IMU 安装角 [pitch, yaw]（roll 假设为 0） | `initial_imu_angle` |
 | `initial_imu_leverarm` | [float, float, float] | `[0, 0, 0]` | m | 初始 IMU 杆臂（b→v） | `initial_imu_leverarm` |
-| `evaluate_imu_angle` | int | `0` | — | 1=估计 IMU 安装角和杆臂（P2 子滤波 5 维） | `evaluate_imu_angle` |
+| `evaluate_imu_angle` | int | `0` | — | 1=估计 IMU 安装角和杆臂（StateIndex 参数块 5 维） | `evaluate_imu_angle` |
 | `imu_angle_std` | [float, float] | `[10, 10]` | deg | IMU 安装角初始标准差 [pitch, yaw] | `imu_angle_std` |
 | `imu_leverarm_std` | [float, float, float] | `[1, 1, 1]` | m | IMU 杆臂初始标准差 | `imu_leverarm_std` |
 
 ### 4.10 初始协方差
 
-> 双滤波协方差：P1_0（主滤波）与 P2_0（NHC 子滤波）分别设置。
+> 单滤波协方差 P_0，维度 = StateIndex.dim（默认 15，可选扩展）。
 
-| 字段 | 类型 | 默认值 | 单位 | 说明 | 作用目标 | gnss_ins_lc_nhc 对应 |
-|------|------|--------|------|------|---------|---------------------|
-| `use_define_variance_pos_vel` | int | `1` | — | 1=使用自定义位置速度方差 | P1 | `use_define_variance_pos_vel` |
-| `use_define_variance_att` | int | `1` | — | 1=使用自定义姿态方差 | P1 | `use_define_variance_att` |
-| `initial_pos_std` | [float, float, float] | `[0.5, 0.5, 0.5]` | m | 初始位置标准差 [N, E, D] | P1 | `initial_pos_std` |
-| `initial_vel_std` | [float, float, float] | `[0.5, 0.5, 0.5]` | m/s | 初始速度标准差 [N, E, D] | P1 | `initial_vel_std` |
-| `initial_att_std` | [float, float, float] | `[0.2, 0.2, 0.5]` | deg | 初始姿态标准差 [roll, pitch, yaw] | P1 | `initial_att_std` |
+| 字段 | 类型 | 默认值 | 单位 | 说明 | gnss_ins_lc_nhc 对应 |
+|------|------|--------|------|------|---------------------|
+| `use_define_variance_pos_vel` | int | `1` | — | 1=使用自定义位置速度方差 | `use_define_variance_pos_vel` |
+| `use_define_variance_att` | int | `1` | — | 1=使用自定义姿态方差 | `use_define_variance_att` |
+| `initial_pos_std` | [float, float, float] | `[0.5, 0.5, 0.5]` | m | 初始位置标准差 [N, E, D] | `initial_pos_std` |
+| `initial_vel_std` | [float, float, float] | `[0.5, 0.5, 0.5]` | m/s | 初始速度标准差 [N, E, D] | `initial_vel_std` |
+| `initial_att_std` | [float, float, float] | `[0.2, 0.2, 0.5]` | deg | 初始姿态标准差 [roll, pitch, yaw] | `initial_att_std` |
 
-> P2_0（NHC 子滤波）由 `imu_angle_std` 和 `imu_leverarm_std` 自动构造（见 4.9）。
+> 可选块（imu_angle, imu_leverarm, lever_arm, time_sync）的初始方差由对应 std 配置项自动填充。
 
 ### 4.11 GNSS 中断模拟
 
@@ -437,34 +429,32 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 
 ---
 
-## 6. 双滤波状态向量对应
+## 6. 状态向量对应（单滤波, StateIndex）
 
-### 6.1 主滤波 P1（E 系，误差状态）
+### 6.1 固定 15 维（E 系, ψ-error）
 
-| 索引 | 状态量 | 维度 | 是否必选 | 对应配置项 |
+| 索引 | 状态量 | 维度 | 对应配置项 |
+|------|--------|------|-----------|
+| 0–2 | 位置误差 δr^e | 3 | `initial_pos` / `initial_pos_std` |
+| 3–5 | 速度误差 δv^e | 3 | `initial_vel` / `initial_vel_std` |
+| 6–8 | 姿态误差 δψ^e | 3 | `initial_att` / `initial_att_std` |
+| 9–11 | 陀螺零偏 δb_g | 3 | `initial_gyro_bias` / `gyro_bias_std` |
+| 12–14 | 加计零偏 δb_a | 3 | `initial_acce_bias` / `acce_bias_std` |
+
+### 6.2 可选参数块
+
+| 索引 | 状态量 | 维度 | 启用条件 | 对应配置项 |
 |------|--------|------|---------|-----------|
-| 0–2 | 位置误差 δr_e | 3 | 必选 | `initial_pos` / `initial_pos_std` |
-| 3–5 | 速度误差 δv_e | 3 | 必选 | `initial_vel` / `initial_vel_std` |
-| 6–8 | 姿态误差 δθ | 3 | 必选 | `initial_att` / `initial_att_std` |
-| 9–11 | 陀螺零偏 ε_b | 3 | 必选 | `initial_gyro_bias` / `gyro_bias_std` |
-| 12–14 | 加计零偏 ∇_b | 3 | 必选 | `initial_acce_bias` / `acce_bias_std` |
-| 15–17 | 陀螺比例因子 | 3 | 可选（`evaluate_imu_scale=1`） | `initial_gyro_scale` / `gyro_scale_std` |
-| 18–20 | 加计比例因子 | 3 | 可选（`evaluate_imu_scale=1`） | `initial_acce_scale` / `acce_scale_std` |
-| 21–23 | GNSS 杆臂 | 3 | 可选 | `leverarm` |
+| 15–17 | GNSS 杆臂 δl_gnss | 3 | `estimate_leverarm=1` | `leverarm` / `lever_arm_std` |
+| 18–19 | IMU 安装角 δθ_imu | 2 | `estimate_mounting_angle=1` | `imu_angle` / `imu_angle_std` |
+| 20–22 | IMU 杆臂 δl_imu | 3 | `estimate_imu_leverarm=1`（需 mounting_angle） | `imu_leverarm` / `imu_leverarm_std` |
+| 23 | 时间对齐 δt | 1 | `estimate_time_sync=1` | `time_sync_std` |
 
-### 6.2 NHC 子滤波 P2（v 系，误差状态）
-
-| 索引 | 状态量 | 维度 | 是否必选 | 对应配置项 |
-|------|--------|------|---------|-----------|
-| 0–1 | IMU 安装角误差 δθ_imu [pitch, yaw] | 2 | 必选 | `initial_imu_angle` / `imu_angle_std` |
-| 2–4 | IMU 杆臂误差 δl_imu | 3 | 必选 | `initial_imu_leverarm` / `imu_leverarm_std` |
-
-> P2 仅在 `evaluate_imu_angle=1` 且 `nhc_enable≠0` 时启用。
+> 不包含比例因子误差（已放弃）。默认全 0 时 dim=15，全启用时 dim=24。
 
 ### 6.3 反馈机制
 
-- **P1 反馈**：GNSS 量测更新、ZUPT 更新、NHC H1 部分更新后反馈至 INS 状态（位置、速度、姿态、零偏、比例因子、杆臂）
-- **P2 反馈**：NHC H2 部分更新后独立反馈至 IMU 安装角和杆臂
+统一反馈（ψ-error）：位置/速度/姿态减号，零偏/杆臂/安装角/时间加号。详见 [estimator.md 第 5 节](file:///home/mxl/workplace/gipylib/skills/estimator.md#5-反馈机制)。
 
 ---
 

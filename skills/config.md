@@ -179,7 +179,7 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 | `reboot` | double | `50` | s | >0 | GNSS 中断重启阈值，等价于 `gnss_outage_threshold`（[初始化.md 13.6 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#136-reboot-识别与重新初始化)）。INS 初始化完成后，若 GNSS 中断超过此阈值，重新进行组合导航初始化 |
 | `imu_outage_threshold` | double | `1.0` | s | >0 | IMU 中断 reboot 阈值。IMU 数据流中断超过此值时触发 reboot |
 | `timestamp_jump_threshold` | double | `10.0` | s | >0 | 时间戳跳变 reboot 阈值。IMU/GNSS 时间戳跳变超过此值时触发 reboot |
-| `cov_divergence_threshold` | double | `100.0` | m² | >0 | 协方差发散 reboot 阈值。主滤波 P1 对角元素最大值超过此值时触发 reboot |
+| `cov_divergence_threshold` | double | `100.0` | m² | >0 | 协方差发散 reboot 阈值。协方差 P 对角元素最大值超过此值时触发 reboot |
 | `enable_gnss_mode_degrade_reboot` | bool | `false` | — | true/false | 是否启用 GNSS 模式降级 reboot（如 RTK→SPP） |
 | `gnss_mode_degrade_threshold` | double | `60.0` | s | >0 | GNSS 模式降级持续时长阈值 |
 | `reboot_use_prior_state` | bool | `false` | — | true/false | reboot 后重新初始化时是否使用前一次状态作为先验 |
@@ -286,16 +286,12 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 | `initial_att` | array[3] | `[0.0, 0.0, 0.0]` | deg | — | 初始姿态 [roll, pitch, yaw]（ZYX 旋转） |
 | `initial_gyro_bias` | array[3] | `[0, 0, 0]` | deg/h | — | 初始陀螺零偏 [x, y, z] |
 | `initial_acce_bias` | array[3] | `[0, 0, 0]` | mGal | — | 初始加计零偏 [x, y, z] |
-| `initial_gyro_scale` | array[3] | `[0, 0, 0]` | ppm | — | 初始陀螺比例因子 [x, y, z] |
-| `initial_acce_scale` | array[3] | `[0, 0, 0]` | ppm | — | 初始加计比例因子 [x, y, z] |
-| `evaluate_imu_scale` | int | `0` | — | 0 / 1 | 1=估计 IMU 比例因子（P1 扩展 6 维） |
 
 **单位转换**（参考 `tools/gnss_ins_lc_nhc` `StartAligning` 与 `constant.hpp`，[初始化.md 11.2 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#112-单位转换参考-kf-gins-loadconfig)）：
 - 纬度/经度：度 → 弧度（`rad = deg * D2R`）
 - 姿态角：度 → 弧度
 - 陀螺零偏：deg/h → rad/s（`rad/s = deg/h * dh2rs`，`dh2rs = π / 180.0 / 3600.0`）
 - 加计零偏：mGal → m/s²（`m/s² = mGal * 1e-6 * g0`，`g0 = 9.7803267715`，即 `constant_mGal ≈ 9.78e-6`；**注意：非标准 `1e-5`**）
-- 比例因子：ppm → 无量纲（`= ppm * 1e-6`，`constant_ppm = 1e-6`）
 
 ### 2.7 IMU 噪声参数
 
@@ -305,12 +301,8 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 | `attitude_random_walk` | array[3] | `[0.1, 0.1, 0.1]` | deg/√hr | >0 | 姿态随机游走（ARW）[x, y, z] |
 | `gyro_bias_std` | array[3] | `[25.0, 25.0, 25.0]` | deg/h | >0 | 陀螺零偏标准差 [x, y, z] |
 | `acce_bias_std` | array[3] | `[200.0, 200.0, 200.0]` | mGal | >0 | 加计零偏标准差 [x, y, z] |
-| `gyro_scale_std` | array[3] | `[500.0, 500.0, 500.0]` | ppm | >0 | 陀螺比例因子标准差 [x, y, z] |
-| `acce_scale_std` | array[3] | `[500.0, 500.0, 500.0]` | ppm | >0 | 加计比例因子标准差 [x, y, z] |
 | `corr_time_of_gyro_bias` | double | `0.01` | h | >0 | 陀螺零偏相关时间（一阶高斯-马尔科夫过程） |
 | `corr_time_of_acce_bias` | double | `0.01` | h | >0 | 加计零偏相关时间 |
-| `corr_time_of_gyro_scale` | double | `0.01` | h | >0 | 陀螺比例因子相关时间 |
-| `corr_time_of_acce_scale` | double | `0.01` | h | >0 | 加计比例因子相关时间 |
 | `position_random_walk` | array[3] | `[0, 0, 0]` | — | ≥0 | 位置随机游走 [x, y, z] |
 
 ### 2.8 NHC 配置
@@ -353,7 +345,7 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 | `antlever` | array[3] | `[0.0, 0.0, 0.0]` | m | — | 天线杆臂（IMU 系 FRD，参考 KF-GINS） |
 | `initial_imu_angle` | array[2] | `[0, 0]` | deg | — | 初始 IMU 安装角 [pitch, yaw]（roll 假设为 0） |
 | `initial_imu_leverarm` | array[3] | `[0.0, 0.0, 0.0]` | m | — | 初始 IMU 杆臂（b→v） |
-| `evaluate_imu_angle` | int | `0` | — | 0 / 1 | 1=估计 IMU 安装角与杆臂（启用 P2 子滤波 5 维） |
+| `evaluate_imu_angle` | int | `0` | — | 0 / 1 | 1=估计 IMU 安装角与杆臂（启用 StateIndex 参数块 5 维） |
 | `imu_angle_std` | array[2] | `[10.0, 10.0]` | deg | >0 | IMU 安装角初始标准差 [pitch, yaw] |
 | `imu_leverarm_std` | array[3] | `[1.0, 1.0, 1.0]` | m | >0 | IMU 杆臂初始标准差 [x, y, z] |
 
@@ -369,7 +361,7 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 | `initial_vel_std` | array[3] | `[0.5, 0.5, 0.5]` | m/s | >0 | 初始速度标准差 [N, E, D] |
 | `initial_att_std` | array[3] | `[0.2, 0.2, 0.5]` | deg | >0 | 初始姿态标准差 [roll, pitch, yaw] |
 
-**注**：P2_0（NHC 子滤波）由 `imu_angle_std` 和 `imu_leverarm_std` 自动构造，无需单独配置。
+**注**：P 中 IMU 安装角/杆臂参数块的初始协方差由 `imu_angle_std` 和 `imu_leverarm_std` 自动构造，无需单独配置。
 
 **姿态协方差默认值**（`use_define_variance_att=0` 时，参考 [初始化.md 12.3](file:///home/mxl/workplace/gipylib/skills/初始化.md#123-不同对准模式下的姿态协方差默认值)）：
 

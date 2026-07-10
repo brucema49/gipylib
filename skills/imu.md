@@ -83,15 +83,15 @@ IMU/GNSS 数据流（纯队列流水线，时间对齐在 Estimator 内部）:
                                     InsCore ←─────── 时间对齐后的 IMU
                                     (正向递推)
                                        ↓
-                                  双滤波 EKF (P1 主滤波 + P2 NHC 子滤波)
+                                  单滤波 EKF (P, StateIndex 参数块)
                                        ↓
-                                  双滤波独立反馈
+                                  单滤波统一反馈
 ```
 
 - `InsCore` 负责 INS 正向递推（姿态、速度、位置更新）
 - `Interpolator` 负责 IMU/GNSS 时间对齐（**在 Estimator 内部调用**，Scheduler 仅转发）
-- `InsKf`/`LcEstimator` 负责构造双滤波状态转移矩阵 F1/F2（误差传播）
-- InsCore 是正向递推，InsKf/LcEstimator 是误差传播，两者共享相同的物理模型
+- `LcEstimator` 负责构造状态转移矩阵 F（误差传播，StateIndex 参数块）
+- InsCore 是正向递推，LcEstimator 是误差传播，两者共享相同的物理模型
 - IMU 数据通过 `queue.put()` 流转，**无观察者回调、无 notify()**
 
 ---
@@ -726,8 +726,8 @@ GNSS(t_gnss) 到达，IMU 缓冲区有 imu_list
   v_scul = (cross(prev_dtheta, dvel_comp) + cross(prev_dvel, dtheta_comp)) / 12
 
 其中:
-  dtheta_comp = (gyro*dt - gyro_bias*dt) * (1 - gyro_scale)  已补偿角增量
-  dvel_comp = (accel*dt - accel_bias*dt) * (1 - accel_scale)  已补偿速度增量
+  dtheta_comp = gyro*dt - gyro_bias*dt  已补偿角增量
+  dvel_comp = accel*dt - accel_bias*dt  已补偿速度增量
   prev_dtheta/prev_dvel: 上一历元的已补偿增量 (参考 ignav omgbp/fbp)
   C_ee_v = I - skew(ω_ie * 0.5 * dt)  地球自转半步补偿
   f^e = C_b^e * f^b                              比力在 E 系投影
@@ -735,7 +735,7 @@ GNSS(t_gnss) 到达，IMU 缓冲区有 imu_list
   g^e = EarthParam.gravity_ecef(r^e)               E 系下正常重力向量
 
 计算步骤:
-  1. dtheta_comp, dvel_comp = IMU补偿(速率×dt - bias×dt)×(1-scale)
+  1. dtheta_comp, dvel_comp = IMU补偿(速率×dt - bias×dt)
   2. v_rot = 精确Rodrigues旋转补偿(dtheta_comp, dvel_comp)
   3. v_scul = 划桨补偿(prev_dtheta, prev_dvel, dtheta_comp, dvel_comp)
   4. g^e = EarthParam.gravity_ecef(state.position)    E 系重力
@@ -1185,7 +1185,7 @@ E 系 ↔ n 系转换:
 | `navmech.cc` 姿态更新 | `InsCore.attitude_update()` | E 系下四元数/DCM 姿态递推 |
 | `navmech.cc` 速度更新 | `InsCore.velocity_update()` | E 系下比力+Coriolis+重力 |
 | `navmech.cc` 位置更新 | `InsCore.position_update()` | ECEF 位置递推 |
-| `navmech.cc` F矩阵构造 | `InsKf.set_Ft()` / `LcEstimator.set_Ft()` | E 系下可配置维度状态转移矩阵 |
+| `navmech.cc` F矩阵构造 | `LcEstimator` (`TransferMatrix.build_F`) | E 系下可配置维度状态转移矩阵 |
 | `navinitalized.cc` | `InsCore.coarse_align_*()` | E 系下粗对准+精对准 |
 
 ### 11.3 GINav → 本项目
@@ -1196,7 +1196,7 @@ E 系 ↔ n 系转换:
 | `ins_init.m` | `InsCore` + 协方差设置 | INS 初始化 |
 | `ins_align.m` | `InsCore.coarse_align_*()` | INS 对准 |
 | `earth_update.m` | `EarthParam` | 地球参数更新 |
-| `update_trans_mat.m` | `InsKf.set_Ft()` / `LcEstimator.set_Ft()` | 状态转移矩阵更新 |
+| `update_trans_mat.m` | `LcEstimator` (`TransferMatrix.build_F`) | 状态转移矩阵更新 |
 | `Cnb2att.m` / `att2Cnb.m` | `AttitudeUtil` | 姿态转换 |
 
 ---
@@ -1484,9 +1484,9 @@ IMU 数据到达（纯队列流水线，无观察者回调）:
   LcIntegration.process_epoch()          (从 estimate_queue.get())
     → _time_align()                       (时间对齐：增量切分，在 Estimator 内部)
     → ImuMechStrategy.execute()           (前端策略：机械编排 E 系递推)
-    → InsKf.time_update()                 (双滤波 EKF 预测：P1 + P2 独立)
-    → [GNSS 到达时] meas_update()         (双滤波量测更新：H1 作用于 P1, H2 作用于 P2)
-    → feedback()                          (双滤波独立反馈)
+    → LcEstimator.time_update()           (单滤波 EKF 预测：P = Φ·(P+0.5Q)·Φ^T + 0.5Q)
+    → [GNSS 到达时] meas_update()         (单滤波量测更新：H 作用于 P, Joseph form)
+    → feedback()                          (单滤波统一反馈)
     → solution_queue.put(Solution)        (输出解)
 ```
 
@@ -1508,6 +1508,6 @@ integration._frontend = frontend
 
 | 特性 | 体现 |
 |------|------|
-| **封装** | 机械编排状态（姿态/速度/位置）封装在 `InsCore` 内部，双滤波状态分别封装在 P1/P2 矩阵中，外部仅通过策略接口访问 |
+| **封装** | 机械编排状态（姿态/速度/位置）封装在 `InsCore` 内部，误差状态封装在单一 P 矩阵中（StateIndex 参数块），外部仅通过策略接口访问 |
 | **继承** | `ImuPreprocessor(ABC)` → `RateImuPreprocessor` / `DeltaImuPreprocessor`；`OdometryStrategy(ABC)` → `ImuMechStrategy`；`BaseSensor(ABC)` → `ImuSensor` |
 | **多态** | 框架持有 `OdometryStrategy` 抽象引用（`_frontend`），运行时调用 `ImuMechStrategy` / `SppStrategy` / `RtkStrategy`；传感器层多态通过 `BaseSensor` 抽象引用 |
