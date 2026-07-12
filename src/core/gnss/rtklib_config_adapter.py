@@ -64,6 +64,7 @@ def build_params(gnss_cfg: dict) -> dict:
     params["snrmax"] = _f(gnss_cfg["snrmax"])
     params["accelh"] = _f(gnss_cfg["accelh"])
     params["accelv"] = _f(gnss_cfg["accelv"])
+    params["pos_psd"] = _f(gnss_cfg.get("pos_psd", 0.0))
     params["prnbias"] = _f(gnss_cfg["prnbias"])
     params["sig_p0"] = _f(gnss_cfg["sig_p0"])
     params["sig_v0"] = _f(gnss_cfg["sig_v0"])

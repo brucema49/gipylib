@@ -89,6 +89,7 @@ def rtkinit(cfg):
     nav.maxage = cfg.maxage
     nav.accelh = cfg.accelh
     nav.accelv = cfg.accelv
+    nav.pos_psd = cfg.pos_psd
     nav.prnbias = cfg.prnbias
     
     # ambiguity resolution
@@ -766,10 +767,23 @@ def udpos(nav, sol):
     # process noise added to accel
     Q = np.zeros((3,3))
     Q[0,0] = Q[1,1] = nav.accelh**2 * abs(tt)
-    Q[2,2] = nav.accelv**2 * abs(tt)    
+    Q[2,2] = nav.accelv**2 * abs(tt)
     E = gn.xyz2enu(gn.ecef2pos(nav.x[0:3]))
     Qv = E.T @ Q @ E
     nav.P[6:9,6:9] += Qv
+
+    # velocity process noise (prevents P_vel collapse during long stationary
+    # periods; without this, K_vel -> 0 and filter can't track motion onset)
+    Qvv = Qv * abs(tt)
+    nav.P[3:6,3:6] += Qvv
+
+    # position process noise (prevents P_pos collapse when measurement update
+    # shrinks P_acc before it can propagate to position through F)
+    if nav.pos_psd > 0:
+        Qp = np.zeros((3,3))
+        Qp[0,0] = Qp[1,1] = Qp[2,2] = nav.pos_psd * abs(tt)
+        Qpv = E.T @ Qp @ E
+        nav.P[0:3,0:3] += Qpv
     
 def udbias(nav, obsb, obsr, iu, ir):
     
@@ -1042,6 +1056,7 @@ def relpos(nav, obsr, obsb, sol):
     sol.stat = stat
     sol.ratio = nav.ratio
     sol.age = nav.dt
+    sol.ns = nav.ns
     nav.sol.append(sol)
     nav.rr = sol.rr[0:3]
     tracemat(3, 'sol_rr= ', sol.rr, '15.3f')

@@ -22,9 +22,12 @@
 > - ✅ 已实现：`src/stream/gnss_sol_sensor.py::GnssSolSensor`（外部 GNSS 结果传感器线程）
 > - ✅ 已实现：`src/stream/internal_gnss_sensor.py::InternalGnssSensor`（内部 GNSS 解算传感器线程，逐历元调用 pntpos/relpos，SPP 模式含多普勒测速）
 > - ✅ 已实现：`src/core/ins/initializer.py::InsInitializer`（INS 初始化，三种模式 + 三阈值检验，详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
+> - ✅ 已实现：单滤波 EKF `LcEstimator` / `LcIntegration`（StateIndex 参数块，最近邻时间对齐，详见 [estimator.md](file:///home/mxl/workplace/gipylib/skills/estimator.md)）
+> - ✅ 已实现：`src/core/ins/constraints.py::Constraints`（NHC/ZUPT/ZARU 约束，独立模块，参考 ignav 分离架构）
+> - ✅ 已实现：`src/core/ins/lc_runner.py::LcRunner`（松组合批处理运行器，路径 C 下由 `Logger` 在流式结束后调用，输出松组合 .pos）
+> - ✅ 已验证：路径 C 三文件输出（RTK.pos + aligned_internal_rtk.csv + RTKLC.pos），松组合结果与纯 GNSS 一致（planar <0.5m, elev <1m）
 > - 🚧 预留：RoverSensor / EphSensor / RefSensor（独立星历/基站流，当前由 `InternalGnssSensor` 内部 RINEX 加载完成）
 > - 🚧 预留：Scheduler / 独立星历基站流（当前三种模式均无 Scheduler，传感器直接推入 queue 由 Logger/SolutionLogger 消费）
-> - ✅ 已实现：单滤波 EKF `LcEstimator` / `LcIntegration`（StateIndex 参数块，最近邻时间对齐，详见 [estimator.md](file:///home/mxl/workplace/gipylib/skills/estimator.md)）
 
 ---
 
@@ -2237,10 +2240,19 @@ gipylib/
 │   │   ├── thread_control.py    # ✅ ThreadControl 线程控制
 │   │   ├── time_utils.py        # ✅ 时间转换（gpst_to_unix / unix_to_gpst / ymdhms_to_gpst）
 │   │   ├── data_types.py        # ✅ 核心数据类型（ImuMeasurement / GnssSolution / SensorData / AlignedBlock）
-│   │   └── gnss/                # ✅ GNSS 解算模块（含 rtklib/ 吸收子包）
+│   │   ├── gnss/                # ✅ GNSS 解算模块（含 rtklib/ 吸收子包）
+│   │   └── ins/                 # ✅ INS/松组合模块
+│   │       ├── initializer.py       # ✅ InsInitializer（三种初始化模式 + 三阈值检验）
+│   │       ├── lc_estimator.py      # ✅ LcEstimator（单滤波 EKF，StateIndex 参数块，Joseph form）
+│   │       ├── lc_integration.py    # ✅ LcIntegration（最近邻时间对齐主循环）
+│   │       ├── lc_runner.py         # ✅ LcRunner（松组合批处理运行器，输出 RTKLC.pos）
+│   │       ├── constraints.py       # ✅ Constraints（NHC/ZUPT/ZARU 约束，独立模块）
+│   │       ├── static_detect.py     # ✅ StaticDetect（GLRT/MV/MAG/ARE/ALL 静态检测）
+│   │       ├── transfer_matrix.py   # ✅ TransferMatrix（F/Φ/Q，读取 pos_psd 等过程噪声 PSD）
+│   │       └── ...                  # ✅ 其他 INS 支撑模块（interpolator/earth_param/attitude 等）
 │   │
 │   ├── log/                     # ✅ 日志层
-│   │   ├── logger.py            # ✅ Logger（external+on / internal+on 模式，消费 imu_queue + gnss_queue）
+│   │   ├── logger.py            # ✅ Logger（external+on / internal+on 模式，消费 imu_queue + gnss_queue；internal+on 下收集数据供 LcRunner 批量运行）
 │   │   ├── solution_logger.py   # ✅ SolutionLogger（internal+off 模式，仅消费 gnss_queue）
 │   │   ├── writer_base.py       # ✅ WriterBase 输出器抽象基类
 │   │   ├── solution_writer.py   # ✅ SolutionWriter rtklib 风格 .pos 输出

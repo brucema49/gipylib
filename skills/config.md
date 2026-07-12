@@ -42,7 +42,10 @@
   - [2.7 IMU 噪声参数](#27-imu-噪声参数)
   - [2.8 NHC 配置](#28-nhc-配置)
   - [2.9 ZUPT 配置](#29-zupt-配置)
+  - [2.9b ZARU 配置](#29b-zaru-配置)
+  - [2.9c 静态检测配置](#29c-静态检测配置)
   - [2.10 杆臂与安装角](#210-杆臂与安装角)
+  - [2.10b 可选状态参数开关](#210b-可选状态参数开关单滤波-stateindex-管理)
   - [2.11 初始协方差](#211-初始协方差)
   - [2.12 GNSS 中断模拟](#212-gnss-中断模拟)
 - [3. 输出配置 (output)](#3-输出配置-output)
@@ -208,8 +211,9 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 |------|------|--------|------|---------|------|
 | `gnss_enable` | int | `1` | — | 0 / 1 | GNSS 量测使能。0=关闭 GNSS 量测更新 |
 | `imu_enable` | int | `1` | — | 0 / 1 | IMU 机械编排放能。0=关闭机械编排 |
-| `nhc_enable` | int | `2` | — | 0-9 | NHC 策略（见下方策略表） |
-| `zupt_enable` | int | `0` | — | 0 / 1 | ZUPT 策略。0=关闭；1=3D 零速更新。与 NHC 互斥 |
+| `nhc_enable` | int | `2` | — | 0-9 | NHC 策略（见下方策略表）。静态时与 ZUPT/ZARU 互斥（静态→ZUPT+ZARU，运动→NHC） |
+| `zupt_enable` | int | `0` | — | 0 / 1 | ZUPT 策略。0=关闭；1=3D 零速更新。静态时与 NHC 互斥 |
+| `zaru_enable` | int | `0` | — | 0 / 1 | ZARU 策略。0=关闭；1=零角速率更新（估计陀螺零偏）。静态时与 NHC 互斥 |
 
 **NHC 策略表**：
 
@@ -225,6 +229,11 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 | 7 | 1D | v 系 | 侧向（Ga-St VBAKF 自适应） |
 | 8 | 3D | n 系(ENU) | 东 + 北 + 天速度 |
 | 9 | 2D | v 系 | 前向 + 侧向（速度大时放宽 R） |
+
+> **约束互斥逻辑**（参考 ignav，详见 [NHC_ZUPT.md](file:///home/mxl/workplace/gipylib/skills/NHC_ZUPT.md)）：
+> - 静态检测（GLRT/MV/MAG/ARE/ALL）判定为静止 → ZUPT + ZARU（若 enable=1）
+> - 静态检测判定为运动 → NHC（若 enable≠0）
+> - 三者通过 per-IMU 触发 + decimation 互斥应用
 
 ### 2.4 数据路径与采样率
 
@@ -295,6 +304,10 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 
 ### 2.7 IMU 噪声参数
 
+> 包含传感器级噪声参数（VRW/ARW/bias_std/corr_time）和过程噪声 PSD 参数（用于 Q 矩阵构造，由 `TransferMatrix` 读取）。
+
+#### 2.7.1 传感器级噪声参数
+
 | 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
 |------|------|--------|------|---------|------|
 | `velocity_random_walk` | array[3] | `[0.1, 0.1, 0.1]` | m/s/√hr | >0 | 速度随机游走（VRW）[x, y, z] |
@@ -303,14 +316,43 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 | `acce_bias_std` | array[3] | `[200.0, 200.0, 200.0]` | mGal | >0 | 加计零偏标准差 [x, y, z] |
 | `corr_time_of_gyro_bias` | double | `0.01` | h | >0 | 陀螺零偏相关时间（一阶高斯-马尔科夫过程） |
 | `corr_time_of_acce_bias` | double | `0.01` | h | >0 | 加计零偏相关时间 |
-| `position_random_walk` | array[3] | `[0, 0, 0]` | — | ≥0 | 位置随机游走 [x, y, z] |
+
+#### 2.7.2 过程噪声 PSD 参数（Q 矩阵构造）
+
+> 由 `src/core/ins/transfer_matrix.py::TransferMatrix` 读取，用于构造过程噪声矩阵 Q。
+> **调谐级 PSD** 在传感器噪声基础上增大以计入车辆动力学，使 P_pos 在 1s 内增长到与 R 可比（K≈0.5）。
+
+| 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
+|------|------|--------|------|---------|------|
+| `gyro_psd` | double | `1.0e-5` | rad²/s | >0 | 陀螺过程噪声 PSD（调谐值）。传感器级为 3.4e-9（CPT 战术级，仅含传感器噪声） |
+| `accel_psd` | double | `1.0e-2` | m²s⁻³ | >0 | 加计过程噪声 PSD（调谐值）。传感器级为 2.6e-6 |
+| `gyro_bias_psd` | double | `1.0e-10` | rad²s⁻³ | >0 | 陀螺零偏随机游走 PSD（调谐值） |
+| `acce_bias_psd` | double | `1.0e-4` | m²s⁻⁵ | >0 | 加计零偏随机游走 PSD（调谐值） |
+| `pos_psd` | double | `5.0e-3` | m²/s | ≥0 | **位置随机游走 PSD（LC EKF 必需项）**。使 P_pos 1s 内增长 ~0.005，配合 R=0.0025(sigma=0.05) 使 K≈0.8。无 pos_psd 时 P_pos 在量测更新后趋近 0，K→0，滤波器锁死无法跟踪 GNSS |
+
+> **注意**：`pos_psd` 是 LC EKF 必需项。`TransferMatrix` 通过 `ins_cfg.get("pos_psd", 0.0)` 读取（标量），Q 矩阵使用 `pos_psd * dt`。旧版 `position_random_walk`（数组）已废弃，不再使用。
+
+#### 2.7.3 初始不确定度（SI 单位，从 cpt-rtktc_gps.conf 提取）
+
+| 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
+|------|------|--------|------|---------|------|
+| `initial_pos_std_si` | array[3] | `[30.0, 30.0, 30.0]` | m | >0 | 初始位置不确定度（1σ, per axis, ECEF） |
+| `initial_vel_std_si` | array[3] | `[10.0, 10.0, 10.0]` | m/s | >0 | 初始速度不确定度（1σ, per axis, ECEF） |
+| `initial_att_std_si` | array[3] | `[0.00524, 0.00524, 0.00524]` | rad | >0 | 初始姿态不确定度（1σ, per axis） |
+| `gyro_bias_std_si` | array[3] | `[2.424e-5, ...]` | rad/s | >0 | 陀螺零偏不确定度（from ins-uncbg） |
+| `acce_bias_std_si` | array[3] | `[0.0489, ...]` | m/s² | >0 | 加计零偏不确定度（from ins-uncba） |
 
 ### 2.8 NHC 配置
 
 > NHC（Non-Holonomic Constraint，非完整性约束）假设车辆在 v 系（车体系）下侧向和垂向速度为 0。
+> 参考 ignav `ins-nhc.cc`，包含 guards（速度/角速率阈值）和 decimation（抽样间隔）。
 
 | 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
 |------|------|--------|------|---------|------|
+| `nhc_std` | double | `0.5` | m/s | >0 | NHC 速度观测标准差。std=0.5 + decimation=10 防止 100Hz 过约束高程退化 |
+| `nhc_max_vel` | double | `0.5` | m/s | >0 | NHC 单维速度 guard（ignav MAXVEL，超阈剔除该维） |
+| `nhc_max_gyro` | double | `30.0` | deg/s | >0 | NHC 角速率 guard（ignav，剧烈转弯跳过整个 NHC） |
+| `nhc_decimation` | int | `10` | epoch | ≥1 | NHC 抽样间隔（1=每IMU历元，10=100Hz下10Hz） |
 | `nhc_gt` | int | `0` | — | 0 / 1 | 1=使用真值参考速度/姿态（仿真用），与 `nhc_lstm` 互斥 |
 | `nhc_lstm` | int | `0` | — | 0 / 1 | 1=使用 LSTM 预测速度/姿态（部署用），与 `nhc_gt` 互斥 |
 | `nhc_start` | double | `0` | s | ≥0 | NHC 生效起始时刻（GPST 周内秒） |
@@ -327,15 +369,49 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 | `nhc_vb_zeta` | double | `1.0` | — | >0 | VBAKF 遗忘因子 |
 | `nhc_vb_nu` | double | `3.0` | — | >0 | 逆 Wishart 先验自由度 |
 
+> **NHC 调谐经验**：std=0.5 + decimation=10（10Hz）防止 100Hz 过约束导致高程退化。详见 [NHC_ZUPT.md](file:///home/mxl/workplace/gipylib/skills/NHC_ZUPT.md)。
+
 ### 2.9 ZUPT 配置
 
 > ZUPT（Zero-velocity Update，零速更新）在车辆静止时约束三维速度为 0。与 NHC 互斥。
+> 参考 ignav `ins-zvu.cc`，包含 guards 和 ignav 常量映射。
 
 | 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
 |------|------|--------|------|---------|------|
-| `zupt_vel_threshold` | double | `0.5` | m/s | >0 | 零速检测速度阈值，低于此值判定为静止 |
-| `zupt_R` | array[3] | `[0.01, 0.01, 0.01]` | (m/s)² | >0 | ZUPT 三维速度观测噪声 R [x, y, z] |
-| `zupt_min_static_epoch` | int | `5` | epoch | >0 | 判定静止的最小连续历元数 |
+| `zupt_std` | double | `0.05` | m/s | >0 | ZUPT 速度观测标准差（ignav VARVEL=SQR(0.05)） |
+| `zupt_max_vel` | double | `0.1` | m/s | >0 | ZUPT 速度 guard（ignav MAXVEL，超阈跳过） |
+| `zupt_max_gyro` | double | `10.0` | deg/s | >0 | ZUPT 角速率 guard（ignav MAXGYRO） |
+| `zupt_min_count` | int | `15` | epoch | >0 | ZUPT 最小间隔（ignav MINZC=15） |
+| `zupt_vel_threshold` | double | `0.5` | m/s | >0 | 零速检测速度阈值（兼容旧版，推荐用 static_detect） |
+| `zupt_R` | array[3] | `[0.01, 0.01, 0.01]` | (m/s)² | >0 | ZUPT 三维速度观测噪声 R [x, y, z]（兼容旧版） |
+| `zupt_min_static_epoch` | int | `5` | epoch | >0 | 判定静止的最小连续历元数（兼容旧版） |
+
+### 2.9b ZARU 配置
+
+> ZARU（Zero Angular Rate Update，零角速率更新）在车辆静止时约束三维角速度为 0，估计陀螺零偏。
+> 参考 ignav `ins-zaru.cc`。静态时与 NHC 互斥。
+
+| 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
+|------|------|--------|------|---------|------|
+| `zaru_std` | double | `0.01745` | rad/s | >0 | ZARU 角速率观测标准差（ignav VARARE=SQR(1°/s)） |
+| `zaru_max_vel` | double | `0.1` | m/s | >0 | ZARU 速度 guard（ignav MAXVEL） |
+| `zaru_max_gyro` | double | `5.0` | deg/s | >0 | ZARU 角速率 guard（ignav MAXGYRO，比 ZUPT 更严） |
+| `zaru_min_count` | int | `100` | epoch | >0 | ZARU 最小间隔（ignav MINZAC=100） |
+
+### 2.9c 静态检测配置
+
+> 参考 ignav `ins-static-detect.cc`，用于 NHC/ZUPT/ZARU 互斥选择（静态→ZUPT/ZARU，运动→NHC）。
+
+| 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
+|------|------|--------|------|---------|------|
+| `static_detect_method` | str | `"GLRT"` | — | GLRT/MV/MAG/ARE/ALL | 检测方法 |
+| `static_window_size` | int | `20` | epoch | >0 | 滑动窗口大小（100Hz下0.2s） |
+| `static_sig_gyro` | double | `0.1` | rad/s | >0 | 陀螺噪声 σ |
+| `static_sig_accl` | double | `0.1` | m/s² | >0 | 加计噪声 σ |
+| `static_gamma_glrt` | double | `100.0` | — | >0 | GLRT 阈值 |
+| `static_gamma_mv` | double | `50.0` | — | >0 | MV 阈值 |
+| `static_gamma_mag` | double | `50.0` | — | >0 | MAG 阈值 |
+| `static_gamma_are` | double | `50.0` | — | >0 | ARE 阈值 |
 
 ### 2.10 杆臂与安装角
 
@@ -345,9 +421,25 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 | `antlever` | array[3] | `[0.0, 0.0, 0.0]` | m | — | 天线杆臂（IMU 系 FRD，参考 KF-GINS） |
 | `initial_imu_angle` | array[2] | `[0, 0]` | deg | — | 初始 IMU 安装角 [pitch, yaw]（roll 假设为 0） |
 | `initial_imu_leverarm` | array[3] | `[0.0, 0.0, 0.0]` | m | — | 初始 IMU 杆臂（b→v） |
-| `evaluate_imu_angle` | int | `0` | — | 0 / 1 | 1=估计 IMU 安装角与杆臂（启用 StateIndex 参数块 5 维） |
 | `imu_angle_std` | array[2] | `[10.0, 10.0]` | deg | >0 | IMU 安装角初始标准差 [pitch, yaw] |
 | `imu_leverarm_std` | array[3] | `[1.0, 1.0, 1.0]` | m | >0 | IMU 杆臂初始标准差 [x, y, z] |
+
+### 2.10b 可选状态参数开关（单滤波 StateIndex 管理）
+
+> 参考gnss_ins_lc_nhc `evaluate_*`，由 `StateIndex` dataclass 管理参数块索引（-1=未启用）。
+
+| 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
+|------|------|--------|------|---------|------|
+| `estimate_leverarm` | int | `0` | — | 0 / 1 | 1=估计 GNSS 天线杆臂（3维，算法参考 ignav） |
+| `estimate_mounting_angle` | int | `0` | — | 0 / 1 | 1=估计 IMU 安装角（2维，替代旧 `evaluate_imu_angle`） |
+| `estimate_imu_leverarm` | int | `0` | — | 0 / 1 | 1=估计 IMU 杆臂 b→v（3维，需 `estimate_mounting_angle=1`） |
+| `estimate_time_sync` | int | `1` | — | 0 / 1 | 1=估计时间对齐误差（1维，算法参考 ignav） |
+| `lever_arm_psd` | double | `0.0` | m²/s | ≥0 | GNSS 杆臂随机游走 PSD（0=常数） |
+| `imu_angle_psd` | double | `1.0e-6` | rad²/s | ≥0 | 安装角随机游走 PSD |
+| `imu_leverarm_psd` | double | `1.0e-8` | m/s | ≥0 | IMU 杆臂随机游走 PSD |
+| `time_sync_psd` | double | `1.0e-4` | s²/s | ≥0 | 时间对齐随机游走 PSD |
+| `lever_arm_std` | array[3] | `[0.1, 0.1, 0.1]` | m | >0 | GNSS 杆臂初始标准差 |
+| `time_sync_std` | double | `0.01` | s | >0 | 时间对齐初始标准差 |
 
 ### 2.11 初始协方差
 
@@ -388,12 +480,22 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 |------|------|--------|------|---------|------|
 | `output_dir` | str | `"output"` | — | 有效目录 | 输出目录 |
 | `solution_format` | str | `"pos"` | — | `pos` / `csv` / `nmea` | 解算结果格式 |
-| `solution_filename` | str | — | — | 有效文件名 | 输出文件名（覆盖默认名） |
+| `solution_filename` | str | `"RTKLC.pos"` | — | 有效文件名 | **双用途**：internal+off 模式=纯 GNSS 定位结果；internal+on 模式=松组合定位结果（由 `LcRunner` 输出） |
+| `gnss_solution_filename` | str | `"RTK.pos"` | — | 有效文件名 | 纯 GNSS 定位结果文件名（仅 internal+on 模式，由 `Logger.gnss_writer` 实时输出） |
+| `aligned_filename` | str | `"aligned.csv"` | — | 有效文件名 | 对齐块状 CSV 文件名（external+on / internal+on 模式，由 `AlignedWriter` 输出） |
 | `trace_level` | int | `1` | — | 0 / 1 / 2 / 3 | 轨迹输出级别。0=无；1=基本；2=详细；3=调试 |
 | `log_raw_data` | bool | `false` | — | true/false | 是否记录原始数据到 `raw/` |
 | `log_level` | str | `"INFO"` | — | `DEBUG` / `INFO` / `WARNING` / `ERROR` | 运行日志级别 |
 | `terminal_summary_interval` | int | `10` | — | >0 | 终端摘要间隔（每 N 条解算结果输出一次摘要） |
 | `filter_debug_log_enable` | int | `0` | — | 0 / 1 | 1=输出滤波调试日志（F/H/P 矩阵等） |
+
+> **三种运行模式的输出文件**：
+>
+> | 模式 | gnss_source | ins.enabled | 输出文件 |
+> |------|-------------|-------------|---------|
+> | 路径 A（外部对齐） | `external` | `on` | `aligned_filename`（对齐 CSV） |
+> | 路径 B（内部纯 GNSS） | `internal` | `off` | `solution_filename`（纯 GNSS .pos） |
+> | 路径 C（内部对齐+松组合） | `internal` | `on` | `gnss_solution_filename`（纯 GNSS .pos）+ `aligned_filename`（对齐 CSV）+ `solution_filename`（松组合 .pos） |
 
 ---
 
@@ -433,7 +535,9 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 | `leverarm` / `antlever` | `ins.leverarm` / `ins.antlever` | 直接对应 |
 | `initial_imu_angle` / `initial_imu_leverarm` | `ins.initial_imu_angle` / `ins.initial_imu_leverarm` | 直接对应 |
 | `imu_angle_std` / `imu_leverarm_std` | `ins.imu_angle_std` / `ins.imu_leverarm_std` | 直接对应 |
-| `evaluate_imu_scale` / `evaluate_imu_angle` | `ins.evaluate_imu_scale` / `ins.evaluate_imu_angle` | 直接对应 |
+| `evaluate_imu_angle` | `ins.estimate_mounting_angle` | 重命名（单滤波 StateIndex 参数块管理） |
+| `estimate_leverarm` / `estimate_mounting_angle` / `estimate_imu_leverarm` / `estimate_time_sync` | `ins.estimate_*` | 直接对应（单滤波可选参数块开关） |
+| `pos_psd` | `ins.pos_psd` | 直接对应（LC EKF 必需项，位置随机游走 PSD） |
 | `use_define_variance_pos_vel` / `use_define_variance_att` | `ins.use_define_variance_pos_vel` / `ins.use_define_variance_att` | 直接对应 |
 | `initial_pos_std` / `initial_vel_std` / `initial_att_std` | `ins.initial_pos_std` / `initial_vel_std` / `initial_att_std` | 直接对应 |
 | `data_rate` | `ins.data_rate` | 直接对应 |

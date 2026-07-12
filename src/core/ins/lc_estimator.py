@@ -11,7 +11,6 @@
 """
 import dataclasses
 import logging
-import math
 
 import numpy as np
 
@@ -19,7 +18,6 @@ from src.core.data_types import GnssSolution, ImuMeasurement, InsState
 from src.core.ins.attitude import dcm2euler, dcm2quat
 from src.core.ins.earth_param import cal_Ce2n, ecef2llh
 from src.core.ins.ins_update import InsUpdate
-from src.core.ins.nhc import Nhc
 from src.core.ins.state_index import StateIndex
 from src.core.ins.transfer_matrix import TransferMatrix, skew
 
@@ -37,31 +35,25 @@ class LcEstimator:
         self.ins_update = InsUpdate(state)
         self.si = StateIndex.from_config(config)
         self.tm = TransferMatrix(config, self.si)
-        self._nhc = Nhc(config)
         self.P = P.copy().astype(np.float64)
         self.x = np.zeros(self.si.dim, dtype=np.float64)
 
         ins_cfg = config.get("ins", {})
-        self.static_speed_threshold = ins_cfg.get("static_speed_threshold", 0.5)
-        self.angular_velocity_threshold = ins_cfg.get(
-            "angular_velocity_threshold", 30.0 * math.pi / 180.0)
-        self.zupt_std = ins_cfg.get("zupt_std", 0.05)
         self._gnss_pos_std = {
-            1: 0.02,   # SOLQ_FIX (RTK fix)
+            1: 0.15,   # SOLQ_FIX (RTK fix): 增大以给 EKF 惯性, 平滑 RTK 偶发跳变
             2: 0.05,   # SOLQ_FLOAT (RTK float)
             4: 1.0,    # SOLQ_DGPS
             5: 10.0,   # SOLQ_SINGLE (SPP)
             0: 10.0,   # SOLQ_NONE (fallback)
         }
         self._gnss_vel_std = ins_cfg.get("gnss_vel_std", 0.5)
+        self._innov_reject_threshold = float(ins_cfg.get("innov_reject_threshold", 0.0))
+        self._innov_reject_warmup = int(ins_cfg.get("innov_reject_warmup", 100))
+        self._gnss_update_count = 0
 
     @property
     def state(self) -> InsState:
         return self.ins_update.state
-
-    @property
-    def nhc(self) -> Nhc:
-        return self._nhc
 
     # ===== 时间更新 =====
 
@@ -98,10 +90,25 @@ class LcEstimator:
           pos: I(3)
           lever_arm: -C_b_e (jacobian: H[ila,pos]=-Cbe)
           time_sync: C_b_e @ skew(w_b_ib) @ lever + v_e (jacobian_p_dt)
+
+        当位置创新范数超过 innov_reject_threshold 时跳过量测更新,
+        防止 INS 跟随 GNSS 系统偏差; 速度更新不受影响。
         """
         state = self.ins_update.state
         si = self.si
         Z = state.pos_e - gnss.position
+
+        self._gnss_update_count += 1
+        if self._innov_reject_threshold > 0 and self._gnss_update_count > self._innov_reject_warmup:
+            innov_norm = float(np.linalg.norm(Z - self.x[si.pos:si.pos+3]))
+            if innov_norm > self._innov_reject_threshold:
+                logger.debug(
+                    "pos update rejected: innov=%.3fm > %.3fm, epoch=%d, Q=%d, ns=%d",
+                    innov_norm, self._innov_reject_threshold,
+                    self._gnss_update_count, gnss.quality, gnss.num_sv
+                )
+                return
+
         H = np.zeros((3, si.dim), dtype=np.float64)
         H[:, si.pos:si.pos+3] = np.eye(3)
 
@@ -114,17 +121,30 @@ class LcEstimator:
             H[:, si.time_sync] = dt1
 
         R = self._build_pos_R(gnss)
-        self._joseph_update(Z, H, R)
+        self.joseph_update(Z, H, R)
 
     def _build_pos_R(self, gnss: GnssSolution) -> np.ndarray:
-        """构造位置量测噪声协方差 (固定 sigma per quality)。
+        """构造位置量测噪声协方差 (自适应 sigma + 全协方差矩阵)。
+
+        对角线: max(fixed_sigma, rtk_sd) — 良好历元 rtk_sd 很小, sigma 取固定值;
+        偏差历元 rtk_sd 增大, sigma 随之增大以降低 K。
+        非对角线: 从 RTK 全协方差矩阵 gnss.cov 提取, 捕获轴向相关性,
+        使 EKF 能针对性降低偏差方向上的 Kalman 增益。
 
         time_sync 未估计时, R 中加入时间偏差不确定性 (speed × dt_offset)。
         time_sync 估计时, 时间偏差由状态处理, R 不含 timing 项。
         """
         base_sigma = self._gnss_pos_std.get(gnss.quality, 0.5)
         sigma = np.array([base_sigma] * 3, dtype=np.float64)
+
+        if gnss.sd is not None and np.all(gnss.sd > 0):
+            sigma = np.maximum(sigma, gnss.sd)
+
         R = np.diag(sigma ** 2).astype(np.float64)
+
+        if gnss.cov is not None:
+            cov_off_diag = gnss.cov - np.diag(np.diag(gnss.cov))
+            R = R + cov_off_diag
 
         if not self.si.has_time_sync():
             speed = float(np.linalg.norm(self.ins_update.state.vel_e))
@@ -166,7 +186,7 @@ class LcEstimator:
             H[:, si.time_sync] = dt2
 
         R = self._build_vel_R(gnss)
-        self._joseph_update(Z, H, R)
+        self.joseph_update(Z, H, R)
 
     def _build_vel_R(self, gnss: GnssSolution) -> np.ndarray:
         """构造速度量测噪声协方差。"""
@@ -176,28 +196,26 @@ class LcEstimator:
             R = np.diag([self._gnss_vel_std ** 2] * 3).astype(np.float64)
         return 0.5 * (R + R.T)
 
-    def meas_update_zupt(self) -> None:
-        """ZUPT 量测更新 (3 维速度约束)。"""
-        state = self.ins_update.state
-        si = self.si
-        Z = state.vel_e.copy()
-        H = np.zeros((3, si.dim), dtype=np.float64)
-        H[:, si.vel:si.vel+3] = np.eye(3)
-        R = np.diag([self.zupt_std ** 2] * 3).astype(np.float64)
-        self._joseph_update(Z, H, R)
+    def joseph_update(self, Z: np.ndarray, H: np.ndarray,
+                      R: np.ndarray, innov_clip: float = 0.0) -> None:
+        """Joseph form 量测更新 (单滤波, N = si.dim)。
 
-    def meas_update_nhc(self, imu: ImuMeasurement) -> None:
-        """NHC 量测更新 (2 维, 单 H 矩阵)。"""
-        Z, H, R = self._nhc.build_meas(self.ins_update.state, imu, self.si)
-        self._joseph_update(Z, H, R)
+        对应 ignav filter(): 供 GNSS 量测更新和 Constraints 模块调用。
 
-    def _joseph_update(self, Z: np.ndarray, H: np.ndarray,
-                       R: np.ndarray) -> None:
-        """Joseph form 量测更新 (单滤波, N = si.dim)。"""
+        innov_clip > 0 时启用创新自适应降权: 当创新范数超过 innov_clip
+        时, 按比例放大 R 以降低 Kalman 增益, 防止滤波器跟随持续偏差。
+        """
         n = self.si.dim
+        innov = Z - H @ self.x
+
+        if innov_clip > 0:
+            innov_norm = float(np.linalg.norm(innov))
+            if innov_norm > innov_clip:
+                scale = (innov_norm / innov_clip) ** 2
+                R = R * scale
+
         S = H @ self.P @ H.T + R
         K = self.P @ H.T @ np.linalg.inv(S)
-        innov = Z - H @ self.x
         self.x = self.x + K @ innov
         I_KH = np.eye(n) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
@@ -253,5 +271,4 @@ class LcEstimator:
             new_state.time_sync = state.time_sync + float(self.x[si.time_sync])
 
         self.ins_update.state = new_state
-        self._nhc.update_from_state(new_state)
         self.x[:] = 0.0

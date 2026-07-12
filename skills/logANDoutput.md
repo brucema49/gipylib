@@ -7,10 +7,11 @@
 >
 > **当前实现状态**：
 > - ✅ 已实现：`src/log/writer_base.py::WriterBase(ABC)`、`src/log/solution_writer.py::SolutionWriter`（rtklib 风格 .pos）、`src/log/aligned_writer.py::AlignedWriter`（对齐块状 CSV）
-> - ✅ 已实现：`src/log/logger.py::Logger`（外部模式：消费 imu_queue + gnss_queue，匹配后写 AlignedWriter）
+> - ✅ 已实现：`src/log/logger.py::Logger`（外部模式 / internal+on 模式：消费 imu_queue + gnss_queue，匹配后写 AlignedWriter；internal+on 模式下同时收集 IMU+GNSS 数据，流式结束后批量运行 LcRunner 输出松组合 .pos）
 > - ✅ 已实现：`src/log/solution_logger.py::SolutionLogger`（内部模式：仅消费 gnss_queue，写 SolutionWriter）
 > - ✅ 已实现：`src/log/aligner.py::Aligner`（IMU 积攒 + GNSS 收割的匹配器，时间戳基于 Unix）
 > - ✅ 已实现：`src/core/ins/initializer.py::InsInitializer`（INS 初始化，三种模式 + 三阈值检验，详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
+> - ✅ 已实现：`src/core/ins/lc_runner.py::LcRunner`（松组合批处理运行器，收集 IMU+GNSS 后批量执行 LC EKF，输出松组合 .pos，详见 [estimator.md](file:///home/mxl/workplace/gipylib/skills/estimator.md)）
 > - 🚧 预留：TraceWriter / RawDataWriter / Solution CSV/NMEA 输出 / INS 状态输出（当前未实现）
 >
 > **框架设计模式集成**：
@@ -45,8 +46,9 @@
 | `src/log/solution_writer.py` | rtklib 风格 `.pos` 输出 `SolutionWriter(WriterBase)`，ECEF→LLH，sd ECEF→ENU | ✅ 已实现 |
 | `src/log/aligned_writer.py` | 对齐块状 CSV 输出 `AlignedWriter(WriterBase)`，G 行 + N 行 I | ✅ 已实现 |
 | `src/log/aligner.py` | IMU 积攒 + GNSS 收割的匹配器 `Aligner`（harvest_window=1.0s） | ✅ 已实现 |
-| `src/log/logger.py` | 外部模式日志线程 `Logger`（消费 imu_queue + gnss_queue） | ✅ 已实现 |
+| `src/log/logger.py` | 日志线程 `Logger`（external+on / internal+on 模式，消费 imu_queue + gnss_queue；internal+on 下同时收集数据供 LcRunner 批量运行） | ✅ 已实现 |
 | `src/log/solution_logger.py` | 内部模式日志线程 `SolutionLogger`（仅消费 gnss_queue） | ✅ 已实现 |
+| `src/core/ins/lc_runner.py` | 松组合批处理运行器 `LcRunner`（收集 IMU+GNSS 后批量执行 LC EKF，输出松组合 .pos） | ✅ 已实现 |
 | `src/log/trace_writer.py` | 运行轨迹/调试输出 `TraceWriter(WriterBase)` | 🚧 预留 |
 | `src/log/raw_data_writer.py` | 原始数据记录 `RawDataWriter(WriterBase)` | 🚧 预留 |
 
@@ -347,30 +349,38 @@ class RawDataWriter(WriterBase):
 >
 > **🚧 预留设计**：INS 启用后（`internal` + `ins.enabled: "on"`），将扩展为消费 `solution_queue` / `trace_queue` / `raw_log_queue` 三队列的完整 Logger（见 7.5 节）。
 
-### 7.1 Logger（外部模式，实际实现 src/log/logger.py）
+### 7.1 Logger（外部模式 / internal+on 模式，实际实现 src/log/logger.py）
 
 ```python
 class Logger(Thread):
-    """外部模式日志记录器线程。
+    """日志记录器线程。
 
     从 imu_queue、gnss_queue 消费数据，做 GNSS 触发匹配，
-    委托 AlignedWriter 输出 CSV。
+    委托 AlignedWriter 输出 CSV。可选地同时输出纯 GNSS .pos 文件。
+    流式结束后可选地批量运行松组合 EKF (LcRunner) 输出 RTKLC.pos。
     依赖注入: 构造函数接收 AlignedWriter 与 Aligner 实例。
     """
 
     def __init__(self, imu_queue: Queue, gnss_queue: Queue,
                  writer: AlignedWriter, aligner: Aligner,
-                 control: ThreadControl):
+                 control: ThreadControl, gnss_writer=None,
+                 lc_runner=None):
         Thread.__init__(self, name="Logger", daemon=True)
         self.imu_queue = imu_queue
         self.gnss_queue = gnss_queue
         self.writer = writer           # 依赖注入 AlignedWriter
         self.aligner = aligner         # 依赖注入 Aligner
         self.control = control
+        self.gnss_writer = gnss_writer  # 可选 SolutionWriter（纯 GNSS .pos）
+        self.lc_runner = lc_runner      # 可选 LcRunner（松组合批处理）
         self.imu_eof = False
+        self._lc_imu_log = []           # LcRunner 收集的 IMU 数据
+        self._lc_gnss_log = []          # LcRunner 收集的 GNSS 数据
 
     def run(self):
         self.writer.open()
+        if self.gnss_writer is not None:
+            self.gnss_writer.open()
         try:
             while self.control.is_running():
                 # 1. 先把 imu_queue 中的数据搬到 aligner.imu_buffer
@@ -387,6 +397,12 @@ class Logger(Thread):
                 # 4. 解包 SensorData 并匹配写出
                 if isinstance(gnss, SensorData):
                     gnss = gnss.gnss_solution
+                # 同时输出纯 GNSS .pos 文件（如有配置）
+                if self.gnss_writer is not None:
+                    self.gnss_writer.write(gnss)
+                # 收集 GNSS 数据供 LcRunner 批量运行
+                if self.lc_runner is not None:
+                    self._lc_gnss_log.append(gnss)
                 # 等待 IMU 数据读到 >= GNSS 历元 + harvest_window
                 self._wait_for_imu(gnss.timestamp + self.aligner.harvest_window)
                 aligned = self.aligner.harvest(gnss)
@@ -394,12 +410,22 @@ class Logger(Thread):
                     self.writer.write(aligned)
         finally:
             self.writer.close()
+            if self.gnss_writer is not None:
+                self.gnss_writer.close()
+            if self.lc_runner is not None:
+                self._run_lc()
+
+    def _run_lc(self):
+        """流式结束后批量运行松组合 EKF。"""
+        self.lc_runner.run(self._lc_imu_log, self._lc_gnss_log)
 
     def _wait_for_imu(self, gnss_timestamp: float) -> None:
-        """阻塞直到 IMU 缓冲包含 >= gnss_timestamp 的数据，或 IMU EOF。"""
+        """阻塞直到 IMU 缓冲包含 >= gnss_timestamp 的数据，或 IMU EOF。
+        同时收集 IMU 数据供 LcRunner 批量运行。"""
 
     def _drain_imu_queue(self):
-        """非阻塞地把 imu_queue 中所有数据搬到 aligner.imu_buffer。"""
+        """非阻塞地把 imu_queue 中所有数据搬到 aligner.imu_buffer。
+        同时收集 IMU 数据供 LcRunner 批量运行。"""
 ```
 
 ### 7.2 SolutionLogger（内部模式，实际实现 src/log/solution_logger.py）
@@ -443,13 +469,16 @@ class SolutionLogger(Thread):
 |---------|-------------|-------------|------------|---------|--------|-------------|
 | 外部对齐 | `external` | `on` | `Logger` | imu_queue + gnss_queue | AlignedWriter | 路径 A |
 | 内部纯 GNSS | `internal` | `off` | `SolutionLogger` | gnss_queue | SolutionWriter | 路径 B |
-| 内部对齐 | `internal` | `on` | `Logger` | imu_queue + gnss_queue | AlignedWriter | 路径 C |
+| 内部对齐 + 松组合 | `internal` | `on` | `Logger` (+ gnss_writer + lc_runner) | imu_queue + gnss_queue | AlignedWriter + SolutionWriter (×2) | 路径 C |
 | 🚧 INS 启用（预留） | `internal` | `on` | 完整 Logger（7.5 节） | solution_queue + trace_queue + raw_log_queue | SolutionWriter + TraceWriter + RawDataWriter | 未来路径 D |
 
-> **路径 C 说明**：`internal + ins.enabled=on` 当前复用 external 模式的 `Logger` + `Aligner` + `AlignedWriter` 管线，
-> 传感器替换为 `InternalGnssSensor`（实时 RTK/SPP 解算）+ `ImuSensor`（IMU 流式读取）。
-> 输出文件名由 `output.aligned_filename` 指定（如 `aligned_internal_rtk.csv`）。
-> 未来 INS EKF 启用后，路径 C 将升级为路径 D（完整 Logger + Estimator 线程）。
+> **路径 C 说明**：`internal + ins.enabled=on` 模式输出**三个文件**：
+> 1. **纯 GNSS 定位结果** `RTK.pos`（由 `gnss_solution_filename` 配置）— `Logger` 每收到一个 GNSS 历元立即写入 `gnss_writer`（SolutionWriter）
+> 2. **对齐块状 CSV** `aligned_internal_rtk.csv`（由 `aligned_filename` 配置）— `Logger` + `Aligner` + `AlignedWriter` 匹配 IMU+GNSS 后写入
+> 3. **松组合定位结果** `RTKLC.pos`（由 `solution_filename` 配置）— 流式结束后 `Logger` 调用 `LcRunner.run()` 批量执行 LC EKF 输出
+>
+> 传感器为 `InternalGnssSensor`（实时 RTK/SPP 解算）+ `ImuSensor`（IMU 流式读取）。
+> `Logger` 在消费数据的同时收集 IMU+GNSS 列表（`_lc_imu_log` / `_lc_gnss_log`），流式结束后（GNSS EOF）在 `finally` 块中调用 `_run_lc()` 批量运行松组合 EKF。
 
 ### 7.4 Aligner — IMU 积攒 + GNSS 收割匹配器（实际实现 src/log/aligner.py）
 
@@ -695,17 +724,20 @@ logging:
 `Logger` / `SolutionLogger` 通过构造函数接收 `WriterBase` 实例（及 `Aligner`），而非内部 new，便于替换输出格式与测试：
 
 ```python
-# ✅ 实际实现：外部模式 Logger（src/log/logger.py）
+# ✅ 实际实现：Logger（src/log/logger.py，支持 external+on / internal+on 模式）
 class Logger(Thread):
-    """外部模式日志记录器线程（依赖注入）
+    """日志记录器线程（依赖注入）
 
     从 imu_queue、gnss_queue 消费数据，做 GNSS 触发匹配，
     委托注入的 AlignedWriter 与 Aligner 处理。
+    internal+on 模式下额外注入 gnss_writer（纯 GNSS 输出）和 lc_runner（松组合批处理）。
     """
     def __init__(self, imu_queue: Queue, gnss_queue: Queue,
                  writer: AlignedWriter,   # 依赖注入 Writer
                  aligner: Aligner,        # 依赖注入 Aligner
-                 control: ThreadControl):
+                 control: ThreadControl,
+                 gnss_writer=None,        # 可选依赖注入 SolutionWriter（纯 GNSS）
+                 lc_runner=None):         # 可选依赖注入 LcRunner（松组合）
         # 持有 WriterBase 抽象引用（多态），不关心具体子类
         ...
 
@@ -776,6 +808,41 @@ def build_external_mode(config, imu_queue, gnss_queue, control):
     )
 
 
+# ✅ 实际装配：内部对齐 + 松组合模式（src/main.py 路径 C 节选）
+def build_internal_lc_mode(config, imu_queue, gnss_queue, control):
+    """装配内部 GNSS + IMU 对齐 + 松组合 EKF 模式。
+    输出三个文件：纯 GNSS .pos + 对齐 CSV + 松组合 .pos
+    """
+    # 1. 对齐块状 CSV 输出
+    aligned_writer = AlignedWriter(
+        output_dir=config["output"]["output_dir"],
+        filename=config["output"].get("aligned_filename", "aligned.csv"),
+    )
+    # 2. 纯 GNSS 定位结果输出（文件名由 gnss_solution_filename 配置）
+    gnss_writer = SolutionWriter(
+        output_dir=config["output"]["output_dir"],
+        filename=config["output"].get("gnss_solution_filename", "gnss_solution.pos"),
+    )
+    # 3. 松组合定位结果输出（文件名由 solution_filename 配置）
+    lc_writer = SolutionWriter(
+        output_dir=config["output"]["output_dir"],
+        filename=config["output"].get("solution_filename", "RTKLC.pos"),
+    )
+    # 4. LcRunner（松组合批处理运行器）
+    from src.core.ins.lc_runner import LcRunner
+    lc_runner = LcRunner(config, lc_writer)
+    aligner = Aligner(imu_dt=1.0 / config["ins"]["data_rate"])
+    return Logger(
+        imu_queue=imu_queue,
+        gnss_queue=gnss_queue,
+        writer=aligned_writer,    # 依赖注入 AlignedWriter
+        aligner=aligner,          # 依赖注入 Aligner
+        control=control,
+        gnss_writer=gnss_writer,  # 依赖注入 SolutionWriter（纯 GNSS）
+        lc_runner=lc_runner,      # 依赖注入 LcRunner（松组合）
+    )
+
+
 # 🚧 预留：INS 启用后的完整装配
 def build_logger(config: dict, queues: dict, control) -> Logger:
     """装配完整日志记录器（依赖注入，INS 启用后）"""
@@ -818,16 +885,26 @@ def build_logger(config: dict, queues: dict, control) -> Logger:
         ↓                                                → AlignedWriter.write(AlignedBlock)
   (None EOF sentinel 触发 Logger 退出)
 
-【当前实现：内部对齐模式（internal + ins.enabled=on，路径 C）】
+【当前实现：内部对齐 + 松组合模式（internal + ins.enabled=on，路径 C）】
   ImuSensor.run()
     → ImuFormator.decode(line) → ImuMeasurement         (gpst_to_unix 时间戳)
     → imu_queue.put(SensorData(tag="imu"))
         ↓                                                ↓
-  InternalGnssSensor.run()                              Logger.run()（与路径 A 完全相同）
+  InternalGnssSensor.run()                              Logger.run()
     → 逐历元 pntpos/relpos → GnssSolution               → _drain_imu_queue() → Aligner.push_imu()
-    → gnss_queue.put(SensorData(tag="gnss_solution"))    → gnss_queue.get() → Aligner.harvest(gnss)
-        ↓                                                → AlignedWriter.write(AlignedBlock)
+    → gnss_queue.put(SensorData(tag="gnss_solution"))    → gnss_queue.get()
+        ↓                                                   ├─ gnss_writer.write(gnss)           → RTK.pos (纯 GNSS)
+                                                            ├─ _lc_gnss_log.append(gnss)          (收集供 LcRunner)
+                                                            ├─ _wait_for_imu() + _lc_imu_log.append (收集 IMU)
+                                                            ├─ Aligner.harvest(gnss) → AlignedWriter.write → aligned_internal_rtk.csv
+                                                            └─ (循环)
   (None EOF sentinel 触发 Logger 退出)
+  finally:
+    gnss_writer.close()
+    Logger._run_lc():
+      LcRunner.run(_lc_imu_log, _lc_gnss_log)
+        → InsInitializer.initialize() → LcEstimator + LcIntegration
+        → 整数秒输出 InsState+P → GnssSolution → lc_writer.write() → RTKLC.pos (松组合)
 
 【🚧 预留：INS 启用后的完整流水线（internal + ins.enabled=on，路径 D）】
   ImuSensor/GnssRoverSensor ──put()──→ imu_queue/sensor_queue

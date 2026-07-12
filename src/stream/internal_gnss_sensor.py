@@ -80,14 +80,18 @@ class InternalGnssSensor(Thread):
 
         # 5. 创建处理器并运行（延迟导入，需 RtklibEnv.setup() 先完成）
         mode = self.gnss_cfg["positioning_mode"]
+        filtertype = self.gnss_cfg.get("filtertype", "forward")
         if mode == "spp":
             from src.core.gnss.spp_processor import SppProcessor
             processor = SppProcessor(nav)
             self._run_spp_loop(processor, rov)
         elif mode == "rtk":
-            from src.core.gnss.rtk_processor import RtkProcessor
-            processor = RtkProcessor(nav)
-            self._run_rtk_loop(processor, rov, base, nav, rn)
+            if filtertype in ("combined", "backward", "combined_noreset"):
+                self._run_rtk_batch(nav, rov, base, filtertype)
+            else:
+                from src.core.gnss.rtk_processor import RtkProcessor
+                processor = RtkProcessor(nav)
+                self._run_rtk_loop(processor, rov, base, nav, rn)
         else:
             raise ValueError(f"Unsupported positioning_mode: {mode}")
 
@@ -113,3 +117,27 @@ class InternalGnssSensor(Thread):
             if sol is not None:
                 self.output_queue.put(SensorData(tag="gnss_solution", gnss_solution=sol))
             obsr, obsb = rn.next_obs(nav, rov, base, dir)
+
+    def _run_rtk_batch(self, nav, rov, base, filtertype):
+        """RTK 批处理模式: combined/backward 滤波。
+
+        使用 rtklib-py 的 procpos() 完成正向+反向+平滑组合，
+        然后将组合解逐历元推入 gnss_queue。
+        """
+        import os
+        from src.core.gnss.rtklib.postpos import procpos
+        from src.core.gnss.solution_converter import sol_to_gnss_solution
+
+        nav.filtertype = filtertype
+        fp_stat = open(os.devnull, "w")
+        try:
+            sol_list = procpos(nav, rov, base, fp_stat)
+        finally:
+            fp_stat.close()
+
+        for sol in sol_list:
+            if not self.control.is_running():
+                break
+            gsol = sol_to_gnss_solution(sol)
+            if gsol is not None:
+                self.output_queue.put(SensorData(tag="gnss_solution", gnss_solution=gsol))

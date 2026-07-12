@@ -27,7 +27,11 @@
 > - ✅ 已实现：三种运行模式——internal+off（纯 GNSS，输出 .pos）/ external+on（外部对齐 CSV）/ internal+on（内部对齐 CSV，实时解算+IMU 对齐）
 > - ✅ 已实现：`src/core/ins/initializer.py::InsInitializer`（INS 初始化，三种模式：静态 / 速度矢量 / 位置差分，三阈值检验，详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
 > - ✅ 已实现：`src/core/ins/` 下 `interpolator.py` / `earth_param.py` / `attitude.py`（初始化支撑模块）
-> - 🚧 预留：INS 机械编排核心 `InsCore` / 双滤波 EKF `LcIntegration` / NHC / ZUPT / 紧组合接口（下一阶段实现）
+> - ✅ 已实现：单滤波 EKF `LcEstimator` / `LcIntegration`（StateIndex 参数块，最近邻时间对齐，详见 [estimator.md](file:///home/mxl/workplace/gipylib/skills/estimator.md)）
+> - ✅ 已实现：`src/core/ins/constraints.py::Constraints`（NHC/ZUPT/ZARU 约束，独立模块，参考 ignav 分离架构）
+> - ✅ 已实现：`src/core/ins/lc_runner.py::LcRunner`（松组合批处理运行器，路径 C 下由 `Logger` 在流式结束后调用，输出松组合 .pos）
+> - ✅ 已验证：路径 C 三文件输出（RTK.pos + aligned_internal_rtk.csv + RTKLC.pos），松组合结果与纯 GNSS 一致（planar <0.5m, elev <1m）
+> - 🚧 预留：紧组合接口 `TcEstimator` / `TcIntegration`（下一阶段实现）
 
 ### 设计模式总览
 
@@ -423,24 +427,26 @@ gipylib/
 │   │   │       ├── rtkcmn.py      # ✅ 通用工具（坐标变换、时间等）
 │   │   │       └── rtkpos.py      # ✅ RTK 相对定位
 │   │   │
-│   │   ├── ins/                   # 🚧 IMU/INS 模块（预留，当前未实现）
-│   │   │   ├── ins_core.py        # 🚧 InsCore INS核心（参考 t_gsins）
-│   │   │   ├── ins_kf.py          # 🚧 InsKf 卡尔曼滤波基类（参考 t_gsinskf）
-│   │   │   ├── imu_preprocess.py  # 🚧 ImuPreprocessor 预处理基类
-│   │   │   ├── interpolator.py    # 🚧 Interpolator 插值基类（参考 t_ginterp）
-│   │   │   ├── ins_init.py        # 🚧 INS 初始化（粗对准+精对准）
-│   │   │   ├── earth_param.py     # 🚧 地球参数（重力、自转角速度等）
-│   │   │   └── attitude.py        # 🚧 姿态表示与转换（四元数/欧拉角/DCM）
+│   │   ├── ins/                   # ✅ IMU/INS 模块（已实现，单滤波架构）
+│   │   │   ├── initializer.py     # ✅ InsInitializer INS 初始化（三种模式 + 三阈值检验）
+│   │   │   ├── interpolator.py    # ✅ IMU/GNSS 时间对齐插值
+│   │   │   ├── earth_param.py     # ✅ 地球参数（重力、自转角速度等）
+│   │   │   ├── attitude.py        # ✅ 姿态表示与转换（四元数/欧拉角/DCM）
+│   │   │   ├── state_index.py     # ✅ StateIndex 状态参数块管理（15~24 维）
+│   │   │   ├── transfer_matrix.py # ✅ TransferMatrix 状态转移矩阵 Φ + 过程噪声 Q
+│   │   │   ├── ins_propagate.py   # ✅ INS 机械编排（姿态/速度/位置递推）
+│   │   │   ├── ins_update.py      # ✅ 量测更新逻辑
+│   │   │   ├── lc_estimator.py    # ✅ LcEstimator 单滤波松组合 EKF（StateIndex 参数块）
+│   │   │   ├── lc_integration.py  # ✅ LcIntegration 松组合集成（逐 IMU 触发 + 抽取）
+│   │   │   ├── lc_runner.py       # ✅ LcRunner 松组合批处理运行器（路径 C 输出 RTKLC.pos）
+│   │   │   ├── constraints.py     # ✅ Constraints NHC/ZUPT/ZARU 约束（独立模块，参考 ignav）
+│   │   │   └── static_detect.py   # ✅ 静态检测（GLRT/MV/MAG/ARE/ALL + 滑动窗口）
 │   │   │
-│   │   └── estimator/             # 🚧 融合估计模块（预留，当前未实现）
-│   │       ├── integration.py     # 🚧 Integration 组合导航集成基类
-│   │       ├── ekf.py             # 🚧 EKF 滤波器核心（双滤波）
-│   │       ├── lc_estimator.py    # 🚧 LcEstimator 松组合估计器
-│   │       ├── lc_measurement.py  # 🚧 松组合量测更新
-│   │       ├── lc_feedback.py     # 🚧 松组合反馈
-│   │       ├── nhc.py             # 🚧 NHC 约束（H1/H2 拆分）
-│   │       ├── zupt.py            # 🚧 ZUPT 零速更新（仅 P1）
-│   │       ├── state_vector.py    # 🚧 双滤波状态索引
+│   │   └── estimator/             # 🚧 融合估计模块（历史设计，实际已并入 src/core/ins/）
+│   │       ├── integration.py     # 🚧 （已实现为 ins/lc_integration.py）
+│   │       ├── lc_estimator.py    # 🚧 （已实现为 ins/lc_estimator.py）
+│   │       ├── nhc.py             # 🚧 （已合并入 ins/constraints.py）
+│   │       ├── zupt.py            # 🚧 （已合并入 ins/constraints.py）
 │   │       └── tc_interface.py    # 🚧 紧组合预留接口
 │   │
 │   ├── log/                       # ✅ 日志输出流
@@ -1645,22 +1651,32 @@ gnss.pos ──→ GnssSolStreamer → gnss_sol_q┘    (时间对齐)     (EKF�
 
 ### 9.2 src/core/ins/
 
-**职责**：实现 INS 初始化与机械编排，支持增量式和速率式 IMU 数据，提供数据插值功能。
+**职责**：实现 INS 初始化、机械编排与松组合 EKF 融合，支持增量式和速率式 IMU 数据，提供数据插值功能。
 
-**关键实现**（已实现 + 预留）：
+> **架构更新（2026-07）**：单滤波架构已实现，估计器模块已并入 `src/core/ins/`（不再使用独立的 `src/core/estimator/` 目录）。下文 `InsCore`/`ImuPreprocessor`/`ImuMechanizer` 为早期预留设计，实际已由 `lc_estimator.py` / `lc_integration.py` / `transfer_matrix.py` / `constraints.py` / `lc_runner.py` / `static_detect.py` 替代。详见 [estimator.md](file:///home/mxl/workplace/gipylib/skills/estimator.md)。
+
+**关键实现**（已实现）：
 1. ✅ `InsInitializer`：INS 初始化，三种模式（静态 / 速度矢量 / 位置差分）+ 三阈值检验（详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
 2. ✅ `interpolator.py`：IMU/GNSS 时间对齐插值（`is_to_update` / `imu_interpolate` / `find_bracket_imus`，参考 KF-GINS `imuInterpolate`）
 3. ✅ `earth_param.py`：WGS84 地球参数、`ecef2llh` / `llh2ecef` / `cal_Ce2n` / `gravity_ecef`
 4. ✅ `attitude.py`：姿态表示与转换（`euler2dcm` / `dcm2quat` / `att_caln2e` 等）
-5. 🚧 `InsCore`：INS 核心，参考 GREAT-MSF t_gsins（姿态/速度/位置更新）— 待实现
-6. 🚧 `ImuPreprocessor`：IMU 预处理（增量式↔速率式转换）— 待实现
-7. 🚧 `ImuMechanizer`：机械编排主入口（驱动姿态/速度/位置递推 + Φ/Q 构造）— 待实现
+5. ✅ `state_index.py`：StateIndex 状态参数块管理（15~24 维，替代 MainStateIndex/NhcSubStateIndex）
+6. ✅ `transfer_matrix.py`：状态转移矩阵 Φ + 过程噪声 Q 构造（读取 `pos_psd` / `gyro_psd` / `accel_psd` 等配置）
+7. ✅ `ins_propagate.py`：INS 机械编排（姿态/速度/位置递推，参考 KF-GINS/GINav）
+8. ✅ `ins_update.py`：量测更新逻辑
+9. ✅ `lc_estimator.py`：单滤波松组合 EKF（StateIndex 参数块，Joseph 更新）
+10. ✅ `lc_integration.py`：松组合集成（逐 IMU 触发 + 抽取，NHC/ZUPT/ZARU 互斥约束）
+11. ✅ `lc_runner.py`：松组合批处理运行器（路径 C 下由 Logger 在流式结束后调用，输出 RTKLC.pos）
+12. ✅ `constraints.py`：NHC/ZUPT/ZARU 约束（独立模块，参考 ignav 分离架构）
+13. ✅ `static_detect.py`：静态检测（GLRT/MV/MAG/ARE/ALL + 滑动窗口）
 
-**详细指导**：见 [imu.md](imu.md)
+**详细指导**：见 [imu.md](imu.md) 与 [estimator.md](estimator.md)
 
-### 9.3 src/core/estimator/
+### 9.3 src/core/estimator/（历史设计，已并入 src/core/ins/）
 
-**职责**：实现真正双滤波松组合 EKF（主滤波 P1 15/18 维 + NHC 子滤波 P2 5 维），含 NHC 约束（H1/H2 拆分），保留紧组合接口。采用 Integration 抽象体系。**时间同步与 IMU 插值逻辑由估计器内部处理**（参考 KF-GINS 增量切分方案，**时间对齐是重中之重**）。
+> **架构更新（2026-07）**：双滤波（P1/P2）已迁移为**单滤波**架构（统一使用 `P`，维度 = `StateIndex.dim`，15~24 维），估计器模块已并入 `src/core/ins/` 目录。下文双滤波/InsKf/P1/P2 描述为早期设计，仅供参考。当前实现详见 [estimator.md](file:///home/mxl/workplace/gipylib/skills/estimator.md)。
+
+**职责**：~~实现真正双滤波松组合 EKF（主滤波 P1 15/18 维 + NHC 子滤波 P2 5 维）~~ → 已实现为单滤波松组合 EKF（`LcEstimator`，StateIndex 参数块，15~24 维），含 NHC/ZUPT/ZARU 约束（独立模块 `constraints.py`），保留紧组合接口。**时间同步与 IMU 插值逻辑由估计器内部处理**（参考 KF-GINS 增量切分方案，**时间对齐是重中之重**）。
 
 **关键实现**：
 1. Integration：组合导航集成基类，参考 GREAT-MSF t_gintegration

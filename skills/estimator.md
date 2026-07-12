@@ -3,7 +3,7 @@
 > **单滤波**松组合 EKF：固定 15 维基础状态 + 可选参数块（GNSS 杆臂 3 / IMU 安装角 2 / IMU 杆臂 3 / 时间对齐 1），含 NHC 约束与 ZUPT 零速更新。
 > 参数块/矩阵块管理参考 gnss_ins_lc_nhc `StateIndex`；算法参考 ignav（H 矩阵公式、ψ-error 模型）；OOP 风格参考 gnss_ins_lc_nhc 和 GREAT-MSF-main。
 >
-> **设计原则**：不继承 ABC（YAGNI），`LcEstimator` / `LcIntegration` / `Nhc` 为普通类。
+> **设计原则**：不继承 ABC（YAGNI），`LcEstimator` / `LcIntegration` / `Constraints` 为普通类。
 >
 > **时间系统约定**：全框架内部统一使用 **Unix 时间戳（float 秒，与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）**。
 >
@@ -13,10 +13,12 @@
 > - ✅ 已实现：内部 GNSS + IMU 数据对齐管线（路径 C）
 > - ✅ 已实现：`InsInitializer`（三种初始化模式 + 三阈值检验）
 > - ✅ 已实现：`InsUpdate`（E 系机械编排，ψ-error）
-> - ✅ 已实现：`InsPropagate`（开环 P 协方差传播）+ `TransferMatrix`（F/Φ/Q）
+> - ✅ 已实现：`InsPropagate`（开环 P 协方差传播）+ `TransferMatrix`（F/Φ/Q，读取 `pos_psd` 等过程噪声 PSD）
 > - ✅ 已实现：`LcEstimator`（单滤波 EKF，StateIndex 参数块，Joseph form）
-> - ✅ 已实现：`LcIntegration`（最近邻时间对齐主循环）
-> - ✅ 已实现：`Nhc`（v 系 NHC 量测构造，单 H 矩阵）
+> - ✅ 已实现：`LcIntegration`（最近邻时间对齐主循环，per-IMU 触发 + decimation）
+> - ✅ 已实现：`Constraints`（NHC/ZUPT/ZARU 约束, 独立模块, 参考 ignav 分离架构）
+> - ✅ 已实现：`LcRunner`（松组合批处理运行器，集成到 `main.py` 路径 C，由 `Logger` 在流式结束后调用，输出松组合 .pos）
+> - ✅ 已验证：路径 C 三文件输出（RTK.pos + aligned CSV + RTKLC.pos），松组合结果与纯 GNSS 一致（planar <0.5m, elev <1m，2362 历元 100% 通过）
 > - ✅ 已验证：E2E 测试通过（planar max=0.128m, elev max=0.372m, match rate 99.94%）
 > - 🚧 预留：紧组合接口（`TcEstimator` / `TcIntegration`）
 
@@ -39,9 +41,9 @@
 
 本项目采用**普通类**（不继承 ABC），遵循 YAGNI 原则：
 
-- **`LcEstimator`**：单滤波 EKF 估计器，持有 `InsUpdate` / `TransferMatrix` / `Nhc` / `StateIndex`，维护协方差矩阵 P（维度 = si.dim）
-- **`LcIntegration`**：松组合导航集成，持有 `LcEstimator`，维护 `imupre`/`imucur`/`pending_gnss`，执行最近邻时间对齐主循环
-- **`Nhc`**：NHC 量测构造器，维护 `R_b^v` 旋转矩阵，构造 Z/H/R
+- **`LcEstimator`**：单滤波 EKF 估计器，持有 `InsUpdate` / `TransferMatrix` / `StateIndex`，维护协方差矩阵 P（维度 = si.dim），提供 `joseph_update()` 滤波步骤
+- **`LcIntegration`**：松组合导航集成，持有 `LcEstimator` / `Constraints` / `StaticDetect`，维护 `imupre`/`imucur`/`pending_gnss`，执行最近邻时间对齐主循环
+- **`Constraints`**：NHC/ZUPT/ZARU 约束更新器（独立模块, 参考 ignav ins-nhc/ins-zvu/ins-zaru 分离），持有 `Nhc` 量测构造器 + guards 配置，调用 `estimator.joseph_update()` 完成滤波
 
 不使用 `InsKf` 基类、`OdometryStrategy` 策略层、`FusionStrategy` 层（设计阶段考虑过，实际未采用）。
 
@@ -52,8 +54,10 @@ LcIntegration (主循环: add_imu/add_gnss + 最近邻时间对齐)
 ├── LcEstimator (单滤波 EKF)
 │   ├── InsUpdate (E 系机械编排)
 │   ├── TransferMatrix (F/Φ/Q, 动态维度)
-│   ├── Nhc (NHC 量测构造, 单 H 矩阵)
 │   └── StateIndex (参数块索引管理)
+├── Constraints (NHC/ZUPT/ZARU 约束, 独立模块)
+│   └── Nhc (NHC 量测构造, 单 H 矩阵)
+├── StaticDetect (静态检测: GLRT/MV/MAG/ARE/ALL)
 └── pending_gnss: deque (GNSS 缓冲)
 ```
 
@@ -73,15 +77,15 @@ class LcEstimator:
     def meas_update_vel(self, gnss: GnssSolution) -> None:
         # GNSS 速度量测 (Joseph form)
 
-    def meas_update_zupt(self) -> None:
-        # ZUPT 3D 速度约束
-
-    def meas_update_nhc(self, imu: ImuMeasurement) -> None:
-        # NHC 2D 侧向/垂向速度约束
+    def joseph_update(self, Z, H, R) -> None:
+        # Joseph form 量测更新 (对应 ignav filter, 供 Constraints 模块调用)
 
     def feedback(self) -> None:
         # 统一反馈校正 (ψ-error + 可选参数块)
 ```
+
+> **NHC/ZUPT/ZARU 约束**已分离到 `src/core/ins/constraints.py` 的 `Constraints` 类，
+> 通过 `estimator.joseph_update()` 调用滤波步骤，参考 ignav ins-nhc/ins-zvu/ins-zaru 分离架构。
 
 ---
 
@@ -243,7 +247,7 @@ IMU杆臂: l_imu ← l_imu - δl_imu  (减号)
 时间:  time_sync ← time_sync + δt  (加号)
 ```
 
-反馈后 `x` 清零，`Nhc.update_from_state()` 刷新 `R_b^v`。
+反馈后 `x` 清零。`Nhc.build_meas()` 在每次调用时自动从 `state` 刷新 `R_b^v`，无需额外调用。
 
 ---
 
