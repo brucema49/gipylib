@@ -6,6 +6,7 @@
 默认 config_path = data/config.yaml
 """
 import sys
+import time
 from pathlib import Path
 from queue import Queue
 
@@ -30,14 +31,18 @@ def main(config_path: str = "data/config.yaml"):
 
     sensors, logger = _assemble_pipeline(config, control, imu_queue, gnss_queue)
 
+    t0 = time.monotonic()
     for s in sensors:
         s.start()
     logger.start()
 
     logger.join()
+    elapsed = time.monotonic() - t0
     control.shutdown()
     for s in sensors:
         s.join(timeout=2)
+
+    print(f"运行时长: {elapsed:.1f}s ({int(elapsed // 60)}m {elapsed % 60:.1f}s)")
 
 
 def _assemble_pipeline(config, control, imu_queue, gnss_queue):
@@ -87,11 +92,11 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
             output_dir=config["output"]["output_dir"],
             filename=lc_filename,
         )
-        from src.core.ins.lc_runner import LcRunner
-        lc_runner = LcRunner(config, lc_writer)
+        from src.core.ins.lc_stream import LcStream
+        lc_stream = LcStream(config, lc_writer)
         aligner = Aligner(imu_dt=1.0 / config["ins"]["data_rate"])
         logger = Logger(imu_queue, gnss_queue, writer, aligner, control,
-                        gnss_writer=gnss_writer, lc_runner=lc_runner)
+                        gnss_writer=gnss_writer, lc_stream=lc_stream)
         return sensors, logger
 
     raise NotImplementedError(
