@@ -1,18 +1,20 @@
-"""松组合导航集成 (最近邻时间对齐 + 主循环)。
+"""松组合导航集成 (GVINS 风格 IMU 消费 + 主循环)。
 
 参考:
+- tools/GVINS/estimator/src/estimator_node.cpp process() (IMU 跨 GNSS 时刻线性插值)
 - KF-GINS newImuProcess (imupre/imucur/pending_gnss 结构)
 - ignav postpos.cc (NHC/ZUPT/ZARU per-IMU 触发 + decimation)
-- 项目约定: 最近邻匹配 (替换 KF-GINS 增量切分, 适配速率式 IMU)
 
-主循环 (每个新 IMU 到来时):
-  1. 预推进检查: 若 pending GNSS 更近于当前 imucur (即旧 imucur),
-     用当前 state (imucur 时刻) 做量测更新 + 反馈, 然后出队。
-  2. 推进: imupre←imucur, imucur←imu, time_update。
-  3. 约束更新: NHC/ZUPT/ZARU (per-IMU, decimation 控制, 互斥)。
-  4. 推进后检查: 若 pending GNSS 更近于新 imucur, 做量测更新 + 反馈。
+主循环 (每个新 IMU 到来时, GVINS 风格):
+  1. 检查 pending_gnss 队头:
+     - 若 gnss.t < cur.t: 防御性直接量测更新 (过期 GNSS)
+     - 若 cur.t <= gnss.t <= imu.t: 线性插值到 gnss.t, time_update(interp),
+       触发 GNSS 量测更新 + 反馈, 弹出 gnss, cur←interp, 循环处理后续 GNSS
+     - 若 gnss.t > imu.t: 留给后续 IMU, 跳出循环
+  2. 推进当前 IMU: imupre←cur, imucur←imu, time_update(imu)
+  3. 约束更新: NHC/ZUPT/ZARU (per-IMU, decimation 控制, 互斥)
 
-GNSS 由 add_gnss 入队, 不直接触发更新 (等下一个 IMU 决定最近邻)。
+GNSS 由 add_gnss 入队, 不直接触发更新 (等 IMU 跨越 gnss.t 时触发)。
 NHC/ZUPT/ZARU 由 IMU 触发 (decimation), 不依赖 GNSS。
 """
 import collections
@@ -21,6 +23,7 @@ from typing import Optional
 
 from src.core.data_types import GnssSolution, ImuMeasurement
 from src.core.ins.constraints import Constraints
+from src.core.ins.interpolator import imu_interpolate_linear
 from src.core.ins.static_detect import StaticDetect
 
 logger = logging.getLogger(__name__)
@@ -46,7 +49,7 @@ class _DecimationCounter:
 
 
 class LcIntegration:
-    """松组合导航集成 (最近邻时间对齐 + 单滤波 EKF 主循环)。
+    """松组合导航集成 (GVINS 风格 IMU 消费 + 单滤波 EKF 主循环)。
 
     NHC/ZUPT/ZARU 作为可选约束, per-IMU 触发 (decimation 控制):
       - 静态 (StaticDetect): ZUPT + ZARU (互斥于 NHC)
@@ -71,79 +74,82 @@ class LcIntegration:
         self._static_detect = StaticDetect(config)
         # 约束更新模块 (NHC/ZUPT/ZARU, 独立于 LcEstimator)
         self._constraints = Constraints(config)
-        # 超过此秒数认为 GNSS 已过期, 丢弃 (避免用错位状态做更新)
-        self._stale_threshold = 0.5
 
         self.imupre: Optional[ImuMeasurement] = None
         self.imucur: Optional[ImuMeasurement] = None
         self.pending_gnss: collections.deque = collections.deque()
 
     def add_imu(self, imu: ImuMeasurement) -> None:
-        """添加 IMU: 预推进 GNSS → 推进 → 约束 → 推进后 GNSS。"""
+        """GVINS 风格 IMU 消费: 每条 IMU 检查 GNSS 队头时间戳。
+
+        - imu.t < gnss.t: 直接机械编排 (无 GNSS 触发)
+        - imu.t >= gnss.t 且 cur.t <= gnss.t:
+          1) 线性插值到 gnss.t
+          2) time_update(interp) 推进 dt_1 = gnss.t - cur.t
+          3) meas_update_pos/vel(gnss) + feedback 触发融合
+          4) 弹出 gnss, 循环处理后续 GNSS (多 GNSS 同区间)
+          5) cur ← interp, 继续用当前 imu 推进 dt_2 = imu.t - gnss.t
+
+        参考: tools/GVINS/estimator/src/estimator_node.cpp process() lines 338-378
+        """
         if self.imucur is None:
             self.imucur = imu
             self._static_detect.push(imu)
             return
 
-        cur_t = self.imucur.timestamp
-        new_t = imu.timestamp
+        cur = self.imucur  # 当前已推进到的 IMU
 
-        # 1. 预推进: 处理更近于当前 imucur 的 pending GNSS
-        self._process_pending(cur_t, new_t, pre_advance=True)
+        # 1. 处理所有落入 [cur.t, imu.t] 区间的 GNSS (GVINS 风格插值触发)
+        while self.pending_gnss:
+            gnss = self.pending_gnss[0]
+            t_gnss = gnss.timestamp
 
-        # 2. 推进 (机械编排 + P 协方差传播)
-        self.imupre = self.imucur
+            if t_gnss < cur.timestamp:
+                # GNSS 已过期 (比 cur 还早): 防御性直接量测更新
+                # (Logger 按时间顺序喂入, 理论上不应发生)
+                logger.debug(
+                    f"过期 GNSS t={t_gnss:.6f} < cur.t={cur.timestamp:.6f}, "
+                    f"直接量测更新"
+                )
+                self._apply_gnss_update(gnss)
+                self.pending_gnss.popleft()
+                continue
+
+            if t_gnss > imu.timestamp:
+                # GNSS 在当前 IMU 之后: 留给后续 IMU 处理
+                break
+
+            # cur.t <= t_gnss <= imu.t: GVINS 风格插值触发
+            if t_gnss == cur.timestamp:
+                # GNSS 恰好对齐 cur: 无需插值, 直接触发
+                interp = cur
+            else:
+                # 线性插值到 t_gnss
+                interp = imu_interpolate_linear(cur, imu, t_gnss)
+                if interp is None:
+                    break
+                # 推进 dt_1 = t_gnss - cur.t
+                self.imupre = cur
+                self.imucur = interp
+                self.est.time_update(interp)
+                self._static_detect.push(interp)
+                self._apply_constraints(interp)
+
+            # 触发 GNSS 量测更新 + 反馈
+            self._apply_gnss_update(gnss)
+            self.pending_gnss.popleft()
+            cur = interp  # 后续 GNSS 从 interp 时刻继续
+
+        # 2. 推进当前 IMU (dt = imu.t - cur.t)
+        self.imupre = cur
         self.imucur = imu
         self.est.time_update(imu)
         self._static_detect.push(imu)
-
-        # 3. 约束更新 (NHC/ZUPT/ZARU, per-IMU, decimation)
         self._apply_constraints(imu)
-
-        # 4. 推进后: 处理更近于新 imucur 的 pending GNSS
-        self._process_pending(self.imucur.timestamp, self.imupre.timestamp,
-                              pre_advance=False)
 
     def add_gnss(self, gnss: GnssSolution) -> None:
         """添加 GNSS: append 到 pending_gnss deque。"""
         self.pending_gnss.append(gnss)
-
-    def _process_pending(self, t_ref: float, t_other: float,
-                         pre_advance: bool) -> None:
-        """处理 pending GNSS 队列。
-
-        Args:
-            t_ref: 参考时刻 (pre_advance: 当前 imucur; post_advance: 新 imucur)
-            t_other: 对比时刻 (pre_advance: 新 imu; post_advance: 新 imupre)
-            pre_advance: True 表示推进前 (用当前 state), False 表示推进后
-        """
-        while self.pending_gnss:
-            gnss = self.pending_gnss[0]
-            d_ref = abs(t_ref - gnss.timestamp)
-            d_other = abs(t_other - gnss.timestamp)
-
-            if pre_advance:
-                # 推进前: 若 imucur 更近 (或并列), 用当前 state 处理
-                should_process = d_ref <= d_other
-            else:
-                # 推进后: 若新 imucur 严格更近, 用新 state 处理
-                # (并列情况已在推进前处理, 这里不重复)
-                should_process = d_ref < d_other
-
-            if should_process:
-                # 丢弃严重过期的 GNSS (距参考时刻 > 阈值)
-                if d_ref > self._stale_threshold and gnss.timestamp < t_ref:
-                    logger.warning(
-                        f"丢弃过期 GNSS t={gnss.timestamp:.6f} "
-                        f"(t_ref={t_ref:.6f}, d={d_ref:.4f}s)"
-                    )
-                    self.pending_gnss.popleft()
-                    continue
-                self._apply_gnss_update(gnss)
-                self.pending_gnss.popleft()
-            else:
-                # GNSS 更近于另一侧, 等待
-                break
 
     def _apply_gnss_update(self, gnss: GnssSolution) -> None:
         """应用 GNSS 位置/速度量测更新 + 反馈。"""

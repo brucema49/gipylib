@@ -10,7 +10,13 @@
   3. 等待 IMU 覆盖 harvest 窗口
   4. 从 LC 缓冲按时间交错喂入 LcStream（只喂 harvest 窗口内的 IMU）
      GNSS 前的 IMU → GNSS → GNSS 后的 IMU（窗口内），超出的留给下一历元
+     GNSS 后的 IMU (t >= gnss.t) 触发 LcIntegration 的 GVINS 风格插值+融合
   5. harvest 对齐块 → 写 aligned.csv
+
+GVINS 风格 IMU 消费 (lc_integration.add_imu)：
+  IMU 按时间顺序喂入 LcStream。当某条 IMU.t >= gnss.t 时，
+  LcIntegration 自动线性插值到 gnss.t 并触发 GNSS 量测更新。
+  关键不变量：GNSS 必须在 t >= gnss.t 的 IMU 之前入队（由 _lc_imu_buffer 分前后段保证）。
 
 TC 扩展点：当前 GNSS 由上游 RTKLIB 预解算后入队。未来 TC 时，
 把"从 gnss_queue 取预解算结果"替换为"用 INS 先验调用 GNSS 解算"。
@@ -56,6 +62,7 @@ class Logger(Thread):
         self.imu_eof = False
         # LC 专用 IMU 缓冲：暂存 IMU，按 GNSS 节奏喂入 LcStream
         # 离线模式下 IMU 传感器可能远超 GNSS 解算速度，必须节流到 harvest 窗口
+        # 同时保证 GNSS 在 t>=gnss.t 的 IMU 之前入队（GVINS 插值触发前提）
         self._lc_imu_buffer: deque = deque()
 
     def run(self):
@@ -110,6 +117,7 @@ class Logger(Thread):
                 #    只喂 gnss.timestamp + harvest_window 以内的 IMU
                 #    超出的留在缓冲给下一个 GNSS 历元
                 #    同时间戳 GNSS 先于 IMU（与批处理排序一致）
+                #    GNSS 后的 IMU (t >= gnss.t) 触发 GVINS 插值+融合
                 if self.lc_stream is not None:
                     feed_cutoff = gnss.timestamp + self.aligner.harvest_window
                     before = []

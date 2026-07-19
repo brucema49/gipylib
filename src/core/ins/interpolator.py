@@ -1,12 +1,14 @@
-"""IMU 时间对齐工具（最近邻匹配策略）。
+"""IMU 时间对齐工具（GVINS 风格线性插值 + 最近邻匹配）。
 
-原线性插值策略参考 gnss_ins_lc_nhc navdataque.cc SortData，但经调查发现：
-- gnss_ins_lc_nhc 使用增量式 IMU（gyro_/acce_ 实为 dtheta/dvel），SortData
-  做的是增量切分（按比例分割增量），不适用于速率式 IMU
-- tools/GINav 也使用增量式 IMU（imu.dw/dv），初始化时无时间插值
+GVINS 风格线性插值（imu_interpolate_linear）：
+- 项目统一时间对齐策略，初始化与主循环机械编排共用
+- 参考 tools/GVINS/estimator/src/estimator_node.cpp process() lines 361-374
+- 当 IMU 时间戳跨越 GNSS 时间戳时，在 GNSS 时刻线性插值 IMU 数据
+- 反距离权重: w1=dt_2/(dt_1+dt_2), w2=dt_1/(dt_1+dt_2)
 
-因此改为 GNSS 时间最近邻匹配 IMU 数据，不进行精细化插值。
-时间对齐误差（最大半个 IMU 采样周期 ≈ 5ms @100Hz）后续由 KF 在线估计。
+最近邻策略（imu_interpolate）：
+- 历史保留接口，不再被项目代码使用
+- 原 gnss_ins_lc_nhc/GINav 增量切分不适用于速率式 IMU
 """
 from typing import Optional
 
@@ -38,6 +40,9 @@ def is_to_update(t0: float, t2: float, t_gnss: float,
 def imu_interpolate(imu_pre: ImuMeasurement, imu_cur: ImuMeasurement,
                     t_gnss: float) -> Optional[ImuMeasurement]:
     """最近邻匹配：返回时间戳最接近 t_gnss 的 IMU 历元（不插值）。
+
+    Deprecated: 项目统一使用 imu_interpolate_linear 线性插值策略。
+    本函数仅为兼容历史接口保留，新代码请使用 imu_interpolate_linear。
 
     速率式 IMU 最近邻策略：
     - 在包夹区间 [imu_pre, imu_cur] 内，选时间戳最接近 t_gnss 的历元
@@ -91,3 +96,40 @@ def find_bracket_imus(imu_list, t_gnss: float
         return None
 
     return None
+
+
+def imu_interpolate_linear(imu_pre: ImuMeasurement,
+                           imu_cur: ImuMeasurement,
+                           t_target: float) -> Optional[ImuMeasurement]:
+    """GVINS 风格线性插值：在 t_target 处线性插值 IMU 数据。
+
+    参考 tools/GVINS/estimator/src/estimator_node.cpp process() lines 361-374:
+        dt_1 = t_target - imu_pre.t   (前一 IMU 到目标时刻)
+        dt_2 = imu_cur.t - t_target   (目标时刻到当前 IMU)
+        w1 = dt_2 / (dt_1 + dt_2)     # imu_pre 权重 (反距离)
+        w2 = dt_1 / (dt_1 + dt_2)     # imu_cur 权重 (反距离)
+        accel = w1 * imu_pre.accel + w2 * imu_cur.accel
+        gyro  = w1 * imu_pre.gyro  + w2 * imu_cur.gyro
+
+    Args:
+        imu_pre: 前一 IMU 历元 (timestamp <= t_target)
+        imu_cur: 当前 IMU 历元 (timestamp >= t_target)
+        t_target: 插值目标时刻（通常为 GNSS 时间戳）
+
+    Returns:
+        t_target 时刻的 ImuMeasurement（线性插值数据），或 None（区间不包含 t_target）
+    """
+    t0 = imu_pre.timestamp
+    t2 = imu_cur.timestamp
+    if not (t0 <= t_target <= t2) or t2 <= t0:
+        return None
+    dt_1 = t_target - t0
+    dt_2 = t2 - t_target
+    w1 = dt_2 / (dt_1 + dt_2)
+    w2 = dt_1 / (dt_1 + dt_2)
+    return ImuMeasurement(
+        timestamp=t_target,
+        week=imu_pre.week,
+        accel=w1 * imu_pre.accel + w2 * imu_cur.accel,
+        gyro=w1 * imu_pre.gyro + w2 * imu_cur.gyro,
+    )

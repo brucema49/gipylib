@@ -26,8 +26,8 @@ def main(config_path: str = "data/config.yaml"):
     config = load_config(config_path)
 
     control = ThreadControl()
-    imu_queue = Queue(maxsize=2000)
-    gnss_queue = Queue(maxsize=100)
+    imu_queue = Queue(maxsize=200)
+    gnss_queue = Queue(maxsize=3)
 
     sensors, logger = _assemble_pipeline(config, control, imu_queue, gnss_queue)
 

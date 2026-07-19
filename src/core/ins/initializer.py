@@ -18,7 +18,7 @@ import numpy as np
 from src.core.data_types import AlignedBlock, GnssSolution, ImuMeasurement, InsState
 from src.core.ins.attitude import att_caln2e, dcm2quat, euler2dcm
 from src.core.ins.earth_param import cal_Ce2n, ecef2llh
-from src.core.ins.interpolator import find_bracket_imus, imu_interpolate
+from src.core.ins.interpolator import find_bracket_imus, imu_interpolate_linear
 from src.core.ins.state_index import StateIndex
 
 
@@ -77,7 +77,7 @@ class InsInitializer:
         gnss = aligned_block.gnss
         imu_list = aligned_block.imu_list
 
-        # 1. IMU 时间对齐到 GNSS 时间戳 (最近邻匹配, 验证包夹条件)
+        # 1. IMU 时间对齐到 GNSS 时间戳 (GVINS 风格线性插值, 验证包夹条件)
         interp_imu = self._align_imu_to_gnss(imu_list, gnss.timestamp)
         if interp_imu is None:
             raise ValueError(
@@ -120,10 +120,11 @@ class InsInitializer:
 
     def _align_imu_to_gnss(self, imu_list: List[ImuMeasurement],
                            t_gnss: float) -> Optional[ImuMeasurement]:
-        """IMU 数据时间对齐到 GNSS 时间戳 (最近邻匹配, 初始化.md 第 4 节)。
+        """IMU 数据时间对齐到 GNSS 时间戳 (GVINS 风格线性插值, 与主循环一致)。
 
-        从 imu_list 中找包夹 t_gnss 的两个历元，选时间戳最近者返回。
-        时间对齐误差 (最大半个 IMU 采样周期) 后续由 KF 估计。
+        从 imu_list 中找包夹 t_gnss 的两个历元，线性插值到 t_gnss。
+        与 LcIntegration.add_imu 使用同一套插值策略 (imu_interpolate_linear),
+        保证初始化与机械编排的 IMU 数据输入口径一致。
         """
         if not imu_list:
             return None
@@ -131,7 +132,7 @@ class InsInitializer:
         if bracket is None:
             return None
         imu_pre, imu_cur, _ = bracket
-        return imu_interpolate(imu_pre, imu_cur, t_gnss)
+        return imu_interpolate_linear(imu_pre, imu_cur, t_gnss)
 
     def _compute_gyro_norm(self, imu_list: List[ImuMeasurement],
                            t_gnss: float, window: float = 1.0) -> float:
