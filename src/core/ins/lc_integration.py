@@ -78,6 +78,12 @@ class LcIntegration:
         self.imupre: Optional[ImuMeasurement] = None
         self.imucur: Optional[ImuMeasurement] = None
         self.pending_gnss: collections.deque = collections.deque()
+        # Qins 跟踪 (与 ignav outins 一致):
+        #   2 = mech + propagate (time_update only)
+        #   3 = LC update (GNSS meas_update 或约束触发)
+        # add_imu 开始时置 2, _apply_gnss_update / _apply_constraints 触发后置 3,
+        # 末尾 time_update(imu) 不重置 (保留本历元量测更新标记)
+        self.last_qins: int = 2
 
     def add_imu(self, imu: ImuMeasurement) -> None:
         """GVINS 风格 IMU 消费: 每条 IMU 检查 GNSS 队头时间戳。
@@ -95,7 +101,10 @@ class LcIntegration:
         if self.imucur is None:
             self.imucur = imu
             self._static_detect.push(imu)
+            self.last_qins = 2
             return
+
+        self.last_qins = 2  # 默认: 仅机械编排 + 协方差传播
 
         cur = self.imucur  # 当前已推进到的 IMU
 
@@ -157,6 +166,7 @@ class LcIntegration:
         if gnss.velocity is not None:
             self.est.meas_update_vel(gnss)
         self.est.feedback()
+        self.last_qins = 3  # LC 量测更新完成
 
     def _apply_constraints(self, imu: ImuMeasurement) -> None:
         """NHC/ZUPT/ZARU 约束更新 (per-IMU, decimation, 互斥)。
@@ -185,3 +195,4 @@ class LcIntegration:
 
         if applied:
             self.est.feedback()
+            self.last_qins = 3  # 约束量测更新完成

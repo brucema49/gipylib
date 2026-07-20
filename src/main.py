@@ -17,6 +17,7 @@ from src.stream.factory import SensorFactory
 from src.log.aligned_writer import AlignedWriter
 from src.log.aligner import Aligner
 from src.log.logger import Logger
+from src.log.rslt_writer import RSLTWriter
 from src.log.solution_writer import SolutionWriter
 from src.log.solution_logger import SolutionLogger
 from src.utility.config_loader import load_config
@@ -73,7 +74,7 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
 
     if gnss_source == "internal" and ins_enabled == "on":
         # 路径 C: 内部 GNSS 实时解算 + IMU 对齐输出 + 松组合 EKF
-        # 输出三个文件：纯 GNSS .pos + 对齐 CSV + 松组合 .pos
+        # 输出三个文件：纯 GNSS .pos + 对齐 CSV + 松组合 .rslt (100Hz, ECEF+速度+姿态)
         sensors = SensorFactory.create_sensors(config, imu_queue, gnss_queue, control)
         filename = config["output"].get("aligned_filename", "aligned.csv")
         writer = AlignedWriter(
@@ -86,9 +87,9 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
             output_dir=config["output"]["output_dir"],
             filename=gnss_filename,
         )
-        # 松组合定位结果 .pos 文件（文件名通过 solution_filename 配置）
-        lc_filename = config["output"].get("solution_filename", "RTKLC.pos")
-        lc_writer = SolutionWriter(
+        # 松组合定位结果 .rslt 文件（100Hz, ignav outins 风格 LLH位置+ECEF速度+FRD姿态）
+        lc_filename = config["output"].get("rslt_filename", "RTKLC.rslt")
+        lc_writer = RSLTWriter(
             output_dir=config["output"]["output_dir"],
             filename=lc_filename,
         )
