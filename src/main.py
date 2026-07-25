@@ -16,7 +16,7 @@ from src.core.thread_control import ThreadControl
 from src.stream.factory import SensorFactory
 from src.log.aligned_writer import AlignedWriter
 from src.log.aligner import Aligner
-from src.log.logger import Logger
+from src.log.logger import Logger, TcLogger
 from src.log.rslt_writer import RSLTWriter
 from src.log.solution_writer import SolutionWriter
 from src.log.solution_logger import SolutionLogger
@@ -66,7 +66,7 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
     if gnss_source == "internal" and ins_enabled == "off":
         # 路径 B: 纯 GNSS .pos 输出
         sensors = SensorFactory.create_sensors(config, imu_queue, gnss_queue, control)
-        filename = config["output"].get("solution_filename", "solution.pos")
+        filename = config["output"].get("gnss_filename", "RTK.pos")
         writer = SolutionWriter(output_dir=config["output"]["output_dir"],
                                 filename=filename)
         logger = SolutionLogger(gnss_queue, writer, control)
@@ -81,14 +81,14 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
             output_dir=config["output"]["output_dir"],
             filename=filename,
         )
-        # 纯 GNSS 定位结果 .pos 文件（文件名通过 gnss_solution_filename 配置，默认 gnss_solution.pos）
-        gnss_filename = config["output"].get("gnss_solution_filename", "gnss_solution.pos")
+        # 纯 GNSS 定位结果 .pos 文件（副输出）
+        gnss_filename = config["output"].get("gnss_filename", "RTK.pos")
         gnss_writer = SolutionWriter(
             output_dir=config["output"]["output_dir"],
             filename=gnss_filename,
         )
         # 松组合定位结果 .rslt 文件（100Hz, ignav outins 风格 LLH位置+ECEF速度+FRD姿态）
-        lc_filename = config["output"].get("rslt_filename", "RTKLC.rslt")
+        lc_filename = config["output"].get("rslt_filename", "RTKTC.rslt")
         lc_writer = RSLTWriter(
             output_dir=config["output"]["output_dir"],
             filename=lc_filename,
@@ -98,6 +98,24 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
         aligner = Aligner(imu_dt=1.0 / config["ins"]["data_rate"])
         logger = Logger(imu_queue, gnss_queue, writer, aligner, control,
                         gnss_writer=gnss_writer, lc_stream=lc_stream)
+        return sensors, logger
+
+    if gnss_source == "internal" and ins_enabled == "tc":
+        # 路径 D: 紧组合 GNSS/INS (TcGnssSensor 原始观测 + TcStream + RSLTWriter)
+        # 输出一个文件：紧组合 .rslt (100Hz, ignav outins 风格 LLH位置+ECEF速度+FRD姿态)
+        # 不输出纯 GNSS .pos (TC 不做独立 GNSS 解算)
+        sensors = SensorFactory.create_sensors(config, imu_queue, gnss_queue, control)
+        tc_filename = config["output"].get("rslt_filename", "RTKTC.rslt")
+        tc_writer = RSLTWriter(
+            output_dir=config["output"]["output_dir"],
+            filename=tc_filename,
+        )
+        from src.core.tc.tc_stream import TcStream
+        tc_stream = TcStream(config, tc_writer)
+        # harvest_window 与 LC 一致 (1.0s), 保证 IMU 覆盖 GNSS 历元窗口
+        harvest_window = 1.0
+        logger = TcLogger(imu_queue, gnss_queue, tc_stream, control,
+                          harvest_window=harvest_window)
         return sensors, logger
 
     raise NotImplementedError(

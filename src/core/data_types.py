@@ -55,6 +55,7 @@ class AlignedBlock:
 @dataclass
 class SensorData:
     """传感器数据统一容器（一次只承载一种类型）。"""
-    tag: str                                  # "imu" / "gnss_solution"
+    tag: str                                  # "imu" / "gnss_solution" / "gnss_raw"
     imu: Optional[ImuMeasurement] = None
     gnss_solution: Optional[GnssSolution] = None
+    gnss_raw: Optional[tuple] = None          # (obsr, obsb, nav) 原始观测 (TC 模式)

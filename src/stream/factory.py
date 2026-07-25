@@ -39,5 +39,11 @@ class SensorFactory:
             sensors.append(ImuSensor(imu_path, imu_queue, control, imu_coord, imu_format))
             from src.stream.internal_gnss_sensor import InternalGnssSensor
             sensors.append(InternalGnssSensor(config, gnss_queue, control))
+        elif gnss_source == "internal" and ins_enabled == "tc":
+            # internal + tc: IMU 流式 + TcGnssSensor (原始观测, 不做 GNSS 解算)
+            imu_path = config["ins"]["imu_data_path"]
+            sensors.append(ImuSensor(imu_path, imu_queue, control, imu_coord, imu_format))
+            from src.stream.tc_gnss_sensor import TcGnssSensor
+            sensors.append(TcGnssSensor(config, gnss_queue, control))
 
         return sensors

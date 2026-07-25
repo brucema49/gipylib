@@ -22,6 +22,14 @@ from src.core.ins.earth_param import (
 )
 from src.core.ins.state_index import StateIndex
 
+# 传感器零偏相关时间 (h): 0.01h = 36s, 一阶 Gauss-Markov 过程相关时间
+_CORR_TIME_BIAS_H = 0.01
+# 可选状态参数过程噪声 PSD (随机游走, 无需调参)
+_LEVER_ARM_PSD = 0.0          # 杆臂视为常数 (m²/s)
+_IMU_ANGLE_PSD = 1.0e-6       # 安装角随机游走 (rad²/s)
+_IMU_LEVERARM_PSD = 1.0e-8     # IMU 杆臂随机游走 (m²/s)
+_TIME_SYNC_PSD = 1.0e-4       # 时间对齐随机游走 (s²/s)
+
 
 def skew(v: np.ndarray) -> np.ndarray:
     """3 维向量 → 反对称矩阵。"""
@@ -87,9 +95,9 @@ class TransferMatrix:
     def __init__(self, config: dict, state_index: StateIndex = None):
         ins_cfg = config.get("ins", {}) if config else {}
         self.si = state_index if state_index is not None else StateIndex.from_config(config or {})
-        # 相关时间 (h → s)
-        self.tau_gyro = ins_cfg.get("corr_time_of_gyro_bias", 0.01) * 3600.0
-        self.tau_acce = ins_cfg.get("corr_time_of_acce_bias", 0.01) * 3600.0
+        # 相关时间 (常数, h → s): 0.01h = 36s, 传感器零偏相关时间, 无需调参
+        self.tau_gyro = _CORR_TIME_BIAS_H * 3600.0
+        self.tau_acce = _CORR_TIME_BIAS_H * 3600.0
         # 过程噪声 PSD (从 config 直接读取, SI 单位)
         self.gyro_psd = ins_cfg.get("gyro_psd", 3.38802348178723e-09)
         self.accel_psd = ins_cfg.get("accel_psd", 2.60420170553977e-06)
@@ -97,11 +105,11 @@ class TransferMatrix:
         self.acce_bias_psd = ins_cfg.get("acce_bias_psd", 1.66067346797506e-09)
         # 位置随机游走 PSD (m²/s): 计入未建模的位置不确定性 (RTK 跳变/多径等)
         self.pos_psd = ins_cfg.get("pos_psd", 0.0)
-        # 可选参数过程噪声 PSD
-        self.lever_arm_psd = ins_cfg.get("lever_arm_psd", 0.0)
-        self.imu_angle_psd = ins_cfg.get("imu_angle_psd", 1.0e-6)
-        self.imu_leverarm_psd = ins_cfg.get("imu_leverarm_psd", 1.0e-8)
-        self.time_sync_psd = ins_cfg.get("time_sync_psd", 1.0e-4)
+        # 可选参数过程噪声 PSD (常数, 无需调参)
+        self.lever_arm_psd = _LEVER_ARM_PSD
+        self.imu_angle_psd = _IMU_ANGLE_PSD
+        self.imu_leverarm_psd = _IMU_LEVERARM_PSD
+        self.time_sync_psd = _TIME_SYNC_PSD
         # 地球自转角速度 (E 系常数向量)
         self.w_ie_e = np.array([0.0, 0.0, EARTH_ROTATION_RATE], dtype=np.float64)
 

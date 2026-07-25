@@ -50,6 +50,14 @@ class TcStream:
     def close(self) -> None:
         self.writer.close()
 
+    def finalize(self) -> int:
+        """流式结束，返回总输出数。"""
+        if not self._initialized:
+            logger.warning("TcStream: 未初始化，无 TC 输出")
+            return 0
+        logger.info(f"TcStream 输出: {self._output_count} 历元")
+        return self._output_count
+
     # ===== 增量喂入 =====
 
     def feed_imu(self, imu: ImuMeasurement) -> None:

@@ -8,7 +8,9 @@ REQUIRED_DATA_RATE = 100  # external/INS 模式仅支持 100Hz
 SUPPORTED_EXTERNAL_FORMATS = {"pos"}
 SUPPORTED_GNSS_SOURCES = {"external", "internal"}
 SUPPORTED_POSITIONING_MODES = {"spp", "rtk"}
-SUPPORTED_INS_ENABLED = {"on", "off"}
+SUPPORTED_INS_ENABLED = {"on", "off", "tc"}
+# coupling_mode ↔ ins.enabled 映射
+COUPLING_MODE_MAP = {"gnss": "off", "lc": "on", "tc": "tc"}
 
 
 def load_config(path) -> dict:
@@ -18,7 +20,6 @@ def load_config(path) -> dict:
         FileNotFoundError: 文件不存在
         yaml.YAMLError: YAML 解析错误
         ValueError: 配置非法
-        NotImplementedError: internal + ins.enabled=on（INS 未实现）
     """
     path = Path(path)
     if not path.exists():
@@ -27,10 +28,28 @@ def load_config(path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
+    # coupling_mode (可选, 文件头主选项): 自动同步 ins.enabled
+    coupling_mode = cfg.get("coupling_mode")
+    if coupling_mode is not None:
+        if coupling_mode not in COUPLING_MODE_MAP:
+            raise ValueError(
+                f"coupling_mode must be one of {set(COUPLING_MODE_MAP)}, "
+                f"got '{coupling_mode}'"
+            )
+        expected_ins = COUPLING_MODE_MAP[coupling_mode]
+        ins_cfg = cfg.setdefault("ins", {})
+        actual_ins = ins_cfg.get("enabled")
+        if actual_ins is not None and actual_ins != expected_ins:
+            raise ValueError(
+                f"coupling_mode='{coupling_mode}' requires ins.enabled='{expected_ins}', "
+                f"but got '{actual_ins}'"
+            )
+        ins_cfg["enabled"] = expected_ins
+
     # ins.enabled 必填
     ins_enabled = cfg.get("ins", {}).get("enabled")
     if ins_enabled is None:
-        raise ValueError("ins.enabled is required (must be 'on' or 'off')")
+        raise ValueError("ins.enabled is required (must be 'on', 'off', or 'tc')")
     if ins_enabled not in SUPPORTED_INS_ENABLED:
         raise ValueError(
             f"ins.enabled must be one of {SUPPORTED_INS_ENABLED}, "
@@ -85,11 +104,12 @@ def load_config(path) -> dict:
             raise ValueError(
                 "base_path is required when positioning_mode='rtk'"
             )
-        if ins_enabled == "on":
+        # INS 模式 (on/tc) 需要 IMU 数据
+        if ins_enabled in ("on", "tc"):
             if not cfg["ins"].get("imu_data_path"):
                 raise ValueError(
-                    "ins.imu_data_path is required when gnss_source='internal' "
-                    "and ins.enabled='on'"
+                    f"ins.imu_data_path is required when gnss_source='internal' "
+                    f"and ins.enabled='{ins_enabled}'"
                 )
 
     return cfg
