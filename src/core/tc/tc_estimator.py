@@ -4,13 +4,15 @@
   - 状态向量加 GNSS 参数块 (clk_bias/ambiguity)
   - time_update: 父类 INS 传播 + 钟差随机游走
   - tc_meas_update: 调 joseph_update + feedback
-  - feedback: 父类 INS 反馈, 但保留 GNSS 参数 (clk/amb 为直接估计, 非 ψ-error)
+  - feedback: 父类 INS 反馈 + GNSS 直接状态累积到 stored
   - switch_mode: 降级时状态向量重整
   - reboot: 重启保留随机游走参数
 
-关键区别:
-  - INS 部分 (pos/vel/att/bias): ψ-error, feedback 校正物理状态后清零
-  - GNSS 部分 (clk_bias/ambiguity): 直接估计, x 中即真值, feedback 不清零
+状态语义 (与 GINav/GREAT-MSF 一致的 innovation 形式):
+  - INS 部分 (pos/vel/att/bias): ψ-error, x 存误差 ε, feedback: state -= ε, ε 清零
+  - GNSS 部分 (clk_bias/ambiguity): 直接估计, x 存修正量 ε (correction)
+      effective = stored + ε (ADD, 修正量加到直接估计)
+      feedback: stored += ε, ε 清零
 """
 import numpy as np
 
@@ -29,6 +31,12 @@ class TcEstimator(LcEstimator):
         super().__init__(state, P, config)
         # 替换为 TcStateIndex (扩展 GNSS 参数块)
         tc_si = TcStateIndex.from_config(config, mode)
+        # RTK 模式: 预分配 ambiguity 槽位 (MAXSAT * nf)
+        # 必须在 dim 检查前设置, 否则 has_ambiguity()=False 导致 H 矩阵维度不匹配
+        if mode == "rtk":
+            from src.core.gnss.rtklib.rtkcmn import uGNSS
+            nf = int(config.get("gnss", {}).get("nf", 2))
+            tc_si.set_ambiguity_count(uGNSS.MAXSAT * nf)
         # 保留 INS 基础部分, 扩展到 tc_si.dim
         old_dim = self.si.dim   # 基类 StateIndex dim (仅 INS+可选块, 无 GNSS 块)
         if tc_si.dim > old_dim:
@@ -43,6 +51,31 @@ class TcEstimator(LcEstimator):
         self.tm = TransferMatrix(config, tc_si)
         self.si = tc_si
         self._clk_q = 1e-2   # 钟差随机游走 PSD (m²/s)
+        # GNSS 直接估计 (stored): clk/amb 的当前最佳估计
+        # x[clk_bias]/x[amb] 存修正量 ε (correction), feedback 时累积到 stored
+        self._clk_stored = np.zeros(3, dtype=np.float64)
+        self._N_stored = np.zeros(tc_si.n_amb if tc_si.has_ambiguity() else 0,
+                                  dtype=np.float64)
+
+    def effective_x(self) -> np.ndarray:
+        """构造有效状态向量供量测构造: stored + x (ε)。
+
+        - INS 部分 (pos/vel/att/bias): x 本身即误差 ε (量测用 nominal state, 不需 effective)
+        - GNSS 直接状态 (clk_bias/ambiguity): effective = stored + ε
+          (ε 为 KF 估计的修正量, stored 为累积的直接估计)
+        """
+        si = self.si
+        x = self.x.copy()
+        if si.clk_bias >= 0:
+            x[si.clk_bias:si.clk_bias + 3] = (
+                self._clk_stored + self.x[si.clk_bias:si.clk_bias + 3])
+        if si.has_ambiguity():
+            amb_slice = slice(si.amb_start, si.amb_start + si.n_amb)
+            # 动态调整 _N_stored 尺寸 (set_ambiguity_count 可能改变 n_amb)
+            if len(self._N_stored) != si.n_amb:
+                self._N_stored = np.zeros(si.n_amb, dtype=np.float64)
+            x[amb_slice] = self._N_stored + self.x[amb_slice]
+        return x
 
     def time_update(self, imu):
         """父类 INS 传播 + 钟差随机游走。"""
@@ -61,25 +94,24 @@ class TcEstimator(LcEstimator):
         self.feedback()
 
     def feedback(self) -> None:
-        """反馈校正: 父类 INS 部分, 但保留 GNSS 参数。
+        """反馈校正: INS 误差减, GNSS 直接状态累积到 stored。
 
-        GNSS 参数 (clk_bias/ambiguity) 是直接估计 (非 ψ-error),
-        feedback 后不清零, 保留在 x 中供下次量测构造使用。
+        GNSS 直接状态 (clk_bias/ambiguity) 的 x 存修正量 ε (correction):
+          - stored += ε (累积修正到直接估计)
+          - ε 清零 (由父类 feedback 完成)
+        INS 误差状态由父类 feedback 处理 (state -= x, x 清零)。
         """
-        # 保存 GNSS 参数
         si = self.si
-        gnss_x = {}
+        # 累积 GNSS 直接状态修正到 stored
         if si.clk_bias >= 0:
-            gnss_x['clk'] = self.x[si.clk_bias:si.clk_bias + 3].copy()
+            self._clk_stored += self.x[si.clk_bias:si.clk_bias + 3]
         if si.has_ambiguity():
-            gnss_x['amb'] = self.x[si.amb_start:si.amb_start + si.n_amb].copy()
-        # 调父类 feedback (校正 INS + 清零全部 x)
+            amb_slice = slice(si.amb_start, si.amb_start + si.n_amb)
+            if len(self._N_stored) != si.n_amb:
+                self._N_stored = np.zeros(si.n_amb, dtype=np.float64)
+            self._N_stored += self.x[amb_slice]
+        # 父类 feedback: INS state -= x, 清零全部 x (含 GNSS ε)
         super().feedback()
-        # 恢复 GNSS 参数
-        if 'clk' in gnss_x:
-            self.x[si.clk_bias:si.clk_bias + 3] = gnss_x['clk']
-        if 'amb' in gnss_x:
-            self.x[si.amb_start:si.amb_start + si.n_amb] = gnss_x['amb']
 
     def switch_mode(self, new_mode: str, builder=None):
         """降级时状态向量重整。
@@ -98,6 +130,10 @@ class TcEstimator(LcEstimator):
         self.P = new_P
         self.x = new_x
         self._mode = new_mode
+        # 重置 GNSS 直接估计 (新模式从零开始)
+        self._clk_stored = np.zeros(3, dtype=np.float64)
+        self._N_stored = np.zeros(new_si.n_amb if new_si.has_ambiguity() else 0,
+                                  dtype=np.float64)
         if builder is not None:
             self._meas_builder = builder
 
@@ -122,3 +158,7 @@ class TcEstimator(LcEstimator):
         self.state.pos_e[:] = 0.0
         self.state.vel_e[:] = 0.0
         self.state.C_b_e = np.eye(3)
+        # GNSS 直接估计重置
+        self._clk_stored[:] = 0.0
+        self._N_stored = np.zeros(si.n_amb if si.has_ambiguity() else 0,
+                                  dtype=np.float64)
