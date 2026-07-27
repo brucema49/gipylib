@@ -127,15 +127,7 @@ class TcIntegration:
 
     @staticmethod
     def _select_init_mode(config: dict) -> InitMode:
-        ins_cfg = config.get("ins", {})
-        method = ins_cfg.get("alignnment_dynamic_method", "auto")
-        if method == "velocity_vector":
-            return InitMode.VELOCITY_VECTOR
-        if method == "position_diff":
-            return InitMode.POSITION_DIFF
-        pos_mode = config.get("gnss", {}).get("positioning_mode", "spp")
-        if pos_mode == "spp":
-            return InitMode.VELOCITY_VECTOR
+        """TC 模式无 GNSS 速度, 速度初始化统一使用位置差分。"""
         return InitMode.POSITION_DIFF
 
     # ===== 增量喂入 =====
@@ -248,7 +240,7 @@ class TcIntegration:
         if float(np.mean(gyro_norms)) >= angular_thr:
             return
 
-        # SPP 粗定位 (用 obsr + nav)
+        # SPP 粗定位 (用 obsr + nav) 作为初值, RTK/RTD 模式随后用 relpos 精化
         try:
             from src.core.gnss.rtklib.ephemeris import satposs
             from src.core.gnss.rtklib.pntpos import estpos
@@ -264,17 +256,50 @@ class TcIntegration:
             logger.warning(f"TC init SPP 异常: {e}")
             return
 
-        # 构造 GnssSolution 供 InsInitializer 使用
+        # RTK/RTD 模式: 用 relpos 双差解算替代 SPP 初始化
+        # 速度初始化统一使用位置差分 (TC 模式无 GNSS 速度)
+        quality = 5       # 默认 SPP
         rr = x_spp[:3].copy()
+        ns = int(sol.ns)
+        pos_sd = np.array([10.0, 10.0, 10.0])  # SPP 默认 10m
+        if self._mode in ("rtk", "rtd") and obsb is not None:
+            try:
+                from src.core.gnss.rtklib.rtkpos import relpos
+                from src.core.gnss.rtklib.rtkcmn import Sol, SOLQ_NONE
+                # 初始化 nav.x 供 relpos 的 zdres 计算流动站位置
+                nav.x[0:6] = sol.rr[0:6]
+                nav.x[6:9] = 1e-6  # match RTKLIB
+                rtk_sol = Sol()
+                rtk_sol.t = obsr.t
+                relpos(nav, obsr, obsb, rtk_sol)
+                if rtk_sol.stat != SOLQ_NONE:
+                    rr = rtk_sol.rr[:3].copy()
+                    quality = rtk_sol.stat  # 1=FIX, 2=FLOAT, 4=DGPS
+                    ns = rtk_sol.ns if rtk_sol.ns > 0 else (
+                        nav.ns if nav.ns > 0 else ns)
+                    # 按质量设置位置标准差
+                    if quality == 1:      # FIX
+                        pos_sd = np.array([0.1, 0.1, 0.1])
+                    elif quality == 2:    # FLOAT
+                        pos_sd = np.array([0.3, 0.3, 0.3])
+                    elif quality == 4:    # DGPS/RTD
+                        pos_sd = np.array([1.0, 1.0, 1.0])
+                    logger.info(
+                        f"TC init: RTK 解算成功 quality={quality}, "
+                        f"ns={ns}, pos={rr}")
+                else:
+                    logger.warning("TC init: RTK 解算失败, 回退 SPP")
+            except Exception as e:
+                logger.warning(f"TC init RTK 异常: {e}, 回退 SPP")
+
+        # 构造 GnssSolution 供 InsInitializer 使用
         gnss_sol = GnssSolution(
             timestamp=t_gnss,
             week=0,
             position=rr,
-            quality=5,       # SPP
-            num_sv=int(sol.ns),
-            sd=np.array([sol.rr[3], sol.rr[4], sol.rr[5]]
-                        if hasattr(sol, 'rr') and len(sol.rr) >= 6
-                        else [10.0, 10.0, 10.0]),
+            quality=quality,
+            num_sv=ns,
+            sd=pos_sd,
             velocity=None,
             vel_sd=None,
         )
@@ -320,8 +345,8 @@ class TcIntegration:
             for k in range(3):
                 self._est.P[si.clk_bias + k, si.clk_bias + k] = 10.0 ** 2
         self._initialized = True
-        self._last_q = 5
-        self._last_ns = int(sol.ns)
+        self._last_q = quality
+        self._last_ns = ns
         self._last_gnss_t = t_gnss
 
         logger.info(
