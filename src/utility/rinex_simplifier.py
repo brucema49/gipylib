@@ -16,12 +16,18 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 # 频点编号映射：信号代码后两位 → 频点序号（越小优先级越高）
+# L1/E1/B1 频点: 0
+# L2 频点: 1
+# L5/E5a 频点: 2
+# E5b/B2I 频点: 3
+# E6/B3 频点: 4
 _FREQ_ORDER: Dict[str, int] = {
-    "1C": 0, "1X": 0, "1W": 0, "1P": 0, "1I": 0,
-    "2C": 1, "2X": 1, "2W": 1, "2L": 1, "2P": 1,
-    "5Q": 2, "5X": 2,
-    "7Q": 3, "7X": 3, "7I": 3,
-    "8X": 4,
+    "1C": 0, "1X": 0, "1W": 0, "1P": 0, "1I": 0, "1M": 0, "1S": 0,
+    "2C": 1, "2X": 1, "2W": 1, "2L": 1, "2P": 1, "2S": 1, "2I": 3, "2M": 1,
+    "5Q": 2, "5X": 2, "5P": 2,
+    "6C": 4, "6I": 4, "6X": 4,
+    "7Q": 3, "7X": 3, "7I": 3, "7P": 3,
+    "8X": 4, "8Q": 4, "8P": 4,
 }
 
 # 信号类型优先级：C(伪距) > L(载波) > D(多普勒) > S(信噪比)
@@ -74,8 +80,15 @@ def _parse_obs_types_lines(lines: List[str], start_idx: int) -> Tuple[List[str],
     return sigs[:nsig], idx
 
 
-def _select_signals(sigs: List[str], max_freqs: int) -> Tuple[List[str], List[Optional[int]]]:
+def _select_signals(sigs: List[str], max_freqs: int,
+                    preferred_freqs: List[int] = None) -> Tuple[List[str], List[Optional[int]]]:
     """从原始信号列表中选择最多 max_freqs 个频点的信号。
+
+    Args:
+        sigs: 原始信号列表
+        max_freqs: 最多保留频点数
+        preferred_freqs: 优先保留的频点列表（如 [3, 0] 表示优先保留 B2I, 其次 L1）。
+                     若为 None 或优先频点不足 max_freqs 个，则按频点序号补齐。
 
     返回 (新信号列表, 旧索引→新索引映射，None 表示丢弃)。
     新信号列表按 C-L-D-S 顺序交织排列。
@@ -95,8 +108,26 @@ def _select_signals(sigs: List[str], max_freqs: int) -> Tuple[List[str], List[Op
         if tc not in freq_groups[fb]:
             freq_groups[fb][tc] = sig
 
-    # 选前 max_freqs 个频点（按频点序号排序）
-    selected_freqs = sorted(freq_groups.keys())[:max_freqs]
+    # 选择频点：优先保留 preferred_freqs 中存在的频点
+    available_freqs = set(freq_groups.keys())
+    selected_freqs = []
+    if preferred_freqs:
+        for pf in preferred_freqs:
+            if pf in available_freqs and pf not in selected_freqs:
+                selected_freqs.append(pf)
+                if len(selected_freqs) >= max_freqs:
+                    break
+        # preferred_freqs 指定时只保留指定的频点, 不补齐
+        # (避免基站/流动站频点不一致: 如 BDS preferred=[3] 时
+        #  流动站只有 B2I, 基站补齐 L1 后频点槽位错位)
+    else:
+        # 无 preferred_freqs 时按频点序号补齐到 max_freqs
+        for fb in sorted(available_freqs):
+            if fb not in selected_freqs:
+                selected_freqs.append(fb)
+                if len(selected_freqs) >= max_freqs:
+                    break
+    selected_freqs = sorted(selected_freqs)
 
     # 构建新信号列表（C-L-D-S 顺序）与索引映射
     new_sigs: List[str] = []
@@ -157,13 +188,17 @@ def _reorder_obs_line(line: str, old_to_new: List[Optional[int]]) -> str:
     return header + "".join(new_fields) + "\n"
 
 
-def simplify_rinex(input_path: str, output_path: str, max_freqs: int = 2) -> str:
+def simplify_rinex(input_path: str, output_path: str, max_freqs: int = 2,
+                   freq_priority: Dict[str, List[int]] = None) -> str:
     """简化 RINEX 3.02 观测文件。
 
     Args:
         input_path: 输入 RINEX 文件路径
         output_path: 输出简化后 RINEX 文件路径
         max_freqs: 每系统最多保留频点数（默认 2，匹配 rtklib-py MAX_NFREQ）
+        freq_priority: 各系统优先保留的频点列表，键为系统字符（'G'/'C'/'E'等），
+                      值为频点序号列表（如 [3, 0] 表示优先保留 B2I, 其次 L1）。
+                      用于确保基站与流动站频点匹配。若为 None 则按频点序号选择。
 
     Returns:
         输出文件路径
@@ -195,7 +230,8 @@ def simplify_rinex(input_path: str, output_path: str, max_freqs: int = 2) -> str
             skip_indices.add(i)
             for j in range(i + 1, next_i):
                 skip_indices.add(j)
-            new_sigs, old_to_new = _select_signals(sigs, max_freqs)
+            preferred = freq_priority.get(sys_char) if freq_priority else None
+            new_sigs, old_to_new = _select_signals(sigs, max_freqs, preferred)
             sys_sigs[sys_char] = (new_sigs, old_to_new)
             i = next_i
             continue

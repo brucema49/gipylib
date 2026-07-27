@@ -77,10 +77,7 @@ class uGNSS(IntEnum):
     GALMAX = 36
     QZSMAX = 10
     GLOMAX = 27
-#    BDSMAX = 63
-#    SBSMAX = 24
-#    IRNMAX = 10
-    BDSMAX = 0
+    BDSMAX = 63
     SBSMAX = 0
     IRNMAX = 0
     NONE = -1

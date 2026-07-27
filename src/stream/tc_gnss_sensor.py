@@ -41,6 +41,30 @@ class TcGnssSensor(Thread):
                     pass
             self.output_queue.put(None)  # EOF sentinel
 
+    def _build_freq_priority(self) -> dict:
+        """从配置的 freq_ix0/freq_ix1 构建各系统的频点优先级。
+
+        配置中 freq_ix0/freq_ix1 的索引与 _FREQ_ORDER 中的频点序号一致:
+          0=L1/E1/B1, 1=L2, 2=L5/E5a, 3=E5b/B2I, 4=E6/B3
+
+        Returns:
+            {'G': [0, 1], 'C': [3, 3], 'E': [0, 2], ...}
+            键为 RINEX 系统字符，值为优先保留的频点列表。
+        """
+        sys_map = {"GPS": "G", "BDS": "C", "GAL": "E", "GLO": "R", "QZS": "J", "SBS": "S"}
+        freq_ix0 = self.gnss_cfg.get("freq_ix0", {})
+        freq_ix1 = self.gnss_cfg.get("freq_ix1", {})
+        priority = {}
+        for sys_name, sys_char in sys_map.items():
+            freqs = []
+            if sys_name in freq_ix0:
+                freqs.append(int(freq_ix0[sys_name]))
+            if sys_name in freq_ix1:
+                freqs.append(int(freq_ix1[sys_name]))
+            if freqs:
+                priority[sys_char] = freqs
+        return priority
+
     def _prepare_rinex(self, path: str) -> str:
         """如需简化则生成临时简化文件，返回可用路径。"""
         if not needs_simplification(path):
@@ -50,7 +74,8 @@ class TcGnssSensor(Thread):
             mode="w", suffix=suffix, delete=False, encoding="utf-8"
         )
         tmp.close()
-        simplify_rinex(path, tmp.name)
+        freq_priority = self._build_freq_priority()
+        simplify_rinex(path, tmp.name, freq_priority=freq_priority)
         self._temp_files.append(tmp.name)
         return tmp.name
 

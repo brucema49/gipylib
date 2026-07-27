@@ -387,7 +387,7 @@ class TcIntegration:
             return
 
         if len(v) == 0:
-            logger.debug(f"TC no_meas (mode={mode}, t={t_gnss:.3f}): "
+            logger.warning(f"TC no_meas (mode={mode}, t={t_gnss:.3f}): "
                          f"obsr sats={len(obsr.sat)}, obsb sats={len(obsb.sat) if obsb is not None else 0}")
             self._degrade.on_fail(self._est, "no_meas")
             return
@@ -396,6 +396,16 @@ class TcIntegration:
         n_meas = info.get("n", len(v))
         self._last_ns = n_meas
         self._last_q = 5 if mode == "spp" else (1 if mode == "rtk" else 4)
+
+        # 量测数不足时跳过更新 (1-3 个双差无法约束 15+ 维状态, 强行更新会发散)
+        # SPP 单点定位需 >=4 颗卫星, RTK/RTD 双差需 >=4 个双差 (即 >=5 颗共视卫星)
+        min_meas = 4
+        if n_meas < min_meas:
+            logger.warning(f"TC skip_meas (mode={mode}, t={t_gnss:.3f}): "
+                         f"n_meas={n_meas} < {min_meas}, skip update, "
+                         f"obsr={len(obsr.sat)}, obsb={len(obsb.sat) if obsb is not None else 0}")
+            self._degrade.on_fail(self._est, "insufficient_meas")
+            return
 
         # RTK 模糊度管理
         if mode == "rtk" and si.has_ambiguity():

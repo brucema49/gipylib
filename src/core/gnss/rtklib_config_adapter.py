@@ -106,6 +106,7 @@ def build_params(gnss_cfg: dict) -> dict:
         ("GPS", gnss_cfg["efact_gps"]),
         ("GLO", gnss_cfg["efact_glo"]),
         ("GAL", gnss_cfg["efact_gal"]),
+        ("BDS", gnss_cfg.get("efact_bds", 1.0)),
     ]:
         if sat_str in cmap:
             params["efact"][cmap[sat_str]] = _f(val)
@@ -121,10 +122,12 @@ def build_params(gnss_cfg: dict) -> dict:
     #               因此这里默认不跳过任何信号。
     from .rtklib.rtkcmn import rSIG
     params["sig_tbl"] = {
-        "1C": rSIG.L1C, "1X": rSIG.L1X, "1W": rSIG.L1W,
-        "2W": rSIG.L2W, "2C": rSIG.L2C, "2X": rSIG.L2X,
-        "5Q": rSIG.L5Q, "5X": rSIG.L5X, "7Q": rSIG.L7Q,
-        "7X": rSIG.L7X,
+        "1C": rSIG.L1C, "1X": rSIG.L1X, "1W": rSIG.L1W, "1P": rSIG.L1C, "1I": rSIG.L1C, "1M": rSIG.L1C, "1S": rSIG.L1C,
+        "2W": rSIG.L2W, "2C": rSIG.L2C, "2X": rSIG.L2X, "2L": rSIG.L2L, "2P": rSIG.L2C, "2S": rSIG.L2C, "2I": rSIG.L7X, "2M": rSIG.L2C,
+        "5Q": rSIG.L5Q, "5X": rSIG.L5X, "5P": rSIG.L5Q,
+        "6C": rSIG.L7X, "6I": rSIG.L7X, "6X": rSIG.L7X,
+        "7Q": rSIG.L7Q, "7X": rSIG.L7X, "7I": rSIG.L7X, "7P": rSIG.L7X,
+        "8X": rSIG.L7X, "8Q": rSIG.L7X, "8P": rSIG.L7X,
     }
     params["skip_sig_tbl"] = {sat_enum: [] for sat_enum in cmap.values()}
 

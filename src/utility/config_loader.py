@@ -7,7 +7,7 @@ import yaml
 REQUIRED_DATA_RATE = 100  # external/INS 模式仅支持 100Hz
 SUPPORTED_EXTERNAL_FORMATS = {"pos"}
 SUPPORTED_GNSS_SOURCES = {"external", "internal"}
-SUPPORTED_POSITIONING_MODES = {"spp", "rtk"}
+SUPPORTED_POSITIONING_MODES = {"spp", "rtd", "rtk"}
 SUPPORTED_INS_ENABLED = {"on", "off", "tc"}
 # coupling_mode ↔ ins.enabled 映射
 COUPLING_MODE_MAP = {"gnss": "off", "lc": "on", "tc": "tc"}
@@ -100,9 +100,9 @@ def load_config(path) -> dict:
             raise ValueError("rover_path is required when gnss_source='internal'")
         if not cfg["gnss"].get("eph_path"):
             raise ValueError("eph_path is required when gnss_source='internal'")
-        if pos_mode == "rtk" and not cfg["gnss"].get("base_path"):
+        if pos_mode in ("rtk", "rtd") and not cfg["gnss"].get("base_path"):
             raise ValueError(
-                "base_path is required when positioning_mode='rtk'"
+                f"base_path is required when positioning_mode='{pos_mode}'"
             )
         # INS 模式 (on/tc) 需要 IMU 数据
         if ins_enabled in ("on", "tc"):

@@ -161,12 +161,12 @@ class InsInitializer:
 
     def _align_static(self, imu_list: List[ImuMeasurement],
                       gnss: GnssSolution) -> Tuple[np.ndarray, np.ndarray]:
-        """静态对准（低精度模式，初始化调整.md）。
+        """静态对准（低精度模式 + 加速度计调平）。
 
-        低精度模式：不做 AcceLeveling，姿态全设为 0。
+        低精度模式：用加速度计平均值估计 roll/pitch (AcceLeveling), yaw=0。
         - 位置: GNSS 历史平均（static_duration 秒窗口，少于 10s 用全部，多于 10s 取最新 10s）
         - 速度: 置 0
-        - 姿态: [0, 0, 0]
+        - 姿态: [roll, pitch, yaw=0] (roll/pitch 由加速度计调平)
 
         静态检测阈值: GNSS 速度范数 < static_speed_threshold (0.5 m/s)
 
@@ -205,8 +205,19 @@ class InsInitializer:
             self._calibrated_gyro_bias = None
             self._calibrated_accel_bias = None
 
-        # 低精度模式: 姿态全设为 0, 不做 AcceLeveling
-        att_rpy = np.zeros(3, dtype=np.float64)  # roll=0, pitch=0, yaw=0
+        # 加速度计调平 (AcceLeveling): 用静态加速度计平均值估计 roll/pitch
+        # 静止时 f_body = [g sin θ, -g sin φ cos θ, -g cos φ cos θ] (FRD)
+        # 故 pitch = atan2(f_x, sqrt(f_y² + f_z²)), roll = atan2(-f_y, -f_z)
+        # yaw 无法从加速度计估计, 设为 0
+        if imu_list:
+            acc_mean = np.mean([imu.accel for imu in imu_list], axis=0)
+            fx, fy, fz = float(acc_mean[0]), float(acc_mean[1]), float(acc_mean[2])
+            pitch = math.atan2(fx, math.sqrt(fy * fy + fz * fz))
+            roll = math.atan2(-fy, -fz)
+            yaw = 0.0
+            att_rpy = np.array([roll, pitch, yaw], dtype=np.float64)
+        else:
+            att_rpy = np.zeros(3, dtype=np.float64)  # roll=0, pitch=0, yaw=0
         vel_e = np.zeros(3, dtype=np.float64)  # 静态速度为 0
         return att_rpy, vel_e
 

@@ -130,6 +130,10 @@ class TcEstimator(LcEstimator):
         self.P = new_P
         self.x = new_x
         self._mode = new_mode
+        # 重建 TransferMatrix (用 new_si, dim 可能因 clk_bias 块变化而改变)
+        # 否则 build_Q 会用旧 si.dim 生成 Q, 与新 P 维度不匹配
+        from src.core.ins.transfer_matrix import TransferMatrix
+        self.tm = TransferMatrix(self._tc_config, new_si)
         # 重置 GNSS 直接估计 (新模式从零开始)
         self._clk_stored = np.zeros(3, dtype=np.float64)
         self._N_stored = np.zeros(new_si.n_amb if new_si.has_ambiguity() else 0,

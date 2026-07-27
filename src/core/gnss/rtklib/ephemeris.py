@@ -27,13 +27,9 @@ def seleph(nav, t, sat):
         for i, eph_ in enumerate(nav.eph[nav.eph_index[sat]:]):
             if eph_.sat != sat:
                 continue
-            # bit 8 set=E5a, bit 9 set=E5b
-            if sys == uGNSS.GAL:
-                # TODO: abstract hard coded freq
-                if nav.obs_idx[1][uGNSS.GAL] == 2 and (eph_.code >> 8) & 1 == 0:
-                    continue
-                elif nav.obs_idx[1][uGNSS.GAL] == 3 and (eph_.code >> 9) & 1 == 0:
-                    continue
+            # GAL 星历 code 字段 (E5a/E5b 类型) 不影响卫星位置计算,
+            # 移除原 code 检查避免所有 GAL 星历被跳过 (phone 数据中
+            # 所有 GAL 星历 bit8=0, 配置 freq_ix1=2(E5a) 时导致无可用星历)
             dt = timediff(t, eph_.toe)
             if abs(dt) <= dt_p:
                 dt_p = abs(dt)

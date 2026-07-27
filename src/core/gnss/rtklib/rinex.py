@@ -19,7 +19,7 @@ class rnx_decode:
     def __init__(self, cfg):
         self.ver = -1.0
         self.fobs = None
-        self.gnss_tbl = {'G': uGNSS.GPS, 'E': uGNSS.GAL, 'R': uGNSS.GLO, 'J': uGNSS.QZS}
+        self.gnss_tbl = {'G': uGNSS.GPS, 'E': uGNSS.GAL, 'R': uGNSS.GLO, 'J': uGNSS.QZS, 'C': uGNSS.BDS}
         self.sig_tbl = cfg.sig_tbl
         self.skip_sig_tbl = cfg.skip_sig_tbl
         self.nf = 4

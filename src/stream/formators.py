@@ -93,7 +93,14 @@ class EuRoCImuFormator(FormatorBase):
         except (ValueError, IndexError):
             return None
         timestamp = timestamp_ns / 1e9
-        week, _ = unix_to_gpst(timestamp)
+        week, sow = unix_to_gpst(timestamp)
+        # 与 rtklib-py 的 epoch2time 一致: 把 GPS 时间当作 UTC 处理 (伪 Unix GPS)
+        # 这样 imu.timestamp 与 obsr.t.time + obsr.t.sec 在同一时间系
+        # rtklib-py 内部 epoch2time 把 RINEX GPS 时间当作 UTC, 比真实 Unix UTC 多 18s leap
+        # unix_to_gpst/gpst_to_unix 互为逆运算 (未考虑 leap), 故直接 +18s 对齐
+        LEAP_SECONDS = 18  # 2025年 GPS-UTC = 18s
+        timestamp = gpst_to_unix(week, sow) + LEAP_SECONDS
+        week, sow = unix_to_gpst(timestamp)
         imu = ImuMeasurement(
             timestamp=timestamp,
             week=week,

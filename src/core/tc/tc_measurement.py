@@ -136,21 +136,24 @@ class SppTcMeas(TcMeasurement):
 
     @staticmethod
     def _sys_clk_offset(sat):
-        """GPS=0, GLO=1, GAL=2 (对应 clk_bias 三维块)。"""
-        if 1 <= sat <= 32:
+        """GPS=0, GLO/BDS=1, GAL=2 (对应 clk_bias 三维块)。
+
+        注: clk_bias 块固定 3 维, GPS/GAL 各占 1 维, GLO 与 BDS 共享 offset 1
+        (同一时刻只启用 GLO 或 BDS, 不冲突)。
+        """
+        sys, _ = sat2prn(sat)
+        if sys == uGNSS.GPS:
             return 0
-        if 101 <= sat <= 132:
-            return 1
-        return 2
+        if sys == uGNSS.GAL:
+            return 2
+        # GLO / BDS 共用 offset 1
+        return 1
 
 
 def _sys_gnss(sat):
     """卫星编号 → uGNSS 系统常量 (供 varerr)。"""
-    if 1 <= sat <= 32:
-        return uGNSS.GPS
-    if 101 <= sat <= 132:
-        return uGNSS.GLO
-    return uGNSS.GAL
+    sys, _ = sat2prn(sat)
+    return sys
 
 
 class _DdBase(TcMeasurement):
