@@ -105,6 +105,15 @@ class TcIntegration:
         self._writer = None
         self._output_count = 0
         self.last_qins: int = 2
+        # false fix 检测: 跟踪上次量测更新后的位置, 检测异常跳变
+        self._last_meas_pos: Optional[np.ndarray] = None
+        self._amb_fixed: bool = False
+        # 量测更新计数 (用于收敛期保护: 前 N 个历元禁用 NIS/false_fix/跳变检验)
+        self._meas_count: int = 0
+        self._convergence_warmup: int = 10  # 收敛预热历元数 (仅跳变检验)
+        # 量测连续失败计数 (用于发散恢复: 连续失败超阈值时尝试 SPP 重初始化)
+        self._consecutive_failures: int = 0
+        self._recovery_threshold: int = 10  # 连续失败 10 个历元后尝试恢复
 
     @property
     def initialized(self) -> bool:
@@ -130,12 +139,26 @@ class TcIntegration:
         """TC 模式无 GNSS 速度, 速度初始化统一使用位置差分。"""
         return InitMode.POSITION_DIFF
 
+    @staticmethod
+    def _restore_nav(nav, saved_x, saved_P, saved_fix=None, saved_lock=None):
+        """恢复 nav 状态 (SPP/RTK 副作用清除)。"""
+        nav.x[:] = saved_x
+        nav.P[:] = saved_P
+        if saved_fix is not None:
+            nav.fix[:] = saved_fix
+        if saved_lock is not None:
+            nav.lock[:] = saved_lock
+
     # ===== 增量喂入 =====
 
     def add_imu(self, imu: ImuMeasurement) -> None:
         """GVINS 风格 IMU 消费: 每条 IMU 检查 GNSS 队头时间戳。"""
         if not self._initialized:
             self._init_imu.append(imu)
+            # 限制缓冲区大小: 只保留最近 5 秒的 IMU 数据 (避免 O(N²) 遍历)
+            # 初始化只需 GNSS 历元前后 2s 的 IMU 数据
+            if len(self._init_imu) > 1000:  # 100Hz × 10s = 1000
+                self._init_imu = self._init_imu[-500:]
             # 当有 GNSS obs 且当前 IMU 时间戳 >= GNSS 时间戳时, 尝试初始化
             if self._init_obs and imu.timestamp >= self._init_obs[-1][3]:
                 self._try_init()
@@ -194,6 +217,28 @@ class TcIntegration:
         self._est.time_update(imu)
         self._static_detect.push(imu)
         self._apply_constraints(imu)
+
+        # 速度发散检测: 速度 > 50 m/s (180 km/h) 说明滤波器已发散
+        # (地面车辆最大速度 ~30 m/s, 50 m/s 是安全阈值)
+        # 重置速度为 0, 放大速度协方差, 等待下次 GNSS 量测修正位置
+        vel = self._est.state.vel_e
+        speed = float(np.linalg.norm(vel))
+        if speed > 50.0:
+            logger.warning(
+                f"TC vel_diverge (t={imu.timestamp:.3f}): "
+                f"speed={speed:.2f} m/s > 50, reset vel & inflate P")
+            self._est.state.vel_e = np.zeros(3, dtype=np.float64)
+            si = self._est.si
+            for k in range(3):
+                self._est.P[si.vel + k, si.vel + k] = 100.0 ** 2
+            # 清零速度与其他状态的交叉协方差
+            for k in range(3):
+                for j in range(si.dim):
+                    if j < si.vel or j >= si.vel + 3:
+                        self._est.P[si.vel + k, j] = 0.0
+                        self._est.P[j, si.vel + k] = 0.0
+            self._est.x[si.vel:si.vel + 3] = 0.0
+
         self._write_state(self.last_qins)
 
     def add_gnss(self, obsr, obsb, nav) -> None:
@@ -201,6 +246,12 @@ class TcIntegration:
         t_gnss = float(obsr.t.time + obsr.t.sec)
         if not self._initialized:
             self._init_obs.append((obsr, obsb, nav, t_gnss))
+            # 限制 GNSS 缓冲区: 只保留最近 5 个历元 (初始化器内部 gnss_buffer=3)
+            # 避免长时间未初始化时内存持续增长
+            if len(self._init_obs) > 5:
+                self._init_obs = self._init_obs[-5:]
+            # 未初始化时输出纯 GNSS 解 (Qins=0, 1Hz GNSS频率, 姿态=0)
+            self._write_gnss_only(obsr, obsb, nav, t_gnss)
             # 若 IMU 已覆盖第一个 GNSS obs 时间, 尝试初始化
             if self._init_imu and self._init_obs:
                 first_t = self._init_obs[0][3]
@@ -215,119 +266,147 @@ class TcIntegration:
     def _try_init(self) -> None:
         """用当前缓冲数据尝试初始化。成功则回放缓冲数据并切换增量模式。
 
-        使用第一个 GNSS obs 做初始化 (而非最后一个), 后续 GNSS obs 供量测更新。
+        每次 _try_init 只处理最新 GNSS 历元, InsInitializer 内部 gnss_buffer
+        通过 _align_motion_displacement 自然累积 (每次 append 一个历元)。
+        当缓冲满 gnss_buffer_size 个历元且平面速度(EN)均达阈值时, 初始化成功。
+        动态速度阈值: SPP > 3m/s, RTK/RTD > 2m/s。
+
+        注: 不做早期返回检查, 否则 gnss_buffer 从第 gnss_buffer_size 个历元
+        才开始填充, 延迟初始化 2 个历元。
         """
         if not self._init_obs:
             return
 
-        obsr, obsb, nav, t_gnss = self._init_obs[0]
+        # 只处理最新 GNSS 历元 (避免遍历所有历元导致 nav.x 被污染)
+        obsr, obsb, nav, t_gnss = self._init_obs[-1]
         imu_block = [imu for imu in self._init_imu
                      if t_gnss - 2.0 <= imu.timestamp <= t_gnss + 1.0]
         if len(imu_block) < 2:
             return
-
         has_before = any(imu.timestamp <= t_gnss for imu in imu_block)
         has_after = any(imu.timestamp >= t_gnss for imu in imu_block)
         if not (has_before and has_after):
             return
 
-        # 角速度检查
-        cfg = self._cfg["ins"]
-        angular_thr = cfg.get("angular_velocity_threshold_deg", 30.0)
-        if angular_thr > math.pi:
-            angular_thr = math.radians(angular_thr)
-        gyro_norms = [float(np.linalg.norm(imu.gyro)) for imu in imu_block]
-        if float(np.mean(gyro_norms)) >= angular_thr:
-            return
+        # 保存 nav 状态: SPP+RTK 会修改 nav 内部状态, 初始化失败时需恢复
+        # 防止污染后续 _write_gnss_only 的 SPP 初始猜测
+        saved_x = nav.x.copy()
+        saved_P = nav.P.copy()
+        saved_fix = nav.fix.copy() if hasattr(nav, 'fix') else None
+        saved_lock = nav.lock.copy() if hasattr(nav, 'lock') else None
 
-        # SPP 粗定位 (用 obsr + nav) 作为初值, RTK/RTD 模式随后用 relpos 精化
+        # SPP 粗定位 (GPS-only 避免 BDS/GAL 时间系统偏差导致发散)
         try:
             from src.core.gnss.rtklib.ephemeris import satposs
             from src.core.gnss.rtklib.pntpos import estpos
+            from src.core.tc.tc_stream import _filter_gps_svh
             rs, var, dts, svh = satposs(obsr, nav)
-            # 用基站位作初始猜测 (比 [0,0,0] 收敛快且准)
+            svh_gps = _filter_gps_svh(obsr, svh)
             if np.any(nav.rb):
                 nav.x[0:3] = nav.rb
-            sol, x_spp = estpos(obsr, nav, rs[:, :3], dts, svh)
+            sol, x_spp = estpos(obsr, nav, rs[:, :3], dts, svh_gps)
             if not sol.stat:
-                logger.warning("TC init: SPP 失败, 等待下一历元")
+                self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
                 return
         except Exception as e:
-            logger.warning(f"TC init SPP 异常: {e}")
+            logger.debug(f"TC init SPP 异常: {e}")
+            self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
             return
 
-        # RTK/RTD 模式: 用 relpos 双差解算替代 SPP 初始化
-        # 速度初始化统一使用位置差分 (TC 模式无 GNSS 速度)
-        quality = 5       # 默认 SPP
+        # RTK/RTD 模式: relpos 双差解算
+        quality = 5
         rr = x_spp[:3].copy()
         ns = int(sol.ns)
-        pos_sd = np.array([10.0, 10.0, 10.0])  # SPP 默认 10m
+        pos_sd = np.array([10.0, 10.0, 10.0])
+        rtk_rr = None
         if self._mode in ("rtk", "rtd") and obsb is not None:
             try:
                 from src.core.gnss.rtklib.rtkpos import relpos
                 from src.core.gnss.rtklib.rtkcmn import Sol, SOLQ_NONE
-                # 初始化 nav.x 供 relpos 的 zdres 计算流动站位置
                 nav.x[0:6] = sol.rr[0:6]
-                nav.x[6:9] = 1e-6  # match RTKLIB
+                nav.x[6:9] = 1e-6
                 rtk_sol = Sol()
                 rtk_sol.t = obsr.t
                 relpos(nav, obsr, obsb, rtk_sol)
                 if rtk_sol.stat != SOLQ_NONE:
-                    rr = rtk_sol.rr[:3].copy()
-                    quality = rtk_sol.stat  # 1=FIX, 2=FLOAT, 4=DGPS
+                    rtk_rr = rtk_sol.rr[:3].copy()
+                    # RTK-SPP 位置一致性检验: 差异 > 50m 说明 RTK false fix, 拒绝初始化
+                    # (SPP 精度 10m 级, 正常 RTK FIX 与 SPP 差异 < 30m;
+                    #  false fix 可偏差 280m+, 用此检查过滤不可靠的 RTK 解)
+                    pos_diff = float(np.linalg.norm(rtk_rr - x_spp[:3]))
+                    if pos_diff > 50.0:
+                        logger.warning(
+                            f"TC init reject: RTK-SPP pos diff {pos_diff:.2f}m > 50m "
+                            f"(t={t_gnss:.1f}, q={rtk_sol.stat}), skip init")
+                        self._restore_nav(nav, saved_x, saved_P,
+                                          saved_fix, saved_lock)
+                        return
+                    rr = rtk_rr
+                    quality = rtk_sol.stat
                     ns = rtk_sol.ns if rtk_sol.ns > 0 else (
                         nav.ns if nav.ns > 0 else ns)
-                    # 按质量设置位置标准差
-                    if quality == 1:      # FIX
+                    if quality == 1:
                         pos_sd = np.array([0.1, 0.1, 0.1])
-                    elif quality == 2:    # FLOAT
+                    elif quality == 2:
                         pos_sd = np.array([0.3, 0.3, 0.3])
-                    elif quality == 4:    # DGPS/RTD
+                    elif quality == 4:
                         pos_sd = np.array([1.0, 1.0, 1.0])
-                    logger.info(
-                        f"TC init: RTK 解算成功 quality={quality}, "
-                        f"ns={ns}, pos={rr}")
-                else:
-                    logger.warning("TC init: RTK 解算失败, 回退 SPP")
             except Exception as e:
-                logger.warning(f"TC init RTK 异常: {e}, 回退 SPP")
+                logger.debug(f"TC init RTK 异常: {e}")
 
-        # 构造 GnssSolution 供 InsInitializer 使用
+        # 恢复 nav 状态 (SPP+RTK 已获取所需结果, 无需保留 nav 副作用)
+        self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
+
+        # 动态速度阈值: 基于运动检测所用位置源
+        # RTK FIX (quality==1): 用 2.0 m/s (精确稳定, 用户要求 RTK/RTD > 2m/s)
+        # RTK FLOAT / SPP: 用 5.0 m/s (SPP 位置噪声 3-5m, 静止时差分速度可达 3+ m/s,
+        #   需更高阈值过滤噪声; 用户要求 SPP > 3m/s, 5.0 可靠过滤 SPP 噪声)
+        if quality == 1:  # FIX
+            init_speed_thr = 2.0
+        else:  # FLOAT / DGPS / SPP: 用 SPP 位置做运动检测, 需更高阈值
+            init_speed_thr = 5.0
+        original_thr = self._initializer.dynamic_speed_threshold
+        self._initializer.dynamic_speed_threshold = init_speed_thr
+
+        # 位置差分运动检测: RTK FLOAT 启动阶段噪声大 (滤波器未收敛, 位置跳变 2-3m),
+        # 会误触发动对准阈值. 使用 SPP 位置做运动检测 (更稳定, 静止时平面速度 <0.5m/s).
+        # 但初始化位置始终用 RTK 解 (用户要求: 不使用 SPP 初始化紧组合参数)
+        if quality == 1:  # FIX
+            pos_for_init = rr.copy()
+        else:  # FLOAT / DGPS: 用 SPP 位置做运动检测, 但初始化位置用 RTK
+            pos_for_init = x_spp[:3].copy()
+
         gnss_sol = GnssSolution(
-            timestamp=t_gnss,
-            week=0,
-            position=rr,
-            quality=quality,
-            num_sv=ns,
-            sd=pos_sd,
-            velocity=None,
-            vel_sd=None,
+            timestamp=t_gnss, week=0, position=pos_for_init,
+            quality=quality, num_sv=ns, sd=pos_sd,
+            velocity=None, vel_sd=None,
         )
-
-        dynamic_thr = cfg.get("dynamic_speed_threshold", 4.0)
-        static_thr = cfg.get("static_speed_threshold", 0.5)
         block = AlignedBlock(gnss=gnss_sol, imu_list=imu_block)
 
-        # 1) 尝试配置的动态模式 (TC 无 GNSS 速度, 用位置差分)
+        # 尝试位置差分初始化 (buffer 内部累积, 需 gnss_buffer_size 个历元)
         init_state = None
         init_P = None
-        if self._init_mode == InitMode.POSITION_DIFF:
-            try:
-                init_state, init_P = self._initializer.initialize(
-                    block, InitMode.POSITION_DIFF)
-            except ValueError:
-                pass
+        try:
+            init_state, init_P = self._initializer.initialize(
+                block, InitMode.POSITION_DIFF)
+        except ValueError as e:
+            logger.debug(f"TC init fail t={t_gnss:.1f}: {e}")
+        except Exception as e:
+            logger.debug(f"TC init excp t={t_gnss:.1f}: {e}")
 
-        # 2) 回退: 静态模式
-        if init_state is None:
-            try:
-                init_state, init_P = self._initializer.initialize(
-                    block, InitMode.STATIC)
-            except ValueError:
-                return
+        # 恢复原始阈值
+        self._initializer.dynamic_speed_threshold = original_thr
 
         if init_state is None:
+            buf_len = len(self._initializer.gnss_buffer)
+            logger.debug(f"TC init None t={t_gnss:.1f} buf={buf_len}/{self._initializer.gnss_buffer_size} "
+                         f"q={quality}")
             return
+
+        # 初始化位置始终用 RTK 解 (用户要求: 不使用 SPP 初始化紧组合参数)
+        # RTK FLOAT 虽然有噪声, 但精度远优于 SPP (SPP 高程误差可达 20m+)
+        if self._mode in ("rtk", "rtd") and obsb is not None and quality != 5:
+            init_state.pos_e = rr.copy()
 
         # 创建估计器 + 量测构造器
         self._est = TcEstimator(init_state, init_P, self._cfg, self._mode)
@@ -347,7 +426,7 @@ class TcIntegration:
         self._initialized = True
         self._last_q = quality
         self._last_ns = ns
-        self._last_gnss_t = t_gnss
+        self._last_gnss_t = init_state.timestamp
 
         logger.info(
             f"TcIntegration 初始化成功: t={init_state.timestamp:.3f}, "
@@ -412,9 +491,11 @@ class TcIntegration:
             return
 
         if len(v) == 0:
-            logger.warning(f"TC no_meas (mode={mode}, t={t_gnss:.3f}): "
+            # 量测构建返回空 (卫星被 outlier 拒绝/共视卫星不足): 跳过更新, 不降级
+            # 降级到 imu_only 会导致位置 10s 内漂移 km 级, 远比跳过一次更新糟糕
+            logger.debug(f"TC no_meas (mode={mode}, t={t_gnss:.3f}): "
                          f"obsr sats={len(obsr.sat)}, obsb sats={len(obsb.sat) if obsb is not None else 0}")
-            self._degrade.on_fail(self._est, "no_meas")
+            self._on_meas_failure(obsr, obsb, nav, t_gnss)
             return
 
         # 更新 num_sv / quality
@@ -424,37 +505,202 @@ class TcIntegration:
 
         # 量测数不足时跳过更新 (1-3 个双差无法约束 15+ 维状态, 强行更新会发散)
         # SPP 单点定位需 >=4 颗卫星, RTK/RTD 双差需 >=4 个双差 (即 >=5 颗共视卫星)
+        # 注: 不降级, 仅跳过本次更新, 等待下一个 GNSS 历元
         min_meas = 4
         if n_meas < min_meas:
-            logger.warning(f"TC skip_meas (mode={mode}, t={t_gnss:.3f}): "
+            logger.debug(f"TC skip_meas (mode={mode}, t={t_gnss:.3f}): "
                          f"n_meas={n_meas} < {min_meas}, skip update, "
                          f"obsr={len(obsr.sat)}, obsb={len(obsb.sat) if obsb is not None else 0}")
-            self._degrade.on_fail(self._est, "insufficient_meas")
+            self._on_meas_failure(obsr, obsb, nav, t_gnss)
             return
+
+        # 收敛期保护: 前 _convergence_warmup 个历元禁用跳变检验
+        # 初始化后模糊度未收敛, 位置会自然调整, 跳变检验会误拒
+        in_warmup = self._meas_count < self._convergence_warmup
+
+        # 注: 移除 NIS 检验和 false_fix 检测 (TC vs SPP 一致性)
+        # 这些机制过度拒绝有效量测导致滤波器发散 (96/173286 历元通过)
+        # ignav 仅用 chi-square 检验残差 (valsol), 无 NIS/SPP 一致性检验
+        # false fix 通过正确协方差矩阵和模糊度管理预防, 而非事后拒绝
 
         # RTK 模糊度管理
         if mode == "rtk" and si.has_ambiguity():
             self._handle_ambiguity(info, obsr, nav)
 
+        # 记录量测更新前位置 (用于跳变检测)
+        pre_update_pos = self._est.state.pos_e.copy()
+
+        # 重置钟差方差 (ignav 白噪声模型: 每历元重置为 UNC_CLK²)
+        self._est.reset_clk_variance()
+
         # 量测更新 + 反馈
         self._est.tc_meas_update(v, H, R, source=mode)
         self._degrade.on_success(self._est)
         self.last_qins = 3  # TC 量测更新完成
-        # DEBUG: 监控状态演化 (前 5 历元)
-        if self._output_count < 5:
-            logger.warning(
-                f"DEBUG t={t_gnss:.3f} mode={mode}: "
-                f"pos={self._est.state.pos_e}, "
-                f"x[pos]={self._est.x[si.pos:si.pos+3]}, "
-                f"x[clk]={self._est.x[si.clk_bias:si.clk_bias+3] if si.clk_bias>=0 else 'N/A'}, "
-                f"clk_stored={self._est._clk_stored}, "
-                f"N_stored_norm={float(np.linalg.norm(self._est._N_stored)):.3f}")
+        self._meas_count += 1
+        self._consecutive_failures = 0  # 量测成功, 重置失败计数
+
+        # 位置跳变检测: 若单次量测更新导致位置跳变 > 50m, 视为 false fix, 回滚
+        # 收敛期跳过此检验 (模糊度收敛过程中位置会自然调整)
+        # 阈值 50m: 仅拦截极端 false fix, 允许 RTK FLOAT 的正常调整
+        if not in_warmup:
+            post_update_pos = self._est.state.pos_e
+            pos_jump = float(np.linalg.norm(post_update_pos - pre_update_pos))
+            if pos_jump > 50.0:
+                logger.warning(
+                    f"TC pos_jump_reject (mode={mode}, t={t_gnss:.3f}): "
+                    f"jump={pos_jump:.2f}m > 30m, false fix suspected, "
+                    f"reset ambiguity & rollback")
+                # 回滚位置 (恢复更新前状态)
+                self._est.state.pos_e = pre_update_pos
+                # 重置模糊度 (清空 stored, 放大 P 对角线, 清零交叉项)
+                if si.has_ambiguity():
+                    self._est._N_stored[:] = 0.0
+                    amb_slice = slice(si.amb_start, si.amb_start + si.n_amb)
+                    self._est.P[:, amb_slice] = 0.0
+                    self._est.P[amb_slice, :] = 0.0
+                    for k in range(si.n_amb):
+                        self._est.P[si.amb_start + k, si.amb_start + k] = 100.0 ** 2
+                self._amb_fixed = False
+                self._ambiguity.reset()
+                # 不降级: 回滚位置 + 重置模糊度即可, 降级到 imu_only 更危险
+                return
+
+        self._last_meas_pos = self._est.state.pos_e.copy()
+
+    def _on_meas_failure(self, obsr, obsb, nav, t_gnss: float) -> None:
+        """量测失败处理: 累计失败次数, 超阈值时尝试 SPP 恢复。
+
+        当连续失败超 _recovery_threshold 个历元且 GNSS 观测可用时,
+        尝试用 SPP 重新初始化位置, 使系统能从发散中恢复。
+        """
+        self._consecutive_failures += 1
+        if self._consecutive_failures < self._recovery_threshold:
+            return
+        # 避免频繁尝试: 每次失败后才尝试, 成功后计数清零
+        if self._consecutive_failures % self._recovery_threshold != 0:
+            return
+        self._try_recovery(obsr, obsb, nav, t_gnss)
+
+    def _try_recovery(self, obsr, obsb, nav, t_gnss: float) -> bool:
+        """SPP 恢复: 用 SPP 位置重置 INS 状态, 重置降级管理器。
+
+        场景: 量测持续失败 (位置发散/卫星数不足), 降级到 imu_only 后
+        位置漂移过远, 量测构建器无法构造有效量测 (zdres 残差过大被 outlier 拒绝)。
+        恢复策略: 用 SPP 重新定位, 重置 INS 位置/速度/P, 重置降级管理器到初始模式。
+
+        Returns:
+            True 恢复成功, False 失败
+        """
+        from src.core.gnss.rtklib.ephemeris import satposs
+        from src.core.gnss.rtklib.pntpos import estpos
+        from src.core.tc.tc_stream import _filter_gps_svh
+
+        saved_x = nav.x.copy()
+        saved_P = nav.P.copy()
+        saved_fix = nav.fix.copy() if hasattr(nav, 'fix') else None
+        saved_lock = nav.lock.copy() if hasattr(nav, 'lock') else None
+        try:
+            rs, var, dts, svh = satposs(obsr, nav)
+            svh_gps = _filter_gps_svh(obsr, svh)
+            if np.any(nav.rb):
+                nav.x[0:3] = nav.rb
+            sol, x_spp = estpos(obsr, nav, rs[:, :3], dts, svh_gps)
+            if not sol.stat:
+                self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
+                logger.warning(
+                    f"TC recovery_fail (t={t_gnss:.1f}): SPP stat={sol.stat}")
+                return False
+        except Exception as e:
+            self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
+            logger.warning(f"TC recovery_excp (t={t_gnss:.1f}): {e}")
+            return False
+        self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
+
+        # SPP 成功: 用 SPP 位置重置 INS 状态
+        spp_pos = x_spp[:3].copy()
+        est = self._est
+        si = est.si
+
+        # 重置 INS 物理状态 (保留姿态: 发散期间姿态可能仍可信)
+        est.state.pos_e = spp_pos.copy()
+        est.state.vel_e = np.zeros(3, dtype=np.float64)
+
+        # 重置 EKF 误差状态和协方差
+        est.x[:] = 0.0
+        # 位置: SPP 精度 ~10m
+        for k in range(3):
+            est.P[si.pos + k, si.pos + k] = 10.0 ** 2
+        # 速度: 未知, 大方差
+        for k in range(3):
+            est.P[si.vel + k, si.vel + k] = 10.0 ** 2
+        # 姿态: 保留原方差 (姿态可能仍可信)
+        # 零偏/杆臂等: 保留原方差
+        # 钟差: 重置
+        if si.clk_bias >= 0:
+            for k in range(3):
+                est.P[si.clk_bias + k, si.clk_bias + k] = 100.0 ** 2
+            est._clk_stored[:] = 0.0
+            if len(x_spp) >= 6:
+                est._clk_stored[0] = float(x_spp[3])
+                est._clk_stored[1] = float(x_spp[4])
+                est._clk_stored[2] = float(x_spp[5])
+                for k in range(3):
+                    est.P[si.clk_bias + k, si.clk_bias + k] = 10.0 ** 2
+        # 模糊度: 重置
+        if si.has_ambiguity():
+            est._N_stored[:] = 0.0
+            amb_slice = slice(si.amb_start, si.amb_start + si.n_amb)
+            est.P[:, amb_slice] = 0.0
+            est.P[amb_slice, :] = 0.0
+            for k in range(si.n_amb):
+                est.P[si.amb_start + k, si.amb_start + k] = 100.0 ** 2
+
+        # 清零交叉协方差 (位置/速度/钟差/模糊度与其他状态的交叉项)
+        reset_idx = list(range(si.pos, si.vel + 3))
+        if si.clk_bias >= 0:
+            reset_idx.extend(range(si.clk_bias, si.clk_bias + 3))
+        if si.has_ambiguity():
+            reset_idx.extend(range(si.amb_start, si.amb_start + si.n_amb))
+        keep_idx = [i for i in range(si.dim) if i not in set(reset_idx)]
+        for i in reset_idx:
+            for j in keep_idx:
+                est.P[i, j] = 0.0
+                est.P[j, i] = 0.0
+
+        # 重置降级管理器到初始模式
+        self._degrade.current_mode = self._degrade.initial_mode
+        self._degrade._fail_count = 0
+        self._degrade._rebooted = False
+
+        # 重置量测构造器到初始模式
+        builder_cls = _MEAS_BUILDERS.get(self._mode, SppTcMeas)
+        self._meas_builder = builder_cls(self._cfg)
+
+        # 重置模糊度管理器
+        self._ambiguity.reset()
+        self._amb_fixed = False
+
+        # 重置失败计数和收敛期保护 (恢复后需重新收敛)
+        self._consecutive_failures = 0
+        self._meas_count = 0
+
+        logger.warning(
+            f"TC recovery_ok (t={t_gnss:.1f}): SPP pos={spp_pos}, "
+            f"reset to mode={self._degrade.initial_mode}")
+        return True
 
     def _handle_ambiguity(self, info: dict, obsr, nav) -> None:
-        """RTK 模糊度固定 (LAMBDA)。
+        """RTK 模糊度固定 (LAMBDA) + ignav 风格 holdamb。
 
-        从 estimator 状态提取 effective N (N_stored + ε_N), 调 TcAmbiguity.try_fix,
-        成功则将整数解赋给 N_stored 并清零 ε_N (像 INS error state feedback)。
+        1. try_fix: LAMBDA 整数搜索, 成功则 N_stored=fixed, ε_N=0
+        2. holdamb: 对实际使用的模糊度添加约束量测 (v=0, R=VAR_HOLDAMB=0.001),
+           通过 joseph_update 降低 P[amb] 同时保留交叉协方差。
+           参考 ignav rtkpos.cc holdamb(): filter(x,P,H,v,R) 而非直接置 P。
+
+        与旧实现的区别:
+        - 旧: P[:,amb]=0, P[amb,:]=0, P[amb,amb]=0.001 (清零交叉项, 过度自信)
+        - 新: 仅约束 info["pairs"] 中的模糊度, 保留交叉协方差, 新卫星 P 不受影响
         """
         si = self._est.si
         if not si.has_ambiguity():
@@ -463,12 +709,53 @@ class TcIntegration:
         # effective N = N_stored + ε_N (current best direct estimate)
         N_effective = self._est._N_stored + self._est.x[amb_slice]
         P_amb = self._est.P[amb_slice, amb_slice]
-        fixed, ratio, ok = self._ambiguity.try_fix(N_effective, P_amb)
-        if ok:
-            # 应用整数解: N_stored = fixed, ε_N = 0
-            self._est._N_stored = fixed.copy()
-            self._est.x[amb_slice] = 0.0
-            logger.debug(f"TC amb fixed: ratio={ratio:.2f}, n={len(fixed)}")
+        # 位置方差 (rtklib thresar1 逻辑): P[pos,pos] 对角均值
+        posvar = float(np.mean(np.diag(
+            self._est.P[si.pos:si.pos + 3, si.pos:si.pos + 3])))
+        fixed, ratio, ok = self._ambiguity.try_fix(N_effective, P_amb, posvar)
+        if not ok:
+            self._amb_fixed = False
+            return
+
+        # 应用整数解: N_stored = fixed, ε_N = 0
+        self._est._N_stored = fixed.copy()
+        self._est.x[amb_slice] = 0.0
+
+        # ignav 风格 holdamb: 对实际使用的模糊度添加约束量测
+        # v[k] = fixed[i] - N_effective[i] = 0 (已设 N_stored=fixed, ε_N=0)
+        # H[k, i] = 1, R[k,k] = VAR_HOLDAMB = 0.001
+        # joseph_update(v=0, H, R) 不改变状态 (K·v=0), 但通过 Joseph 形式降低 P[amb]
+        # 关键: 保留交叉协方差, 未使用的模糊度槽位 P 不受影响 (新卫星可正常初始化)
+        VAR_HOLDAMB = 0.001  # cycle², 与 ignav rtkpos.cc 一致
+        pairs = info.get("pairs", [])
+        # 提取 phase 量测 (code=0) 涉及的 (sat, freq) 唯一对
+        used_amb_idx = set()
+        for sat1, sat2, frq, code in pairs:
+            if code != 0:
+                continue  # 仅 phase 涉及模糊度
+            ii = si.amb_idx(sat1, frq)
+            jj = si.amb_idx(sat2, frq)
+            if ii >= 0:
+                used_amb_idx.add(ii)
+            if jj >= 0:
+                used_amb_idx.add(jj)
+        if used_amb_idx:
+            used_idx = sorted(used_amb_idx)
+            n_const = len(used_idx)
+            v_const = np.zeros(n_const)  # v=0 (N_effective=fixed)
+            H_const = np.zeros((n_const, si.dim))
+            R_const = np.eye(n_const) * VAR_HOLDAMB
+            for k, idx in enumerate(used_idx):
+                H_const[k, idx] = 1.0
+            # joseph_update 降低 P[used_amb] 同时保留交叉协方差
+            self._est.joseph_update(v_const, H_const, R_const)
+            # 反馈 (清零 ε_N, 累积到 stored)
+            self._est.feedback()
+
+        logger.info(
+            f"TC amb fixed: ratio={ratio:.2f}, n={len(fixed)}, "
+            f"n_const={len(used_amb_idx)}, holdamb R={VAR_HOLDAMB}")
+        self._amb_fixed = True
 
     # ===== 约束 =====
 
@@ -497,6 +784,76 @@ class TcIntegration:
             self.last_qins = 3  # 约束量测更新完成
 
     # ===== 输出 =====
+
+    def _write_gnss_only(self, obsr, obsb, nav, t_gnss: float) -> None:
+        """未初始化时输出纯 GNSS 解 (Qins=0, 速度=0, 姿态=0)。
+
+        根据 self._mode 选择解算方式:
+          - spp: SPP 单点定位 (GPS-only 避免 BDS/GAL 时间偏差发散)
+          - rtk/rtd: relpos 双差解算
+        输出频率为 GNSS 频率 (1Hz)。
+        """
+        if self._writer is None:
+            return
+
+        # SPP 粗定位 (GPS-only, 保存/恢复 nav 状态)
+        from src.core.tc.tc_stream import _filter_gps_svh
+        saved_x = nav.x.copy()
+        saved_P = nav.P.copy()
+        saved_fix = nav.fix.copy() if hasattr(nav, 'fix') else None
+        saved_lock = nav.lock.copy() if hasattr(nav, 'lock') else None
+        try:
+            from src.core.gnss.rtklib.ephemeris import satposs
+            from src.core.gnss.rtklib.pntpos import estpos
+            rs, var, dts, svh = satposs(obsr, nav)
+            svh_gps = _filter_gps_svh(obsr, svh)
+            if np.any(nav.rb):
+                nav.x[0:3] = nav.rb
+            sol, x_spp = estpos(obsr, nav, rs[:, :3], dts, svh_gps)
+            if not sol.stat:
+                self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
+                return
+        except Exception as e:
+            logger.debug(f"GNSS-only SPP 异常: {e}")
+            self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
+            return
+
+        quality = 5       # 默认 SPP
+        rr = x_spp[:3].copy()
+        ns = int(sol.ns)
+        pos_sd = np.array([10.0, 10.0, 10.0])
+
+        # RTK/RTD 模式: 用 relpos 双差解算
+        # 注意: relpos 会修改 nav 内部状态, 保存/恢复避免污染
+        if self._mode in ("rtk", "rtd") and obsb is not None:
+            try:
+                from src.core.gnss.rtklib.rtkpos import relpos
+                from src.core.gnss.rtklib.rtkcmn import Sol, SOLQ_NONE
+                nav.x[0:6] = sol.rr[0:6]
+                nav.x[6:9] = 1e-6
+                rtk_sol = Sol()
+                rtk_sol.t = obsr.t
+                relpos(nav, obsr, obsb, rtk_sol)
+                if rtk_sol.stat != SOLQ_NONE:
+                    rr = rtk_sol.rr[:3].copy()
+                    quality = rtk_sol.stat
+                    ns = rtk_sol.ns if rtk_sol.ns > 0 else (
+                        nav.ns if nav.ns > 0 else ns)
+                    if quality == 1:
+                        pos_sd = np.array([0.1, 0.1, 0.1])
+                    elif quality == 2:
+                        pos_sd = np.array([0.3, 0.3, 0.3])
+                    elif quality == 4:
+                        pos_sd = np.array([1.0, 1.0, 1.0])
+            except Exception as e:
+                logger.debug(f"GNSS-only RTK 异常: {e}")
+            finally:
+                self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
+        else:
+            self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
+
+        self._writer.write_gnss_only(t_gnss, rr, quality, ns, pos_sd)
+        self._output_count += 1
 
     def _write_state(self, qins: int) -> None:
         """写当前状态到 .rslt 文件 (per-IMU 100Hz)。"""

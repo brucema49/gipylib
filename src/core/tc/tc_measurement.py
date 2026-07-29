@@ -354,7 +354,7 @@ class RtkTcMeas(_DdBase):
     def _has_amb(self, si):
         return si.has_ambiguity()
 
-    def build(self, state, obsr, nav, si, x=None, obsb=None):
+    def build(self, state, obsr, nav, si, x=None, obsb=None, P=None):
         """构造 RTK 双差量测。"""
         if obsb is None:
             return np.array([]), np.zeros((0, si.dim)), np.zeros((0, 0)), {}
@@ -390,8 +390,7 @@ class RtkTcMeas(_DdBase):
         # 8. EKF 状态向量 x (含 amb)
         if x is None:
             x = np.zeros(si.dim)
-        # P 用于 ref sat 选择 (可选)
-        P = None   # 由 estimator 提供; verification 时用 None
+        # P 用于 ref sat 选择 (选择非刚 reset 的卫星作参考)
         # 9. 构造双差
         return self._build_dd(nav, x, P, yr, er, yu, eu, sats, els, dt, obsr, si)
 

@@ -250,6 +250,9 @@ class InsInitializer:
         - pitch = 0 (初始化调整.md: 其他姿态角设为 0)
         - roll = 0
 
+        速度阈值检查使用平面速度范数 sqrt(v_E^2 + v_N^2) (不含垂向),
+        与 _align_motion_displacement 保持一致。
+
         Returns:
             (att_rpy, vel_e): 姿态和 ECEF 速度
         """
@@ -257,17 +260,18 @@ class InsInitializer:
             raise ValueError("GNSS 无速度数据, 无法执行速度矢量对准")
 
         vel_e = gnss.velocity.copy()
-        speed = np.linalg.norm(vel_e)
-        if speed < self.dynamic_speed_threshold:
-            raise ValueError(
-                f"GNSS 速度 {speed:.3f} m/s 低于动态速度阈值 "
-                f"{self.dynamic_speed_threshold} m/s"
-            )
-
         # ECEF 速度 → NED 速度 (cal_Ce2n 返回 NED 系: N, E, D)
         lat, lon, _ = ecef2llh(gnss.position)
         C_e_n = cal_Ce2n(lat, lon)
         vel_n = C_e_n @ vel_e  # vel_n[0]=North, vel_n[1]=East, vel_n[2]=Down
+
+        # 平面速度范数 (EN), 不含垂向分量
+        planar_speed = math.sqrt(vel_n[0] ** 2 + vel_n[1] ** 2)
+        if planar_speed < self.dynamic_speed_threshold:
+            raise ValueError(
+                f"GNSS 平面速度 {planar_speed:.3f} m/s 低于动态速度阈值 "
+                f"{self.dynamic_speed_threshold} m/s"
+            )
 
         # 初始化调整.md: yaw = atan2(v_E, v_N), 其他姿态角设为 0
         roll = 0.0
@@ -279,9 +283,11 @@ class InsInitializer:
 
     def _align_motion_displacement(self, gnss: GnssSolution
                                    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """位置差分对准: 3 历元缓冲, 最新两个差分计算速度。
+        """位置差分对准: 3 历元缓冲, 所有相邻历元平面速度(EN)均超阈值才初始化。
 
         参考 gnss_ins_lc_nhc InterpolateGnssVel + MotionAligned。
+        速度阈值检查使用平面速度范数 sqrt(v_E^2 + v_N^2) (不含垂向)。
+        要求缓冲区内所有相邻历元差分得到的平面速度均 >= 阈值, 保证连续运动。
 
         Returns:
             (att_rpy, vel_e) 或 None (缓冲区未满或未达运动阈值)
@@ -291,17 +297,28 @@ class InsInitializer:
         if len(self.gnss_buffer) < self.gnss_buffer_size:
             return None  # 缓冲区未满, 延迟初始化
 
+        # 检查缓冲区内所有相邻历元的平面差分速度均 >= 阈值
+        for i in range(1, len(self.gnss_buffer)):
+            gnss_prev = self.gnss_buffer[i - 1]
+            gnss_curr = self.gnss_buffer[i]
+            dt = gnss_curr.timestamp - gnss_prev.timestamp
+            if dt <= 0:
+                return None
+
+            vel_e = (gnss_curr.position - gnss_prev.position) / dt
+            # ECEF → ENU, 取平面速度 (EN)
+            lat, lon, _ = ecef2llh(gnss_curr.position)
+            C_e2n = cal_Ce2n(lat, lon)
+            vel_n = C_e2n @ vel_e
+            planar_speed = math.sqrt(vel_n[0] ** 2 + vel_n[1] ** 2)  # EN
+            if planar_speed < self.dynamic_speed_threshold:
+                return None  # 某一对相邻历元未达阈值, 继续等待
+
         # 用最新两个历元计算速度
         gnss_prev = self.gnss_buffer[-2]
         gnss_curr = self.gnss_buffer[-1]
         dt = gnss_curr.timestamp - gnss_prev.timestamp
-        if dt <= 0:
-            return None
-
         vel_e = (gnss_curr.position - gnss_prev.position) / dt
-        speed = np.linalg.norm(vel_e)
-        if speed < self.dynamic_speed_threshold:
-            return None  # 未达到动态速度阈值
 
         # 用差分速度走速度矢量对准
         gnss_with_vel = GnssSolution(

@@ -167,6 +167,75 @@ class TransferMatrix:
         # 可选块: F=0 (lever_arm/imu_angle/imu_leverarm/time_sync 均为常数或随机游走)
         return F
 
+    def build_F_ins(self, C_b_e: np.ndarray, f_b: np.ndarray,
+                    w_b_ib: np.ndarray, pos_e: np.ndarray,
+                    n_ins: int) -> np.ndarray:
+        """仅构建 INS 块 F 矩阵 (n_ins × n_ins), 性能优化用。
+
+        GNSS 块 (clk_bias/ambiguity) F=0, 无需构建全 n×n 矩阵。
+        """
+        F = np.zeros((n_ins, n_ins), dtype=np.float64)
+        F[0:3, 3:6] = np.eye(3)
+
+        ge = gravity_ecef(pos_e)
+        lat, _, _ = ecef2llh(pos_e)
+        re = georadi(lat)
+        pos_norm = np.linalg.norm(pos_e)
+        if pos_norm > 1.0:
+            F[3:6, 0:3] = -2.0 / (re * pos_norm) * np.outer(ge, pos_e)
+
+        F[3:6, 3:6] = -2.0 * skew(self.w_ie_e)
+        f_e = C_b_e @ f_b
+        F[3:6, 6:9] = -skew(f_e)
+        F[3:6, 12:15] = C_b_e
+        F[6:9, 6:9] = -skew(self.w_ie_e)
+        F[6:9, 9:12] = C_b_e
+        F[9:12, 9:12] = -np.eye(3) / self.tau_gyro
+        F[12:15, 12:15] = -np.eye(3) / self.tau_acce
+        return F
+
+    def build_Q_ins(self, dt: float, C_b_e: np.ndarray,
+                     n_ins: int) -> np.ndarray:
+        """仅构建 INS 块 Q 矩阵 (n_ins × n_ins), 性能优化用。
+
+        GNSS 块 Q=0 (ambiguity 随机游走 Q=0, clk 白噪声单独处理)。
+        """
+        si = self.si
+        G = np.zeros((n_ins, 15), dtype=np.float64)
+        G[0:3, 0:3] = np.eye(3)
+        G[6:9, 6:9] = C_b_e
+        G[3:6, 3:6] = C_b_e
+        G[9:12, 9:12] = np.eye(3)
+        G[12:15, 12:15] = np.eye(3)
+
+        Q_diag = np.zeros((15, 15), dtype=np.float64)
+        Q_diag[0:3, 0:3] = np.diag([self.pos_psd * dt] * 3)
+        Q_diag[3:6, 3:6] = np.diag([self.accel_psd * dt] * 3)
+        Q_diag[6:9, 6:9] = np.diag([self.gyro_psd * dt] * 3)
+        Q_diag[9:12, 9:12] = np.diag([self.gyro_bias_psd * dt] * 3)
+        Q_diag[12:15, 12:15] = np.diag([self.acce_bias_psd * dt] * 3)
+
+        Q = G @ Q_diag @ G.T
+
+        # 可选块 Q (仅在 n_ins 范围内)
+        if si.has_lever_arm() and self.lever_arm_psd > 0.0:
+            i = si.lever_arm
+            if i + 3 <= n_ins:
+                Q[i:i+3, i:i+3] = np.diag([self.lever_arm_psd * dt] * 3)
+        if si.has_imu_angle():
+            i = si.imu_angle
+            if i + 2 <= n_ins:
+                Q[i:i+2, i:i+2] = np.diag([self.imu_angle_psd * dt] * 2)
+        if si.has_imu_leverarm():
+            i = si.imu_leverarm
+            if i + 3 <= n_ins:
+                Q[i:i+3, i:i+3] = np.diag([self.imu_leverarm_psd * dt] * 3)
+        if si.has_time_sync():
+            i = si.time_sync
+            if i < n_ins:
+                Q[i, i] = self.time_sync_psd * dt
+        return Q
+
     def build_Phi(self, F: np.ndarray, dt: float) -> np.ndarray:
         """离散化: 自适应精度 (对齐 ignav precPhi)。
 

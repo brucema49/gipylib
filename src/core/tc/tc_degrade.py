@@ -1,11 +1,16 @@
 """紧组合降级管理器 (简化版)。
 
-降级链: rtk → rtd → spp → imu_only
+降级链: rtk → rtd → spp (不到 imu_only, SPP 总能提供位置约束)
 恢复策略: direct (GNSS 恢复立即回初始配置模式)
 reboot: 持续无 GNSS > reboot_threshold → reboot(keep_random_walk=True)
+
+注: 不降级到 imu_only。imu_only 模式下位置 10s 内漂移 km 级,
+远比 SPP 精度差 (SPP ~10m)。卫星数不足时由 tc_integration 跳过量测更新,
+不触发降级。
 """
 
-_DEGRADE_CHAIN = {"rtk": "rtd", "rtd": "spp", "spp": "imu_only", "imu_only": "imu_only"}
+# 降级链: 最低到 spp (不到 imu_only, 避免 IMU 单独漂移)
+_DEGRADE_CHAIN = {"rtk": "rtd", "rtd": "spp", "spp": "spp"}
 
 
 class TcDegradeManager:

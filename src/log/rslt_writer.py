@@ -140,6 +140,59 @@ class RSLTWriter(WriterBase):
             sdroll, sdpitch, sdyaw,
         ))
 
+    def write_gnss_only(self, timestamp: float, pos_e: np.ndarray,
+                        q: int, num_sv: int, pos_sd: np.ndarray = None) -> None:
+        """未初始化时输出纯 GNSS 解 (Qins=0, 速度=0, 姿态=0)。
+
+        Args:
+            timestamp: Unix 时间戳 (s)
+            pos_e: ECEF 位置 [3] (m)
+            q: GNSS quality (1/2/4/5)
+            num_sv: 卫星数
+            pos_sd: 位置标准差 [3] ECEF (m), 默认 10m
+        """
+        if self._fp is None:
+            raise RuntimeError("RSLTWriter not opened")
+        if pos_sd is None:
+            pos_sd = np.array([10.0, 10.0, 10.0])
+
+        week, sow = unix_to_gpst(timestamp)
+        D2R = np.pi / 180.0
+
+        llh = ecef2llh(pos_e)
+        lat_deg = llh[0] / D2R
+        lon_deg = llh[1] / D2R
+        h = llh[2]
+
+        # 位置 sd: ECEF → ENU
+        R = ecef2enu_matrix(llh)
+        Pp = np.diag(pos_sd ** 2)
+        cov_enu = R @ Pp @ R.T
+        sdn = float(np.sqrt(abs(cov_enu[1, 1])))
+        sde = float(np.sqrt(abs(cov_enu[0, 0])))
+        sdu = float(np.sqrt(abs(cov_enu[2, 2])))
+        sdne = _signed_sqrt(float(cov_enu[0, 1]))
+        sdeu = _signed_sqrt(float(cov_enu[2, 0]))
+        sdun = _signed_sqrt(float(cov_enu[1, 2]))
+
+        fmt = (
+            "%4d %10.3f %14.9f %14.9f %10.4f %3d %3d %3d"
+            " %9.4f %9.4f %9.4f %9.4f %9.4f %9.4f %6.2f %6.1f"
+            " %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f"
+            " %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f\n"
+        )
+        # Qins=0, 速度=0, 姿态=0, sd=0
+        self._fp.write(fmt % (
+            week, sow,
+            lat_deg, lon_deg, h,
+            q, 0, num_sv,   # Qins=0 (未初始化)
+            sdn, sde, sdu, sdne, sdeu, sdun, 0.0, 0.0,
+            0.0, 0.0, 0.0,   # 速度=0
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # 速度 sd=0
+            0.0, 0.0, 0.0,   # 姿态=0
+            0.0, 0.0, 0.0,   # 姿态 sd=0
+        ))
+
     def close(self) -> None:
         if self._fp is not None and not self._closed:
             self._fp.close()

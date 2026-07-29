@@ -21,6 +21,25 @@ from src.core.ins.state_index import StateIndex
 from src.core.tc.tc_state_index import TcStateIndex
 
 
+def _expm_small(A: np.ndarray, order: int = 10) -> np.ndarray:
+    """小矩阵指数 (scaling-and-squaring + Taylor 级数, 不依赖 scipy)。
+
+    供 time_update 分块优化使用 (仅 INS 块, 维度 ≤ 25)。
+    """
+    n = A.shape[0]
+    norm = float(np.linalg.norm(A, np.inf))
+    s = int(np.ceil(np.log2(norm))) if norm > 1.0 else 0
+    A_scaled = A / (2.0 ** s)
+    result = np.eye(n, dtype=np.float64)
+    term = np.eye(n, dtype=np.float64)
+    for k in range(1, order + 1):
+        term = term @ A_scaled / k
+        result += term
+    for _ in range(s):
+        result = result @ result
+    return result
+
+
 class TcEstimator(LcEstimator):
     """紧组合 EKF 估计器。"""
 
@@ -78,13 +97,77 @@ class TcEstimator(LcEstimator):
         return x
 
     def time_update(self, imu):
-        """父类 INS 传播 + 钟差随机游走。"""
+        """父类 INS 传播 + 钟差白噪声 (参考 ignav propP: 每历元重置方差)。
+
+        性能优化: 利用块结构 (INS 块 + GNSS 块) 避免全 n×n 矩阵乘法。
+        - F 非零仅 INS 块 (前 _gnss_base 维), GNSS 块 F=0 → Phi_GNSS=I
+        - Q 非零仅 INS 块, GNSS 块 Q=0 (ambiguity 随机游走 Q=0, clk 白噪声单独处理)
+        - P 传播分块:
+          P_INS = Phi_INS @ (P_INS + 0.5*Q_INS) @ Phi_INS.T + 0.5*Q_INS
+          P_INS_GNSS = Phi_INS @ P_INS_GNSS  (交叉项, 仅左乘)
+          P_GNSS_GNSS 不变 (Phi=I, Q=0)
+        复杂度从 O(n³) 降到 O(n_INS²·n_GNSS + n_INS³), n=354 时约 500x 加速。
+        """
         prev_ts = self.ins_update._prev_timestamp
-        super().time_update(imu)
+        self.ins_update.update(imu)
+
         dt = imu.timestamp - prev_ts
-        if dt > 0 and self.si.clk_bias >= 0:
+        if dt <= 0.0:
+            return
+
+        si = self.si
+        n_ins = si._gnss_base  # INS + 可选块维度 (clk/amb 之前)
+        n_total = si.dim
+
+        C_b_e = self.ins_update.state.C_b_e
+        f_b = self.ins_update.f_b
+        w_b_ib = self.ins_update.w_b_ib
+        pos_e = self.ins_update.state.pos_e
+
+        # 仅构建 INS 块的 F/Phi/Q (n_ins × n_ins), 避免全 n×n 矩阵
+        F_ins = self.tm.build_F_ins(C_b_e, f_b, w_b_ib, pos_e, n_ins)
+        Fdt = F_ins * dt
+        if dt <= 0.005:
+            Phi_ins = np.eye(n_ins, dtype=np.float64) + Fdt
+        elif dt <= 0.01:
+            Phi_ins = np.eye(n_ins, dtype=np.float64) + Fdt + 0.5 * (Fdt @ Fdt)
+        else:
+            Phi_ins = _expm_small(Fdt)
+
+        Q_ins = self.tm.build_Q_ins(dt, C_b_e, n_ins)
+
+        # 分块传播 P
+        if n_total == n_ins:
+            # 无 GNSS 块
+            P0 = self.P + 0.5 * Q_ins
+            self.P = Phi_ins @ P0 @ Phi_ins.T + 0.5 * Q_ins
+        else:
+            # 分块: P = [P_INS, P_cross; P_cross.T, P_GNSS]
+            P_INS = self.P[:n_ins, :n_ins]
+            P_cross = self.P[:n_ins, n_ins:]
+
+            P0_INS = P_INS + 0.5 * Q_ins
+            new_P_INS = Phi_ins @ P0_INS @ Phi_ins.T + 0.5 * Q_ins
+            new_P_cross = Phi_ins @ P_cross  # 仅左乘
+
+            self.P[:n_ins, :n_ins] = new_P_INS
+            self.P[:n_ins, n_ins:] = new_P_cross
+            self.P[n_ins:, :n_ins] = new_P_cross.T
+            # P_GNSS 不变 (Phi=I, Q=0)
+
+        self.P = 0.5 * (self.P + self.P.T)
+        # 钟差按白噪声处理: 不在 IMU 时间更新中累积方差
+        # 在 tc_meas_update 前重置钟差方差 (ignav propP initP(irc,...,UNC_CLK))
+
+    def reset_clk_variance(self):
+        """重置钟差方差 (每个 GNSS 历元前调用, 参考 ignav propP 的 initP(irc,...,UNC_CLK))。
+
+        ignav 将钟差视为白噪声: 每个历元方差重置为 UNC_CLK² = 10000.0,
+        使 KF 对钟差有高增益, 防止钟差误差累积导致发散。
+        """
+        if self.si.clk_bias >= 0:
             for k in range(3):
-                self.P[self.si.clk_bias + k, self.si.clk_bias + k] += self._clk_q * dt
+                self.P[self.si.clk_bias + k, self.si.clk_bias + k] = 100.0 ** 2
 
     def tc_meas_update(self, v, H, R, source: str = ""):
         """GNSS 量测更新 (调 joseph_update + feedback)。"""

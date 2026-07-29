@@ -19,7 +19,7 @@ class TcAmbiguity:
     不依赖 rtklib 全局 nav.x/P 状态。
     """
 
-    def __init__(self, thresar: float = 3.0, thresar_var: float = 0.1,
+    def __init__(self, thresar: float = 3.0, thresar_var: float = 0.5,
                  hold_count: int = 10):
         self.thresar = thresar
         self.thresar_var = thresar_var
@@ -28,12 +28,15 @@ class TcAmbiguity:
         self._hold_count = 0
         self._is_holding = False
 
-    def try_fix(self, x_amb: np.ndarray, P_amb: np.ndarray):
+    def try_fix(self, x_amb: np.ndarray, P_amb: np.ndarray,
+                posvar: float = 0.0):
         """尝试 LAMBDA 固定。
 
         Args:
             x_amb: 浮点模糊度 (n,)
             P_amb: 模糊度协方差 (n, n)
+            posvar: 位置方差 (P[pos,pos] 对角均值), 超阈值时跳过 AR
+                    (rtklib thresar1 逻辑: 检查位置方差而非模糊度方差)
 
         Returns:
             (fixed[n], ratio, ok: bool)
@@ -44,8 +47,8 @@ class TcAmbiguity:
         n = len(x_amb)
         if n == 0:
             return np.array([]), 0.0, False
-        # P 过大跳过 (rtklib thresar1 逻辑)
-        posvar = float(np.mean(np.diag(P_amb)))
+        # 位置方差过大跳过 AR (rtklib thresar1 逻辑)
+        # 注: 检查位置方差而非模糊度方差, 与 rtklib manage_amb_LAMBDA 一致
         if posvar > self.thresar_var:
             return np.array([]), 0.0, False
         afix, s = mlambda(x_amb, P_amb, m=2)
