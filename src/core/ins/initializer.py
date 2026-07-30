@@ -415,7 +415,10 @@ class InsInitializer:
         可选块按 StateIndex 位置填充: lever_arm(3), imu_angle(2),
         imu_leverarm(3), time_sync(1)
 
-        Note: mode 参数保留用于未来按模式调整协方差。
+        Note: yaw 不确定度按对准模式调整: roll/pitch 可从加速度计调平获得
+        (精度 ~0.3°), 但 yaw 在静态对准时不可观测 (设 pi), 在动态对准时
+        取决于 GNSS 速度/位置精度 (velocity_vector ~0.3 rad, position_diff ~1.0 rad)。
+        若使用过小的 yaw std, 滤波器无法纠正初始 yaw 误差, 导致位置发散振荡。
         """
         ins_cfg = self.config.get("ins", {})
         si = StateIndex.from_config(self.config)
@@ -430,6 +433,14 @@ class InsInitializer:
         att_std = np.array(ins_cfg.get("initial_att_std_si",
                                        [0.00524, 0.00524, 0.00524]),
                            dtype=np.float64)
+        # yaw 不确定度按对准模式调整: roll/pitch 由加速度计调平 (config 值合理),
+        # yaw 在静态对准不可观测 (pi rad), 动态对准取决于 GNSS 精度
+        if mode == InitMode.STATIC:
+            att_std[2] = math.pi          # yaw 完全未知
+        elif mode == InitMode.VELOCITY_VECTOR:
+            att_std[2] = 0.3              # ~17 deg (GNSS 速度精度依赖)
+        elif mode == InitMode.POSITION_DIFF:
+            att_std[2] = 1.0              # ~57 deg (位置差分精度差)
         gyro_bias_std = np.array(ins_cfg.get("gyro_bias_std_si",
                                              [2.424e-5, 2.424e-5, 2.424e-5]),
                                  dtype=np.float64)

@@ -97,7 +97,10 @@ def rescode(iter, obs, nav, rs, dts, svh, x):
             freq = gn.sat2freq(obs.sat[i], 0, nav)
             dion *= (nav.freq[0] / freq)**2
             # tropospheric correction
-            trop_hs, trop_wet, _ = tropmodel(obs.t, pos, el, REL_HUMI)
+            # tropmodel with actual el returns slant delay (already contains
+            # 1/sin(el) via 1/cos(z)); use el=90deg to get zenith delay, then
+            # apply NMF mapping, to avoid double-counting elevation dependence.
+            trop_hs, trop_wet, _ = tropmodel(obs.t, pos, np.deg2rad(90.0), REL_HUMI)
             mapfh, mapfw = tropmapf(obs.t, pos, el)
             dtrp = mapfh * trop_hs + mapfw * trop_wet
         else:

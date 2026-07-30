@@ -23,7 +23,6 @@
 """
 import collections
 import logging
-import math
 from typing import Optional, List
 
 import numpy as np
@@ -67,6 +66,7 @@ class TcIntegration:
         self.zaru_enable = int(ins_cfg.get("zaru_enable", 0))
         self._nhc_counter = _DecimationCounter(
             int(ins_cfg.get("nhc_decimation", 1)))
+        self._nhc_warmup = int(ins_cfg.get("nhc_warmup", 30))
         self._zupt_counter = _DecimationCounter(
             int(ins_cfg.get("zupt_min_count", 15)))
         self._zaru_counter = _DecimationCounter(
@@ -136,7 +136,14 @@ class TcIntegration:
 
     @staticmethod
     def _select_init_mode(config: dict) -> InitMode:
-        """TC 模式无 GNSS 速度, 速度初始化统一使用位置差分。"""
+        """TC 模式初始化模式选择: 动态位置差分。
+
+        静态初始化 yaw=0 在本数据集 (EuRoC) 上错误: truth yaw≈290° at t=0,
+        290° 初始误差违反 EKF 小角度假设, yaw 永远无法收敛。
+        改用 POSITION_DIFF: 等车辆运动 (速度>阈值) 后用速度方向计算 yaw,
+        与 ignav 参考一致 (t+730s 初始化, yaw 误差仅 ~5°)。
+        无人机起飞/巡航阶段速度方向≈yaw, 仅纯侧飞时偏差大 (占比低)。
+        """
         return InitMode.POSITION_DIFF
 
     @staticmethod
@@ -171,7 +178,7 @@ class TcIntegration:
             self._write_state(self.last_qins)
             return
 
-        self.last_qins = 2  # 默认: 仅机械编排 + 协方差传播
+        self.last_qins = 2  # 默认: 仅机械编排 + 协差variance propagation
 
         cur = self.imucur
 
@@ -359,12 +366,12 @@ class TcIntegration:
 
         # 动态速度阈值: 基于运动检测所用位置源
         # RTK FIX (quality==1): 用 2.0 m/s (精确稳定, 用户要求 RTK/RTD > 2m/s)
-        # RTK FLOAT / SPP: 用 5.0 m/s (SPP 位置噪声 3-5m, 静止时差分速度可达 3+ m/s,
-        #   需更高阈值过滤噪声; 用户要求 SPP > 3m/s, 5.0 可靠过滤 SPP 噪声)
+        # RTK FLOAT / SPP: 用 3.0 m/s (SPP 位置噪声 3-5m, 但 5.0 导致初始化延迟到 t+730s;
+        #   降至 3.0 提前初始化, SPP 噪声通过 gnss_buffer 多历元平滑过滤)
         if quality == 1:  # FIX
             init_speed_thr = 2.0
-        else:  # FLOAT / DGPS / SPP: 用 SPP 位置做运动检测, 需更高阈值
-            init_speed_thr = 5.0
+        else:  # FLOAT / DGPS / SPP: 用 SPP 位置做运动检测
+            init_speed_thr = 3.0
         original_thr = self._initializer.dynamic_speed_threshold
         self._initializer.dynamic_speed_threshold = init_speed_thr
 
@@ -383,12 +390,12 @@ class TcIntegration:
         )
         block = AlignedBlock(gnss=gnss_sol, imu_list=imu_block)
 
-        # 尝试位置差分初始化 (buffer 内部累积, 需 gnss_buffer_size 个历元)
+        # 尝试初始化 (static 模式: yaw=0, 与 truth 一致; position_diff: 速度方向→yaw)
         init_state = None
         init_P = None
         try:
             init_state, init_P = self._initializer.initialize(
-                block, InitMode.POSITION_DIFF)
+                block, self._init_mode)
         except ValueError as e:
             logger.debug(f"TC init fail t={t_gnss:.1f}: {e}")
         except Exception as e:
@@ -471,9 +478,12 @@ class TcIntegration:
             t_gnss: GNSS 时间戳
         """
         si = self._est.si
+        # 重置钟差为白噪声模型 (必须在 effective_x/build 之前)
+        # 这样 innovation 用 clk=0 计算, KF 每历元独立估计钟差,
+        # 避免 SPP 初始化的 (pos,clk) 自洽性导致位置误差被钟差吸收
+        self._est.reset_clk_variance()
         # 构造 effective_x: amb/clk 部分用 effective (stored + error)
-        # 这样 build 用 current direct estimate (N_stored+ε_N) 构造 v,
-        # 而 joseph_update 用 self.x (error state) 计算 H @ self.x (estimated error).
+        # 此时 clk_stored=0, x[clk]=0, 故 effective clk=0
         x = self._est.effective_x()
         mode = self._degrade.current_mode
 
@@ -491,26 +501,36 @@ class TcIntegration:
             return
 
         if len(v) == 0:
-            # 量测构建返回空 (卫星被 outlier 拒绝/共视卫星不足): 跳过更新, 不降级
-            # 降级到 imu_only 会导致位置 10s 内漂移 km 级, 远比跳过一次更新糟糕
+            # 量测构建返回空 (卫星被 outlier 拒绝/共视卫星不足):
+            # 用 SPP 3D 位置做 fallback 位置更新, 防止 INS 自由漂移
             logger.debug(f"TC no_meas (mode={mode}, t={t_gnss:.3f}): "
                          f"obsr sats={len(obsr.sat)}, obsb sats={len(obsb.sat) if obsb is not None else 0}")
+            if self._spp_fallback_update(obsr, obsb, nav, t_gnss):
+                return
             self._on_meas_failure(obsr, obsb, nav, t_gnss)
             return
 
         # 更新 num_sv / quality
         n_meas = info.get("n", len(v))
         self._last_ns = n_meas
-        self._last_q = 5 if mode == "spp" else (1 if mode == "rtk" else 4)
+        # Q 值: SPP=5, RTD=4, RTK FIX=1, RTK FLOAT=2
+        # armode=0 (无模糊度解算) 时 _amb_fixed 始终为 False → Q=2 (FLOAT)
+        if mode == "spp":
+            self._last_q = 5
+        elif mode == "rtk":
+            self._last_q = 1 if self._amb_fixed else 2
+        else:  # rtd
+            self._last_q = 4
 
-        # 量测数不足时跳过更新 (1-3 个双差无法约束 15+ 维状态, 强行更新会发散)
-        # SPP 单点定位需 >=4 颗卫星, RTK/RTD 双差需 >=4 个双差 (即 >=5 颗共视卫星)
-        # 注: 不降级, 仅跳过本次更新, 等待下一个 GNSS 历元
+        # 量测数不足时用 SPP 位置 fallback (防止 INS 自由漂移)
+        # 1-3 个伪距无法约束 15+ 维状态, 但 SPP 最小二乘能解算 3D 位置
         min_meas = 4
         if n_meas < min_meas:
             logger.debug(f"TC skip_meas (mode={mode}, t={t_gnss:.3f}): "
-                         f"n_meas={n_meas} < {min_meas}, skip update, "
+                         f"n_meas={n_meas} < {min_meas}, try SPP fallback, "
                          f"obsr={len(obsr.sat)}, obsb={len(obsb.sat) if obsb is not None else 0}")
+            if self._spp_fallback_update(obsr, obsb, nav, t_gnss):
+                return
             self._on_meas_failure(obsr, obsb, nav, t_gnss)
             return
 
@@ -530,10 +550,7 @@ class TcIntegration:
         # 记录量测更新前位置 (用于跳变检测)
         pre_update_pos = self._est.state.pos_e.copy()
 
-        # 重置钟差方差 (ignav 白噪声模型: 每历元重置为 UNC_CLK²)
-        self._est.reset_clk_variance()
-
-        # 量测更新 + 反馈
+        # 量测更新 + 反馈 (钟差已在 _trigger_meas 开头重置)
         self._est.tc_meas_update(v, H, R, source=mode)
         self._degrade.on_success(self._est)
         self.last_qins = 3  # TC 量测更新完成
@@ -567,6 +584,67 @@ class TcIntegration:
                 return
 
         self._last_meas_pos = self._est.state.pos_e.copy()
+
+    def _spp_fallback_update(self, obsr, obsb, nav, t_gnss: float) -> bool:
+        """SPP 3D 位置 fallback: 当 TC 量测失败时用 SPP 位置约束 INS。
+
+        场景: 卫星数不足 (<4 颗 GPS) 或残差超阈值被 outlier 拒绝时,
+        TC 量测被跳过。INS 自由积分会导致垂直通道快速发散 (Schuler 不稳定)。
+        SPP 最小二乘能正确处理 (pos, clk) 相关性, 即便几何差, 3D 位置
+        精度 (~20m) 仍远优于纯 INS 漂移 (可达 50m+/30s)。
+
+        策略: 用 SPP 位置做 LC 风格位置量测更新 (仅 pos 3 维, H=I),
+        sigma 自适应: ns>=6 用 20m, ns<6 用 30m (几何差时增大 R 降低 K)。
+        不更新速度/姿态/钟差/模糊度 (H 对应列为 0)。
+        """
+        from src.core.gnss.rtklib.ephemeris import satposs
+        from src.core.gnss.rtklib.pntpos import estpos
+        from src.core.tc.tc_stream import _filter_gps_svh
+
+        saved_x = nav.x.copy()
+        saved_P = nav.P.copy()
+        saved_fix = nav.fix.copy() if hasattr(nav, 'fix') else None
+        saved_lock = nav.lock.copy() if hasattr(nav, 'lock') else None
+        try:
+            rs, var, dts, svh = satposs(obsr, nav)
+            svh_gps = _filter_gps_svh(obsr, svh)
+            if np.any(nav.rb):
+                nav.x[0:3] = nav.rb
+            sol, x_spp = estpos(obsr, nav, rs[:, :3], dts, svh_gps)
+            if not sol.stat:
+                self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
+                return False
+        except Exception as e:
+            self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
+            logger.debug(f"SPP fallback fail (t={t_gnss:.1f}): {e}")
+            return False
+        self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
+
+        spp_pos = x_spp[:3].copy()
+        est = self._est
+        si = est.si
+
+        # 位置 innovation: Z = predicted - observed = state.pos - spp_pos
+        Z = est.state.pos_e - spp_pos
+        H = np.zeros((3, si.dim), dtype=np.float64)
+        H[:, si.pos:si.pos + 3] = np.eye(3)
+        # SPP sigma 自适应: 卫星少时增大 (几何差)
+        n_gps = int(sol.ns) if sol.ns > 0 else 4
+        sigma_spp = 20.0 if n_gps >= 6 else 30.0
+        R = np.diag([sigma_spp ** 2] * 3).astype(np.float64)
+
+        est.joseph_update(Z, H, R)
+        est.feedback()
+
+        self._last_q = 5        # SPP
+        self._last_ns = n_gps
+        self.last_qins = 3      # 量测更新完成
+        self._meas_count += 1
+        self._consecutive_failures = 0
+        logger.debug(
+            f"SPP fallback (t={t_gnss:.3f}): ns={n_gps}, "
+            f"pos_innov={float(np.linalg.norm(Z)):.2f}m, sigma={sigma_spp}")
+        return True
 
     def _on_meas_failure(self, obsr, obsb, nav, t_gnss: float) -> None:
         """量测失败处理: 累计失败次数, 超阈值时尝试 SPP 恢复。
@@ -775,7 +853,8 @@ class TcIntegration:
             if self.zaru_enable and self._zaru_counter.should_trigger():
                 if self._constraints.zaru(self._est, imu):
                     applied = True
-        elif self.nhc_enable and self._nhc_counter.should_trigger():
+        elif (self.nhc_enable and self._nhc_counter.should_trigger()
+              and self._meas_count >= self._nhc_warmup):
             if self._constraints.nhc(self._est, imu):
                 applied = True
 

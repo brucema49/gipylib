@@ -54,7 +54,13 @@ class SppTcMeas(TcMeasurement):
 
     v[i] = P[i] - h(est) = P - (rho + dtr - c*dts + dion + dtrp)
     H[pos:pos+3, i] = +LOS[i]     (= ∂pred/∂δr = -∂pred/∂pos, 与 GINav 一致)
-    H[clk_bias + sys_off, i] = 1.0 (= ∂pred/∂clk, 直接状态)
+    H[clk_bias, i] = 1.0          (= ∂pred/∂clk_base, GPS 公共钟差, 所有卫星)
+    H[clk_bias + sys_off, i] = 1.0 (= ∂pred/∂inter_sys_bias, 仅非 GPS 卫星)
+
+    钟差模型 (与 GINav rescode_sppins.m:47-62 / rtklib-py pntpos.py:113-126 一致):
+      GPS:  dtr = x[clk_bias+0]
+      BDS:  dtr = x[clk_bias+0] + x[clk_bias+1]
+      GAL:  dtr = x[clk_bias+0] + x[clk_bias+2]
     """
 
     def __init__(self, config: dict):
@@ -66,14 +72,26 @@ class SppTcMeas(TcMeasurement):
         # spp_varerr 返回 ~0.004m (仅用于最小二乘加权), 不适合 EKF 量测噪声.
         # 实际 SPP 伪距噪声含电离层/对流层残差 + 多径, sigma ≈ 3-5m.
         self._spp_sigma = float(gnss.get("tc_spp_sigma", 3.0))
+        # Doppler 量测噪声 sigma [m/s] (含钟漂残差 + 热噪声 + 多径)
+        # TC 模式无独立钟漂状态, 钟漂 (<0.3 m/s) 吸收到 R 中
+        self._doppler_sigma = float(gnss.get("tc_doppler_sigma", 0.3))
+        # 粗差拒绝阈值 (防止异常值通过交叉协方差 corrupt yaw)
+        self._max_code = float(gnss.get("maxcode", 30.0))
+        self._max_doppler = 10.0  # m/s
 
     def build(self, state, obsr, nav, si, x=None, obsb=None):
         """构造 SPP 伪距量测 (innovation: P - h(est))。
 
         h(est) = r + dtr_est - c*dts + dion + dtrp
         其中 dtr_est = effective_x[clk_bias + sys_off] (stored + ε_clk)。
+
+        注: 仅使用 GPS 卫星, 与 GPS-only SPP 初始化 (tc_integration._try_init 中
+        _filter_gps_svh) 一致。rtklib-py 不能正确处理本数据集 BDS/GAL 观测
+        (BDS 周数 +1356 修复后残差仍 ~km 量级), inter-system bias 状态虽建模
+        但初始化未估计, 残差会拉偏位置导致发散。
         """
         rr = state.pos_e
+        vr = state.vel_e
         pos = ecef2pos(rr)
         rs, var, dts, svh = satposs(obsr, nav)
         n = len(obsr.sat)
@@ -84,6 +102,10 @@ class SppTcMeas(TcMeasurement):
             i = int(i)
             sat = obsr.sat[i]
             if svh[i] != 0:
+                continue
+            # 仅使用 GPS 卫星, 与 GPS-only SPP 初始化一致
+            sys, _ = sat2prn(sat)
+            if sys != uGNSS.GPS:
                 continue
             r, e = geodist(rs[i, :3], rr)
             if r <= 0.0:
@@ -106,27 +128,67 @@ class SppTcMeas(TcMeasurement):
             mapfh, mapfw = tropmapf(obsr.t, pos, el)
             dtrp = mapfh * trop_hs + mapfw * trop_wet
             # 钟差估计值 (从 effective_x 取 = stored + ε_clk)
+            # 模型 (与 GINav rescode_sppins.m:47-62 / rtklib-py pntpos.py:113-126 一致):
+            #   GPS:  dtr = x[clk_bias+0]                    (common receiver clock)
+            #   BDS:  dtr = x[clk_bias+0] + x[clk_bias+1]     (clock + inter-system bias)
+            #   GAL:  dtr = x[clk_bias+0] + x[clk_bias+2]     (clock + inter-system bias)
             sys_off = self._sys_clk_offset(sat)
             dtr_est = 0.0
             if x is not None and si.clk_bias >= 0:
-                dtr_est = float(x[si.clk_bias + sys_off])
+                dtr_est = float(x[si.clk_bias])          # GPS clock base (always)
+                if sys_off != 0:
+                    dtr_est += float(x[si.clk_bias + sys_off])  # inter-system bias
             # 残差 (innovation: P - h(est), 与 GINav/GREAT-MSF 一致)
             rho = r + dtrp + dion
             v_i = P - (rho + dtr_est - rCST.CLIGHT * dts[i])
-            # H 行: H[pos] = +LOS = ∂pred/∂δr = -∂pred/∂pos (INS 误差状态)
-            H_row = np.zeros(si.dim)
-            H_row[si.pos:si.pos + 3] = e
-            H_row[si.clk_bias + sys_off] = 1.0
-            # R: 使用实际伪距噪声 sigma (含电离层/对流层残差 + 多径)
-            # spp_varerr 仅返回 ~0.004m (最小二乘加权用), 不适合 EKF 量测噪声
+            # 自适应 R: 残差超阈值时膨胀 R (而非硬拒绝), 防止高度误差增大时
+            # 高仰角卫星被全部拒掉导致垂直几何恶化 (恶性循环)
             sys_gnss = _sys_gnss(sat)
             efact = nav.efact[sys_gnss]   # GPS=1.0, GLO=1.5, GAL=1.0
             sig = self._spp_sigma * efact
+            if abs(v_i) > self._max_code:
+                # 残差超阈: 膨胀 R (Huber 风格), 保留量测但降低权重
+                # 避免硬拒绝导致卫星数减少 + 几何恶化
+                sig = sig * (abs(v_i) / self._max_code)
             R_i = sig ** 2
+            # H 行: H[pos] = +LOS = ∂pred/∂δr = -∂pred/∂pos (INS 误差状态)
+            H_row = np.zeros(si.dim)
+            H_row[si.pos:si.pos + 3] = e
+            H_row[si.clk_bias] = 1.0                      # GPS clock base (always)
+            if sys_off != 0:
+                H_row[si.clk_bias + sys_off] = 1.0        # inter-system bias (non-GPS)
             v_list.append(v_i)
             H_rows.append(H_row)
             R_diag.append(R_i)
             used_sats.append(sat)
+
+            # Doppler 量测 (可选): 使速度可观, 通过 F[vel,att] 耦合使 yaw 可观
+            if self.use_doppler and obsr.D[i, 0] != 0.0:
+                freq_d = sat2freq(sat, 0, nav)
+                if freq_d > 0:
+                    lam = rCST.CLIGHT / freq_d
+                    # 几何距离变化率: rate = dot(vs - vr, e) + Sagnac
+                    vs = rs[i, 3:6] - vr  # 卫星相对接收机速度
+                    rate = float(np.dot(vs, e))
+                    # Sagnac 修正 (与 ignav doppHVR 一致)
+                    rate += rCST.OMGE / rCST.CLIGHT * (
+                        vs[1] * rr[0] + rs[i, 0] * vr[0]
+                        - vs[0] * rr[1] - rs[i, 1] * vr[1])
+                    # innovation: v = -lam*D - rate (钟漂吸收到 R)
+                    v_dop = -lam * obsr.D[i, 0] - rate
+                    # 粗差拒绝: Doppler 残差超阈跳过
+                    if abs(v_dop) > self._max_doppler:
+                        continue
+                    # H 行: H[vel] = +e (∂pred/∂ε_vel, INS 误差状态, 与 H[pos]=+e 一致)
+                    H_dop = np.zeros(si.dim)
+                    H_dop[si.vel:si.vel + 3] = e
+                    # R: 仰角相关 (ignav STDOPP/sin(el)), 含钟漂残差
+                    sin_el = max(math.sin(el), 0.1)
+                    sig_dop = self._doppler_sigma / math.sqrt(sin_el)
+                    v_list.append(v_dop)
+                    H_rows.append(H_dop)
+                    R_diag.append(sig_dop ** 2)
+                    used_sats.append(sat)
         if not v_list:
             return np.array([]), np.zeros((0, si.dim)), np.zeros((0, 0)), {}
         v = np.array(v_list)

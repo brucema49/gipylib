@@ -124,5 +124,5 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
 
 
 if __name__ == "__main__":
-    cfg = sys.argv[1] if len(sys.argv) > 1 else "data/config.yaml"
+    cfg = sys.argv[1] if len(sys.argv) > 1 else "data/spp-ins-tc.yaml"
     main(cfg)

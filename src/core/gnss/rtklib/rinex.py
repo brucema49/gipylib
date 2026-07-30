@@ -135,6 +135,10 @@ class rnx_decode:
                     if len(line) >= 42:
                         eph.fit = int(self.flt(line, 1))
     
+                    # BDS ephemeris uses BDT week (epoch 2006-01-01 = GPS week 1356)
+                    # Convert to GPS week for correct toe/tot computation
+                    if sys == uGNSS.BDS:
+                        eph.week += 1356
                     eph.toe = gpst2time(eph.week, eph.toes)
                     eph.tot = gpst2time(eph.week, tot)
                     nav.eph.append(eph)

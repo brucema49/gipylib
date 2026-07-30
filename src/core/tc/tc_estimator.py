@@ -97,16 +97,21 @@ class TcEstimator(LcEstimator):
         return x
 
     def time_update(self, imu):
-        """父类 INS 传播 + 钟差白噪声 (参考 ignav propP: 每历元重置方差)。
+        """父类 INS 传播 + 钟差随机游走。
 
         性能优化: 利用块结构 (INS 块 + GNSS 块) 避免全 n×n 矩阵乘法。
         - F 非零仅 INS 块 (前 _gnss_base 维), GNSS 块 F=0 → Phi_GNSS=I
-        - Q 非零仅 INS 块, GNSS 块 Q=0 (ambiguity 随机游走 Q=0, clk 白噪声单独处理)
+        - Q 非零仅 INS 块, GNSS 块 Q=0 (ambiguity 随机游走 Q=0, clk 见下)
         - P 传播分块:
           P_INS = Phi_INS @ (P_INS + 0.5*Q_INS) @ Phi_INS.T + 0.5*Q_INS
           P_INS_GNSS = Phi_INS @ P_INS_GNSS  (交叉项, 仅左乘)
-          P_GNSS_GNSS 不变 (Phi=I, Q=0)
+          P_GNSS_GNSS 不变 (Phi=I), 但 clk 对角 += Q_clk*dt (随机游走)
         复杂度从 O(n³) 降到 O(n_INS²·n_GNSS + n_INS³), n=354 时约 500x 加速。
+
+        钟差随机游走: Q_clk = sigma_clk² * dt, sigma_clk ≈ 0.3 m/sqrt(s)
+        (典型 GPS 接收机晶振短期稳定度 ~1e-9 s/s ≈ 0.3 m/s)。
+        不再每历元重置 Pclk (原 ignav 白噪声模型会导致 Pclk=100 >> Ppos,
+        钟差吸收全部 innovation, 位置修正不足, 高度误差累积)。
         """
         prev_ts = self.ins_update._prev_timestamp
         self.ins_update.update(imu)
@@ -153,21 +158,37 @@ class TcEstimator(LcEstimator):
             self.P[:n_ins, :n_ins] = new_P_INS
             self.P[:n_ins, n_ins:] = new_P_cross
             self.P[n_ins:, :n_ins] = new_P_cross.T
-            # P_GNSS 不变 (Phi=I, Q=0)
+            # P_GNSS 不变 (Phi=I, Q=0), 但 clk 对角 += Q_clk*dt (随机游走)
+            if si.clk_bias >= 0:
+                clk0 = si.clk_bias
+                # 钟差随机游走: sigma_clk = 0.1 m/sqrt(s) (紧模型, 防止 clock 吸收 height error)
+                # sigma=0.1 → Q_clk=0.01 m²/s, Pclk 平衡 ~0.1m² (远小于 Ppos~0.5)
+                # 使 K[pos] >> K[clk], 位置获得足够修正对抗 IMU 高度漂移
+                q_clk = 0.1 ** 2 * dt   # m² (per IMU step)
+                for k in range(3):
+                    self.P[clk0 + k, clk0 + k] += q_clk
 
         self.P = 0.5 * (self.P + self.P.T)
-        # 钟差按白噪声处理: 不在 IMU 时间更新中累积方差
-        # 在 tc_meas_update 前重置钟差方差 (ignav propP initP(irc,...,UNC_CLK))
 
     def reset_clk_variance(self):
-        """重置钟差方差 (每个 GNSS 历元前调用, 参考 ignav propP 的 initP(irc,...,UNC_CLK))。
+        """重置钟差误差状态 (每个 GNSS 历元前调用)。
 
-        ignav 将钟差视为白噪声: 每个历元方差重置为 UNC_CLK² = 10000.0,
-        使 KF 对钟差有高增益, 防止钟差误差累积导致发散。
+        钟差随机游走模型: Pclk 不再重置, 由 time_update 的 Q_clk 累积。
+        仅清零误差状态 ε_clk=0, 使 effective clk = _clk_stored (上一历元累积值)。
+
+        关键: 不重置 Pclk。
+        - 旧实现 (ignav 白噪声): 每历元 Pclk=100, 导致 K[clk] >> K[pos],
+          钟差吸收全部 innovation, 位置修正不足 → 高度误差累积 (t+1400-1560s 偏差 21m)。
+        - 新实现 (随机游走): Pclk 由 Q_clk 累积 + 量测更新收敛, 平衡 ~0.1-1 m²,
+          K[pos] 与 K[clk] 量级相当, 位置能获得足够修正。
+        - _clk_stored 保留跨历元记忆, 误差状态 ε_clk 清零后用 stored 作有效估计。
         """
-        if self.si.clk_bias >= 0:
-            for k in range(3):
-                self.P[self.si.clk_bias + k, self.si.clk_bias + k] = 100.0 ** 2
+        si = self.si
+        if si.clk_bias >= 0:
+            clk0 = si.clk_bias
+            # 仅清零 clk 误差状态 (ε_clk=0, 用 _clk_stored 作有效估计)
+            # Pclk 不重置, 由 time_update 的 Q_clk 随机游走累积
+            self.x[clk0:clk0 + 3] = 0.0
 
     def tc_meas_update(self, v, H, R, source: str = ""):
         """GNSS 量测更新 (调 joseph_update + feedback)。"""

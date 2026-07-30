@@ -19,7 +19,7 @@ from src.core.ins.attitude import dcm2euler, dcm2quat
 from src.core.ins.earth_param import cal_Ce2n, ecef2llh
 from src.core.ins.ins_update import InsUpdate
 from src.core.ins.state_index import StateIndex
-from src.core.ins.transfer_matrix import TransferMatrix, skew
+from src.core.ins.transfer_matrix import TransferMatrix, rodrigues, skew
 
 logger = logging.getLogger(__name__)
 
@@ -237,7 +237,7 @@ class LcEstimator:
 
         new_pos = state.pos_e - delta_pos
         new_vel = state.vel_e - delta_vel
-        C_b_e_new = (np.eye(3) - skew(delta_psi)) @ state.C_b_e
+        C_b_e_new = rodrigues(-delta_psi) @ state.C_b_e
         U, _, Vt = np.linalg.svd(C_b_e_new)
         C_b_e_new = U @ Vt
         lat, lon, _ = ecef2llh(new_pos)

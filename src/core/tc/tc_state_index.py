@@ -27,6 +27,7 @@ class TcStateIndex(StateIndex):
         self.clk_bias = -1                  # SPP 钟差块起始 (-1=未启用)
         self.amb_start = -1                 # RTK 模糊度块起始 (-1=未启用)
         self.n_amb = 0                      # 模糊度数量
+        self.nf = 2                         # 频率数 (影响 amb_idx 索引公式, 默认双频)
 
     @classmethod
     def from_config(cls, config: dict, mode: str) -> "TcStateIndex":
@@ -52,6 +53,7 @@ class TcStateIndex(StateIndex):
         si.dim = base.dim
         # 扩展 GNSS 参数块
         si.mode = mode
+        si.nf = int(config.get("gnss", {}).get("nf", 2)) if config else 2
         si._gnss_base = si.dim
         si._init_gnss_blocks()
         return si
@@ -82,14 +84,16 @@ class TcStateIndex(StateIndex):
         return self.mode == "rtk" and self.n_amb > 0
 
     def amb_idx(self, sat: int, freq: int) -> int:
-        """模糊度索引 (rtklib IB 宏约定)。
+        """模糊度索引 (sat-major 布局, 与 GINav 兼容)。
 
-        IB(sat, f, na) = na + (sat-1)*nf + f  (nf=2 双频)
-        注意: 实际 ddidx 按参考星选择重排, TcAmbiguity 维护 sat→idx 映射。
+        idx = amb_start + (sat-1)*nf + freq
+        对于 nf=1: idx = amb_start + sat - 1, 范围 [amb_start, amb_start+MAXSAT-1]
+        对于 nf=2: idx = amb_start + (sat-1)*2 + freq, 范围 [amb_start, amb_start+2*MAXSAT-1]
+        总槽位 = MAXSAT * nf (由 set_ambiguity_count 分配)
         """
         if self.amb_start < 0:
             return -1
-        return self.amb_start + (sat - 1) * 2 + freq
+        return self.amb_start + (sat - 1) * self.nf + freq
 
     def reset_gnss_blocks(self):
         """降级重整时重置 GNSS 参数块 (保留 INS+可选块)。"""
