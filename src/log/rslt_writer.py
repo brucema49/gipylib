@@ -58,7 +58,8 @@ class RSLTWriter(WriterBase):
         "Q Qins  ns   sdn(m)   sde(m)   sdu(m)  sdne(m)  sdeu(m)  sdun(m) "
         "age(s)  ratio    vx(m/s)    vy(m/s)    vz(m/s)       "
         "sdvx       sdvy       sdvz      sdvxy      sdvyz      sdvzx   "
-        "roll(deg)  pitch(deg)    yaw(deg)  sdroll(d) sdpitch(d)  sdyaw(d)\n"
+        "roll(deg)  pitch(deg)    yaw(deg)  sdroll(d) sdpitch(d)  sdyaw(d)"
+        "  lever_x(m)  lever_y(m)  lever_z(m)  sdlx(m)  sdly(m)  sdlz(m)\n"
     )
 
     def __init__(self, output_dir: str, filename: str = "RTKLC.rslt"):
@@ -123,11 +124,21 @@ class RSLTWriter(WriterBase):
         # 姿态 sd: deg (ignav outins 固定格式)
         sdroll, sdpitch, sdyaw = _sqrt_diag(Pa) / D2R  # rad → deg
 
+        # 杆臂参数 (b 系 FRD, m): 在线估计时输出 state.leverarm + P 对角 sqrt
+        # 杆臂更新频率 1Hz (Qins=3 量测更新), 1s 内 100Hz 输出值相同 (状态不变)
+        lever = state.leverarm
+        if si.has_lever_arm():
+            i = si.lever_arm
+            sdl = _sqrt_diag(P[i:i + 3, i:i + 3])
+        else:
+            sdl = np.zeros(3)
+
         fmt = (
             "%4d %10.3f %14.9f %14.9f %10.4f %3d %3d %3d"
             " %9.4f %9.4f %9.4f %9.4f %9.4f %9.4f %6.2f %6.1f"
             " %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f"
-            " %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f\n"
+            " %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f"
+            " %10.5f %10.5f %10.5f %9.5f %9.5f %9.5f\n"
         )
         self._fp.write(fmt % (
             week, sow,
@@ -138,6 +149,8 @@ class RSLTWriter(WriterBase):
             sdvx, sdvy, sdvz, sdvxy, sdvyz, sdvzx,
             att_deg[0], att_deg[1], att_deg[2],
             sdroll, sdpitch, sdyaw,
+            lever[0], lever[1], lever[2],
+            sdl[0], sdl[1], sdl[2],
         ))
 
     def write_gnss_only(self, timestamp: float, pos_e: np.ndarray,
@@ -179,9 +192,10 @@ class RSLTWriter(WriterBase):
             "%4d %10.3f %14.9f %14.9f %10.4f %3d %3d %3d"
             " %9.4f %9.4f %9.4f %9.4f %9.4f %9.4f %6.2f %6.1f"
             " %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f"
-            " %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f\n"
+            " %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f"
+            " %10.5f %10.5f %10.5f %9.5f %9.5f %9.5f\n"
         )
-        # Qins=0, 速度=0, 姿态=0, sd=0
+        # Qins=0, 速度=0, 姿态=0, sd=0, 杆臂=0 (未初始化)
         self._fp.write(fmt % (
             week, sow,
             lat_deg, lon_deg, h,
@@ -191,6 +205,8 @@ class RSLTWriter(WriterBase):
             0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # 速度 sd=0
             0.0, 0.0, 0.0,   # 姿态=0
             0.0, 0.0, 0.0,   # 姿态 sd=0
+            0.0, 0.0, 0.0,   # 杆臂=0
+            0.0, 0.0, 0.0,   # 杆臂 sd=0
         ))
 
     def close(self) -> None:
