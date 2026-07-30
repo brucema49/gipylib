@@ -11,6 +11,7 @@
 """
 import dataclasses
 import logging
+from typing import Optional
 
 import numpy as np
 
@@ -40,16 +41,25 @@ class LcEstimator:
 
         ins_cfg = config.get("ins", {})
         self._gnss_pos_std = {
-            1: 0.15,   # SOLQ_FIX (RTK fix): 增大以给 EKF 惯性, 平滑 RTK 偶发跳变
-            2: 0.05,   # SOLQ_FLOAT (RTK float)
+            1: 0.3,    # SOLQ_FIX (RTK fix): RTK 平面精度~0.3m, 增大给 EKF 惯性平滑偶发跳变
+            2: 0.3,    # SOLQ_FLOAT (RTK float): RTK FLOAT 平面精度~0.22m, sigma=0.3 给 EKF 适当惯性
             4: 1.0,    # SOLQ_DGPS
-            5: 10.0,   # SOLQ_SINGLE (SPP)
-            0: 10.0,   # SOLQ_NONE (fallback)
+            5: 1.0,    # SOLQ_SINGLE (SPP): SPP 平面精度~0.8m, sigma=1.0 信任平面 GNSS
+            0: 1.0,    # SOLQ_NONE (fallback)
         }
+        # RTK (Q=1/2) 不使用 rtklib 报的 sd (偏大保守, FLOAT sd 可达 2-9m, 实际精度 0.22m);
+        # SPP (Q=5) sd 较可靠, 用 max(base_sigma, sd)。
+        self._use_gnss_sd_qualities = {4, 5}  # DGPS / SPP 使用 max(sigma, sd)
+        # 垂直 sigma 放大因子: SPP 高程有系统性偏差(~3m), 需放大高程 sigma 让 EKF 不信任
+        # RTK 高程精度好(~0.3m), 不需放大。因子作用于 NED 的 Down 分量
+        self._vertical_sigma_factor = float(ins_cfg.get("vertical_sigma_factor", 1.0))
         self._gnss_vel_std = ins_cfg.get("gnss_vel_std", 0.5)
         self._innov_reject_threshold = float(ins_cfg.get("innov_reject_threshold", 0.0))
         self._innov_reject_warmup = int(ins_cfg.get("innov_reject_warmup", 100))
         self._gnss_update_count = 0
+        # 历史 GNSS 位置 (用于位置差分计算速度, 当 GNSS 无速度输出时)
+        self._prev_gnss_pos: Optional[np.ndarray] = None
+        self._prev_gnss_ts: Optional[float] = None
 
     @property
     def state(self) -> InsState:
@@ -124,12 +134,18 @@ class LcEstimator:
         self.joseph_update(Z, H, R)
 
     def _build_pos_R(self, gnss: GnssSolution) -> np.ndarray:
-        """构造位置量测噪声协方差 (自适应 sigma + 全协方差矩阵)。
+        """构造位置量测噪声协方差 (自适应 sigma + 全协方差矩阵 + 各向异性高程)。
 
         对角线: max(fixed_sigma, rtk_sd) — 良好历元 rtk_sd 很小, sigma 取固定值;
         偏差历元 rtk_sd 增大, sigma 随之增大以降低 K。
         非对角线: 从 RTK 全协方差矩阵 gnss.cov 提取, 捕获轴向相关性,
         使 EKF 能针对性降低偏差方向上的 Kalman 增益。
+
+        各向异性高程: SPP 高程有系统性偏差(~3m), 需放大 Down 方向 sigma 让 EKF
+        不信任高程, 依赖 INS 加速度计积分。通过 NED 旋转实现:
+          R_ned = C_e^n @ R_ecef @ (C_e^n)^T
+          R_ned[2,2] *= vertical_sigma_factor²  (Down 分量放大)
+          R_ecef = (C_e^n)^T @ R_ned @ C_e^n
 
         time_sync 未估计时, R 中加入时间偏差不确定性 (speed × dt_offset)。
         time_sync 估计时, 时间偏差由状态处理, R 不含 timing 项。
@@ -137,7 +153,11 @@ class LcEstimator:
         base_sigma = self._gnss_pos_std.get(gnss.quality, 0.5)
         sigma = np.array([base_sigma] * 3, dtype=np.float64)
 
-        if gnss.sd is not None and np.all(gnss.sd > 0):
+        # 仅对 DGPS/SPP 使用 max(sigma, gnss.sd): 这些模式 sd 较可靠;
+        # RTK (Q=1/2) 的 rtklib sd 偏大保守 (FLOAT sd 可达 2-9m, 实际 0.22m),
+        # 用 base_sigma 即可, 避免 K 过低致 INS 自由漂移。
+        if (gnss.quality in self._use_gnss_sd_qualities
+                and gnss.sd is not None and np.all(gnss.sd > 0)):
             sigma = np.maximum(sigma, gnss.sd)
 
         R = np.diag(sigma ** 2).astype(np.float64)
@@ -145,6 +165,14 @@ class LcEstimator:
         if gnss.cov is not None:
             cov_off_diag = gnss.cov - np.diag(np.diag(gnss.cov))
             R = R + cov_off_diag
+
+        # 各向异性高程: 在 NED 系放大 Down 分量 (SPP 高程偏差大)
+        if self._vertical_sigma_factor != 1.0:
+            lat, lon, _ = ecef2llh(self.ins_update.state.pos_e)
+            C_e_n = cal_Ce2n(lat, lon)  # ECEF → NED
+            R_ned = C_e_n @ R @ C_e_n.T
+            R_ned[2, 2] *= self._vertical_sigma_factor ** 2
+            R = C_e_n.T @ R_ned @ C_e_n
 
         if not self.si.has_time_sync():
             speed = float(np.linalg.norm(self.ins_update.state.vel_e))
@@ -189,9 +217,14 @@ class LcEstimator:
         self.joseph_update(Z, H, R)
 
     def _build_vel_R(self, gnss: GnssSolution) -> np.ndarray:
-        """构造速度量测噪声协方差。"""
+        """构造速度量测噪声协方差。
+
+        RTK relpos 的 vel_sd 可能极大 (如 20+ m/s), 导致 K≈0 速度更新无效。
+        对此类情况 cap 到 _gnss_vel_std, 使 EKF 能有效利用速度量测。
+        """
         if gnss.vel_sd is not None and np.all(gnss.vel_sd > 0):
-            R = np.diag(gnss.vel_sd ** 2).astype(np.float64)
+            vel_sd = np.minimum(gnss.vel_sd, self._gnss_vel_std)
+            R = np.diag(vel_sd ** 2).astype(np.float64)
         else:
             R = np.diag([self._gnss_vel_std ** 2] * 3).astype(np.float64)
         return 0.5 * (R + R.T)

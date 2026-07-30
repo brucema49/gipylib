@@ -78,11 +78,13 @@ class InsInitializer:
         imu_list = aligned_block.imu_list
 
         # 1. IMU 时间对齐到 GNSS 时间戳 (GVINS 风格线性插值, 验证包夹条件)
-        interp_imu = self._align_imu_to_gnss(imu_list, gnss.timestamp)
-        if interp_imu is None:
-            raise ValueError(
-                "IMU 数据不满足包夹条件 (GNSS 时间戳前后需各有 IMU 历元)"
-            )
+        # 动态初始化仅需最新 IMU (不要求包夹), 静态初始化需要包夹做加速度计调平
+        if mode == InitMode.STATIC:
+            interp_imu = self._align_imu_to_gnss(imu_list, gnss.timestamp)
+            if interp_imu is None:
+                raise ValueError(
+                    "IMU 数据不满足包夹条件 (GNSS 时间戳前后需各有 IMU 历元)"
+                )
 
         # 2. 动态模式下检查陀螺角速度范数 (< 30 deg/s)
         if mode in (InitMode.VELOCITY_VECTOR, InitMode.POSITION_DIFF):
@@ -283,11 +285,12 @@ class InsInitializer:
 
     def _align_motion_displacement(self, gnss: GnssSolution
                                    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """位置差分对准: 3 历元缓冲, 所有相邻历元平面速度(EN)均超阈值才初始化。
+        """位置差分对准: gnss_buffer_size 历元缓冲, 所有相邻历元平面速度(EN)均超阈值才初始化。
 
-        参考 gnss_ins_lc_nhc InterpolateGnssVel + MotionAligned。
+        参考 gnss_ins_lc_nhc InterpolateGnssVel + MotionAligned + issue/7-30松组合.md。
         速度阈值检查使用平面速度范数 sqrt(v_E^2 + v_N^2) (不含垂向)。
         要求缓冲区内所有相邻历元差分得到的平面速度均 >= 阈值, 保证连续运动。
+        速度计算使用首尾历元差分 (span 最大, 噪声最小), issue 要求 "首尾位置差分"。
 
         Returns:
             (att_rpy, vel_e) 或 None (缓冲区未满或未达运动阈值)
@@ -314,21 +317,21 @@ class InsInitializer:
             if planar_speed < self.dynamic_speed_threshold:
                 return None  # 某一对相邻历元未达阈值, 继续等待
 
-        # 用最新两个历元计算速度
-        gnss_prev = self.gnss_buffer[-2]
-        gnss_curr = self.gnss_buffer[-1]
-        dt = gnss_curr.timestamp - gnss_prev.timestamp
-        vel_e = (gnss_curr.position - gnss_prev.position) / dt
+        # 用首尾历元差分计算速度 (span 最大, 噪声最小, issue 要求 "首尾位置差分")
+        gnss_first = self.gnss_buffer[0]
+        gnss_last = self.gnss_buffer[-1]
+        dt = gnss_last.timestamp - gnss_first.timestamp
+        vel_e = (gnss_last.position - gnss_first.position) / dt
 
         # 用差分速度走速度矢量对准
         gnss_with_vel = GnssSolution(
-            timestamp=gnss_curr.timestamp,
-            week=gnss_curr.week,
-            position=gnss_curr.position.copy(),
-            quality=gnss_curr.quality,
-            num_sv=gnss_curr.num_sv,
-            sd=gnss_curr.sd.copy(),
-            cov=gnss_curr.cov,
+            timestamp=gnss_last.timestamp,
+            week=gnss_last.week,
+            position=gnss_last.position.copy(),
+            quality=gnss_last.quality,
+            num_sv=gnss_last.num_sv,
+            sd=gnss_last.sd.copy(),
+            cov=gnss_last.cov,
             velocity=vel_e,
             vel_sd=None,
         )

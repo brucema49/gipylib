@@ -105,6 +105,9 @@ class TransferMatrix:
         self.acce_bias_psd = ins_cfg.get("acce_bias_psd", 1.66067346797506e-09)
         # 位置随机游走 PSD (m²/s): 计入未建模的位置不确定性 (RTK 跳变/多径等)
         self.pos_psd = ins_cfg.get("pos_psd", 0.0)
+        # 速度随机游走 PSD (m²/s²): 计入未建模的速度不确定性, 防止 P_vel 坍缩致 K_vel→0
+        # pos_psd 通过 F_rv 耦合也会增长 P_vel, 但 LC 模式下不够; vel_psd 直接注入 P_vel
+        self.vel_psd = ins_cfg.get("vel_psd", 0.0)
         # 可选参数过程噪声 PSD (常数, 无需调参)
         self.lever_arm_psd = _LEVER_ARM_PSD
         self.imu_angle_psd = _IMU_ANGLE_PSD
@@ -281,6 +284,10 @@ class TransferMatrix:
         Q_diag[12:15, 12:15] = np.diag([self.acce_bias_psd * dt] * 3)
 
         Q = G @ Q_diag @ G.T
+
+        # 直接速度过程噪声 (不经过 G 旋转, 直接注入 ECEF vel 对角块)
+        if self.vel_psd > 0.0:
+            Q[3:6, 3:6] += np.diag([self.vel_psd * dt] * 3)
 
         # 可选块 Q (随机游走: PSD × dt)
         if si.has_lever_arm() and self.lever_arm_psd > 0.0:

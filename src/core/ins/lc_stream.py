@@ -3,15 +3,17 @@
 替代 LcRunner 的批处理架构。增量喂入 IMU+GNSS，流式输出 RTKLC.rslt。
 
 流程:
-1. 初始化前：小缓冲累积 IMU+GNSS，每个新 GNSS 到来时尝试初始化
-2. 初始化成功：回放缓冲中 init 时间戳之后的事件，然后切换增量模式
+1. 初始化前：每个 GNSS 到来时输出纯 GNSS (Qins=0, 1Hz), IMU 仅保留最新一条
+   (不解算, 不缓冲)。每个 GNSS 到来时尝试动态初始化 (position_diff / velocity_vector)。
+2. 初始化成功：切换增量模式, 后续 IMU 喂入 LcIntegration
 3. 增量模式：feed_imu 做时间更新 + per-IMU 写出 (.rslt 一行)
    feed_gnss 入 pending 队列（由后续 IMU 跨越 gnss.t 时 GVINS 风格触发）
 4. 输出：per-IMU (100Hz)，每条 IMU 后立即写一行（Qins 跟踪本历元量测更新类型）
 
-TC 扩展点：当前 GNSS 由上游 RTKLIB 预解算后入队。未来 TC 时，
-把"从队列取预解算 GNSS"替换为"用 INS 先验调用 GNSS 解算"，
-事件循环骨架不变。
+参考 issue/7-30松组合.md:
+  - "还未初始化时, 一条一条的弹出GNSS观测进行纯GNSS解算, imu数据直接弹出, 不用进行解算"
+  - "缓存5个动态的GNSS历元结果, 通过首尾位置差分得到大致的平面速度"
+  - 不使用静态回退初始化 (yaw=0 会导致偏航角发散)
 """
 import logging
 import math
@@ -32,8 +34,8 @@ logger = logging.getLogger(__name__)
 class LcStream:
     """流式松组合导航：增量喂入 IMU+GNSS，per-IMU 流式输出 RTKLC.rslt。
 
-    初始化前用小缓冲累积数据（到找到 init 历元为止），初始化后增量处理。
-    输出 per-IMU (100Hz)，每条 IMU 后立即写一行 .rslt。
+    预初始化阶段输出纯 GNSS (Qins=0, 1Hz), IMU 不解算。
+    动态初始化 (position_diff / velocity_vector) 成功后切换增量模式。
     """
 
     def __init__(self, config: dict, writer):
@@ -42,9 +44,9 @@ class LcStream:
         self.initializer = InsInitializer(config)
         self._init_mode = self._select_init_mode(config)
 
-        # 初始化前缓冲（小，到找到 init 历元为止）
-        self._init_imu: List[ImuMeasurement] = []
+        # 预初始化阶段: 仅缓冲 GNSS (供位置差分), 仅保留最新 IMU (供陀螺检测)
         self._init_gnss: List[GnssSolution] = []
+        self._latest_imu: Optional[ImuMeasurement] = None
 
         # 初始化后状态
         self._initialized = False
@@ -77,25 +79,22 @@ class LcStream:
     # ===== 增量喂入 =====
 
     def feed_imu(self, imu: ImuMeasurement) -> None:
-        """喂入 IMU。初始化前缓冲，初始化后做 time_update + per-IMU 写出。"""
+        """喂入 IMU。预初始化仅保留最新一条 (不解算), 初始化后做 time_update + 写出。"""
         if not self._initialized:
-            self._init_imu.append(imu)
-            # 当有 GNSS 且当前 IMU 时间戳 >= GNSS 时间戳时，尝试初始化
-            # （此时 before + after IMU 都已就绪）
-            if self._init_gnss and imu.timestamp >= self._init_gnss[-1].timestamp:
-                self._try_init()
+            # 预初始化: IMU 直接弹出, 仅保留最新一条供初始化陀螺检测
+            self._latest_imu = imu
             return
         self._integ.add_imu(imu)
         self._write_state(self._integ.last_qins)
 
     def feed_gnss(self, gnss: GnssSolution) -> None:
-        """喂入 GNSS。初始化前仅缓冲，初始化后入 pending 队列。
-
-        初始化由 feed_imu 在 after-IMU 到达时触发（确保 before+after 都就绪）。
-        GNSS 量测更新由后续 IMU 跨越 gnss.t 时 GVINS 风格触发 (LcIntegration.add_imu)。
-        """
+        """喂入 GNSS。预初始化输出纯 GNSS (Qins=0) + 尝试动态初始化, 初始化后入 pending 队列。"""
         if not self._initialized:
+            # 预初始化: 输出纯 GNSS (Qins=0, 使用 positioning_mode 规定的模式)
+            self._write_gnss_only(gnss)
             self._init_gnss.append(gnss)
+            # 每个新 GNSS 到来时尝试动态初始化
+            self._try_init()
             return
         self._integ.add_gnss(gnss)
         self._last_gnss_ns = gnss.num_sv
@@ -104,69 +103,50 @@ class LcStream:
     # ===== 初始化 =====
 
     def _try_init(self) -> None:
-        """用当前缓冲数据尝试初始化。成功则回放缓冲数据并切换增量模式。"""
+        """用当前 GNSS 缓冲 + 最新 IMU 尝试动态初始化。
+
+        仅动态模式 (position_diff / velocity_vector), 不使用静态回退。
+        position_diff: 缓冲区满 (gnss_buffer_size 历元) 且所有相邻差分速度均超阈值。
+        velocity_vector: 当前 GNSS 速度超阈值。
+        """
         if not self._init_gnss:
             return
 
         gnss = self._init_gnss[-1]
         t_gnss = gnss.timestamp
-        imu_block = [imu for imu in self._init_imu
-                     if t_gnss - 2.0 <= imu.timestamp <= t_gnss + 1.0]
-        if len(imu_block) < 2:
-            return
 
-        has_before = any(imu.timestamp <= t_gnss for imu in imu_block)
-        has_after = any(imu.timestamp >= t_gnss for imu in imu_block)
-        if not (has_before and has_after):
-            return
+        # 构造 imu_list (仅最新 IMU, 供陀螺角速度检测)
+        imu_list = [self._latest_imu] if self._latest_imu is not None else []
 
+        # 陀螺角速度检测 (动态初始化要求角速度较小)
         cfg = self.config["ins"]
         angular_thr = cfg.get("angular_velocity_threshold_deg", 30.0)
         if angular_thr > math.pi:
             angular_thr = math.radians(angular_thr)
-        gyro_norms = [float(np.linalg.norm(imu.gyro)) for imu in imu_block]
-        if float(np.mean(gyro_norms)) >= angular_thr:
-            return
-
-        dynamic_thr = cfg.get("dynamic_speed_threshold", 4.0)
-        static_thr = cfg.get("static_speed_threshold", 0.5)
-        block = AlignedBlock(gnss=gnss, imu_list=imu_block)
-
-        # 1) 尝试配置的动态模式
-        init_state = None
-        init_P = None
-        speed = self._check_init_speed(gnss, dynamic_thr)
-        if speed is not None:
-            try:
-                init_state, init_P = self.initializer.initialize(
-                    block, self._init_mode)
-                logger.info(
-                    f"LcStream 初始化成功: t={init_state.timestamp:.3f}, "
-                    f"speed={speed:.3f} m/s, mode={self._init_mode.value}")
-            except ValueError:
-                pass
-
-        # 2) 回退：静态模式
-        if init_state is None:
-            gnss_speed = (float(np.linalg.norm(gnss.velocity))
-                          if gnss.velocity is not None else 0.0)
-            if gnss_speed < static_thr:
-                try:
-                    init_state, init_P = self.initializer.initialize(
-                        block, InitMode.STATIC)
-                    logger.info(
-                        f"LcStream 初始化成功 (静态回退): "
-                        f"t={init_state.timestamp:.3f}, "
-                        f"gnss_speed={gnss_speed:.3f} m/s")
-                except ValueError:
-                    return
-            else:
+        if imu_list:
+            gyro_norm = float(np.linalg.norm(imu_list[0].gyro))
+            if gyro_norm >= angular_thr:
                 return
 
+        block = AlignedBlock(gnss=gnss, imu_list=imu_list)
+        dynamic_thr = cfg.get("dynamic_speed_threshold", 4.0)
+
+        # 尝试动态初始化 (position_diff / velocity_vector)
+        init_state = None
+        init_P = None
+        try:
+            init_state, init_P = self.initializer.initialize(
+                block, self._init_mode)
+            logger.info(
+                f"LcStream 动态初始化成功: t={init_state.timestamp:.3f}, "
+                f"mode={self._init_mode.value}")
+        except ValueError:
+            pass
+
         if init_state is None:
             return
 
-        # 初始化成功，创建估计器 + 集成器
+        # 初始化成功, 创建估计器 + 集成器
         self._est = LcEstimator(init_state, init_P, self.config)
         self._integ = LcIntegration(self._est, self.config)
         self._si = StateIndex.from_config(self.config)
@@ -175,35 +155,9 @@ class LcStream:
         self._last_q = gnss.quality
         self._last_gnss_ns = gnss.num_sv
 
-        # 回放缓冲中 init 时间戳之后的事件
-        init_gnss_idx = len(self._init_gnss) - 1
-        self._replay_buffer(init_state.timestamp, init_gnss_idx)
-
         # 清空初始化缓冲
-        self._init_imu.clear()
         self._init_gnss.clear()
-
-    def _replay_buffer(self, init_ts: float, init_gnss_idx: int) -> None:
-        """回放初始化缓冲中 init_ts 之后的事件。"""
-        events = []
-        for imu in self._init_imu:
-            if imu.timestamp > init_ts:
-                events.append((imu.timestamp, "imu", imu))
-        for j in range(init_gnss_idx + 1, len(self._init_gnss)):
-            gnss = self._init_gnss[j]
-            if gnss.timestamp > init_ts:
-                events.append((gnss.timestamp, "gnss", gnss))
-        # 同时间戳时 GNSS 先于 IMU
-        events.sort(key=lambda e: (e[0], 0 if e[1] == "gnss" else 1))
-
-        for _, tag, data in events:
-            if tag == "imu":
-                self._integ.add_imu(data)
-                self._write_state(self._integ.last_qins)
-            else:
-                self._integ.add_gnss(data)
-                self._last_gnss_ns = data.num_sv
-                self._last_q = data.quality
+        self._latest_imu = None
 
     def _check_init_speed(self, gnss: GnssSolution,
                           threshold: float) -> Optional[float]:
@@ -237,10 +191,21 @@ class LcStream:
         )
         self._output_count += 1
 
+    def _write_gnss_only(self, gnss: GnssSolution) -> None:
+        """预初始化阶段输出纯 GNSS 解 (Qins=0, 速度=0, 姿态=0)。"""
+        pos_sd = gnss.sd if gnss.sd is not None else None
+        self.writer.write_gnss_only(
+            timestamp=gnss.timestamp,
+            pos_e=gnss.position,
+            q=gnss.quality,
+            num_sv=gnss.num_sv,
+            pos_sd=pos_sd,
+        )
+        self._output_count += 1
+
     def finalize(self) -> int:
         """流式结束，返回总输出数。"""
         if not self._initialized:
-            logger.warning("LcStream: 未初始化，无 LC 输出")
-            return 0
+            logger.warning("LcStream: 未初始化，仅输出纯 GNSS 结果")
         logger.info(f"LcStream 输出: {self._output_count} 历元")
         return self._output_count

@@ -167,11 +167,17 @@ class Constraints:
         if gyro_norm >= self.nhc_max_gyro:
             return False
         Z, H, R = self._nhc.build_meas(estimator.state, imu, estimator.si)
-        # 自适应 R: 加入速度不确定度 (TC 模式 v^e 无直接更新, 需保护)
+        # 自适应 R: 加入速度 + 姿态不确定度
+        # LC 模式无 GNSS 速度直接更新, v^e 误差大时 NHC 会锁住错误 yaw
+        # 姿态不确定度 (尤其 yaw) 大时, NHC 的侧向速度约束方向不确定,
+        # 需弱化 NHC 防止 yaw-速度正反馈发散
         si = estimator.si
         P_vv = estimator.P[si.vel:si.vel+3, si.vel:si.vel+3]
         H_vel = H[:, si.vel:si.vel+3]
         R = R + H_vel @ P_vv @ H_vel.T
+        P_aa = estimator.P[si.att:si.att+3, si.att:si.att+3]
+        H_att = H[:, si.att:si.att+3]
+        R = R + H_att @ P_aa @ H_att.T
         # 单维速度 guard: 逐维检查 |Z[i]|, 超阈剔除该维
         keep = np.abs(Z) < self.nhc_max_vel
         if not np.any(keep):

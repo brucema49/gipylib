@@ -18,8 +18,12 @@ GNSS 由 add_gnss 入队, 不直接触发更新 (等 IMU 跨越 gnss.t 时触发
 NHC/ZUPT/ZARU 由 IMU 触发 (decimation), 不依赖 GNSS。
 """
 import collections
+import dataclasses
 import logging
+import math
 from typing import Optional
+
+import numpy as np
 
 from src.core.data_types import GnssSolution, ImuMeasurement
 from src.core.ins.constraints import Constraints
@@ -78,6 +82,11 @@ class LcIntegration:
         self.imupre: Optional[ImuMeasurement] = None
         self.imucur: Optional[ImuMeasurement] = None
         self.pending_gnss: collections.deque = collections.deque()
+        # 位置差分速度: 当 GNSS 无速度输出 (如 RTK) 时, 用相邻位置差分计算速度
+        # vel = (pos_cur - pos_prev) / dt, vel_sd = sqrt(2) * pos_sigma / dt
+        self._prev_gnss_pos: Optional[np.ndarray] = None
+        self._prev_gnss_ts: Optional[float] = None
+        self._pos_diff_vel_std = float(ins_cfg.get("pos_diff_vel_std", 0.5))
         # Qins 跟踪 (与 ignav outins 一致):
         #   2 = mech + propagate (time_update only)
         #   3 = LC update (GNSS meas_update 或约束触发)
@@ -161,12 +170,52 @@ class LcIntegration:
         self.pending_gnss.append(gnss)
 
     def _apply_gnss_update(self, gnss: GnssSolution) -> None:
-        """应用 GNSS 位置/速度量测更新 + 反馈。"""
+        """应用 GNSS 位置/速度量测更新 + 反馈。
+
+        当 GNSS 无速度输出 (如 RTK) 时, 用位置差分计算速度:
+          vel = (pos_cur - pos_prev) / dt
+        位置差分速度噪声: sqrt(2) * pos_sigma / dt, 不小于 pos_diff_vel_std。
+        """
         self.est.meas_update_pos(gnss)
-        if gnss.velocity is not None:
-            self.est.meas_update_vel(gnss)
+
+        # 速度量测更新: 优先使用 GNSS 速度, 但 RTK 的 vel_sd 可能极大 (20+ m/s)
+        # 导致 K≈0。当 vel_sd 过大时, 用位置差分速度替代 (sigma 更可靠)。
+        vel_for_update = gnss.velocity
+        vel_sd_for_update = gnss.vel_sd
+        use_pos_diff = False
+        if vel_for_update is not None and vel_sd_for_update is not None:
+            max_sd = float(np.max(vel_sd_for_update))
+            if max_sd > 2.0:  # RTK vel_sd 不可靠, 用位置差分替代
+                use_pos_diff = True
+
+        if (vel_for_update is None or use_pos_diff) and self._prev_gnss_pos is not None:
+            dt = gnss.timestamp - self._prev_gnss_ts
+            if dt > 0.5:  # 仅在合理时间间隔内计算 (避免 GNSS 中断后差分)
+                vel_diff = (gnss.position - self._prev_gnss_pos) / dt
+                vel_for_update = vel_diff
+                # 位置差分速度 sigma (per-axis): sqrt(2) * pos_sd[i] / dt
+                if gnss.sd is not None:
+                    pos_sd = gnss.sd
+                else:
+                    pos_sd = np.full(3, 1.0)
+                vel_sd_arr = np.maximum(
+                    math.sqrt(2) * pos_sd / dt,
+                    self._pos_diff_vel_std)
+                vel_sd_for_update = vel_sd_arr
+
+        if vel_for_update is not None:
+            # 构造带速度的 GnssSolution 副本 (避免修改原对象)
+            gnss_with_vel = dataclasses.replace(gnss)
+            gnss_with_vel.velocity = vel_for_update
+            gnss_with_vel.vel_sd = vel_sd_for_update
+            self.est.meas_update_vel(gnss_with_vel)
+
         self.est.feedback()
         self.last_qins = 3  # LC 量测更新完成
+
+        # 缓存当前 GNSS 位置供下次位置差分
+        self._prev_gnss_pos = gnss.position.copy()
+        self._prev_gnss_ts = gnss.timestamp
 
     def _apply_constraints(self, imu: ImuMeasurement) -> None:
         """NHC/ZUPT/ZARU 约束更新 (per-IMU, decimation, 互斥)。
