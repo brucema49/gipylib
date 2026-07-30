@@ -18,6 +18,7 @@ import math
 import numpy as np
 
 from src.core.data_types import InsState
+from src.core.ins.transfer_matrix import skew
 from src.core.tc.tc_state_index import TcStateIndex
 from src.core.gnss.rtklib.rtkcmn import (geodist, satazel, ecef2pos,
                                           satexclude, ionmodel, tropmodel,
@@ -157,6 +158,14 @@ class SppTcMeas(TcMeasurement):
             H_row[si.clk_bias] = 1.0                      # GPS clock base (always)
             if sys_off != 0:
                 H_row[si.clk_bias + sys_off] = 1.0        # inter-system bias (non-GPS)
+            # 杆臂姿态耦合: ∂ρ/∂att = -e · skew(C_b_e · lever_b)
+            # 即使 lever_b=[0,0,0], 在线估计后激活, 使 yaw 通过杆臂可观测
+            lever_b = state.leverarm
+            lever_e = state.C_b_e @ lever_b
+            H_row[si.att:si.att + 3] = -e @ skew(lever_e)
+            # 杆臂 Jacobian: ∂ρ/∂lever = e · C_b_e
+            if si.has_lever_arm():
+                H_row[si.lever_arm:si.lever_arm + 3] = e @ state.C_b_e
             v_list.append(v_i)
             H_rows.append(H_row)
             R_diag.append(R_i)
@@ -260,7 +269,7 @@ class _DdBase(TcMeasurement):
                 return i
         return i_el[0]  # 全 reset 时用最高
 
-    def _build_dd(self, nav, x, P, yr, er, yu, eu, sat, el, dt, obsr, si):
+    def _build_dd(self, nav, x, P, yr, er, yu, eu, sat, el, dt, obsr, si, state):
         """构造双差 v / H / R (H 为 [m, si.dim])。
 
         与 rtklib ddres 数学等价, 但:
@@ -317,6 +326,14 @@ class _DdBase(TcMeasurement):
                     # 与 GINav ddres_rtkins H(1:3) = LOS_i - LOS_j 一致
                     H_row = np.zeros(si.dim)
                     H_row[si.pos:si.pos + 3] = eu[ref_i, :] - eu[j, :]
+                    # 杆臂姿态耦合 (双差): ∂(DD_ρ)/∂att = -(eu_ref - eu_j) · skew(C_b_e · lever_b)
+                    lever_b = state.leverarm
+                    lever_e = state.C_b_e @ lever_b
+                    los_dd = eu[ref_i, :] - eu[j, :]
+                    H_row[si.att:si.att + 3] = -los_dd @ skew(lever_e)
+                    # 杆臂 Jacobian: ∂(DD_ρ)/∂lever = (eu_ref - eu_j) · C_b_e
+                    if si.has_lever_arm():
+                        H_row[si.lever_arm:si.lever_arm + 3] = los_dd @ state.C_b_e
                     if (not code) and self.use_phase:
                         # phase: pred = DD_rho + λ*(N_i - N_j)
                         # innovation: v = obs - pred = DD_y - λ*(N_i - N_j)
@@ -454,7 +471,7 @@ class RtkTcMeas(_DdBase):
             x = np.zeros(si.dim)
         # P 用于 ref sat 选择 (选择非刚 reset 的卫星作参考)
         # 9. 构造双差
-        return self._build_dd(nav, x, P, yr, er, yu, eu, sats, els, dt, obsr, si)
+        return self._build_dd(nav, x, P, yr, er, yu, eu, sats, els, dt, obsr, si, state)
 
 
 class RtdTcMeas(_DdBase):
@@ -505,7 +522,7 @@ class RtdTcMeas(_DdBase):
         # RTD 只取 code: 在 _build_dd 中通过 use_phase=False 控制
         # 但 _build_dd 仍会遍历 phase/code, 这里在构造后过滤掉 phase 行
         v_all, H_all, R_all, info = self._build_dd(
-            nav, x, P, yr, er, yu, eu, sats, els, dt, obsr, si)
+            nav, x, P, yr, er, yu, eu, sats, els, dt, obsr, si, state)
         if len(v_all) == 0:
             return v_all, H_all, R_all, info
         # info['pairs'] 中的 code 字段: 0=phase, 1=code

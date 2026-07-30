@@ -23,12 +23,15 @@
 """
 import collections
 import logging
+import math
 from typing import Optional, List
 
 import numpy as np
 
 from src.core.data_types import AlignedBlock, GnssSolution, ImuMeasurement
+from src.core.ins.attitude import euler2dcm, att_caln2e, dcm2quat
 from src.core.ins.constraints import Constraints
+from src.core.ins.earth_param import cal_Ce2n, ecef2llh
 from src.core.ins.initializer import InsInitializer, InitMode
 from src.core.ins.interpolator import imu_interpolate_linear
 from src.core.ins.lc_integration import _DecimationCounter
@@ -98,6 +101,8 @@ class TcIntegration:
         # 初始化前缓冲
         self._init_imu: List[ImuMeasurement] = []
         self._init_obs: list = []   # [(obsr, obsb, nav, t_gnss), ...]
+        # 5秒 GNSS 位置缓存 (用于动态初始化: 首尾位置差分计算 yaw)
+        self._gnss_pos_cache: list = []  # [(t, pos_ecef), ...]
         self._initialized = False
         self._last_gnss_t: float = 0.0
         self._last_q: int = 5       # 最近 GNSS quality (初值 5=SPP)
@@ -286,13 +291,8 @@ class TcIntegration:
 
         # 只处理最新 GNSS 历元 (避免遍历所有历元导致 nav.x 被污染)
         obsr, obsb, nav, t_gnss = self._init_obs[-1]
-        imu_block = [imu for imu in self._init_imu
-                     if t_gnss - 2.0 <= imu.timestamp <= t_gnss + 1.0]
-        if len(imu_block) < 2:
-            return
-        has_before = any(imu.timestamp <= t_gnss for imu in imu_block)
-        has_after = any(imu.timestamp >= t_gnss for imu in imu_block)
-        if not (has_before and has_after):
+        # 确保 IMU 数据已就绪 (动态初始化只需最新 IMU 数据, 不需要 5 秒缓冲)
+        if not self._init_imu:
             return
 
         # 保存 nav 状态: SPP+RTK 会修改 nav 内部状态, 初始化失败时需恢复
@@ -364,70 +364,71 @@ class TcIntegration:
         # 恢复 nav 状态 (SPP+RTK 已获取所需结果, 无需保留 nav 副作用)
         self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
 
-        # 动态速度阈值: 基于运动检测所用位置源
-        # RTK FIX (quality==1): 用 2.0 m/s (精确稳定, 用户要求 RTK/RTD > 2m/s)
-        # RTK FLOAT / SPP: 用 3.0 m/s (SPP 位置噪声 3-5m, 但 5.0 导致初始化延迟到 t+730s;
-        #   降至 3.0 提前初始化, SPP 噪声通过 gnss_buffer 多历元平滑过滤)
-        if quality == 1:  # FIX
-            init_speed_thr = 2.0
-        else:  # FLOAT / DGPS / SPP: 用 SPP 位置做运动检测
-            init_speed_thr = 3.0
-        original_thr = self._initializer.dynamic_speed_threshold
-        self._initializer.dynamic_speed_threshold = init_speed_thr
+        # 缓存 GNSS 位置 (5 秒窗口, 用于动态初始化: 首尾位置差分计算 yaw)
+        self._gnss_pos_cache.append((t_gnss, rr.copy()))
+        # 限制缓存大小: 保留最近 6 个历元 (span=5s, 与 5 秒初始化窗口一致)
+        if len(self._gnss_pos_cache) > 6:
+            self._gnss_pos_cache = self._gnss_pos_cache[-6:]
 
-        # 位置差分运动检测: RTK FLOAT 启动阶段噪声大 (滤波器未收敛, 位置跳变 2-3m),
-        # 会误触发动对准阈值. 使用 SPP 位置做运动检测 (更稳定, 静止时平面速度 <0.5m/s).
-        # 但初始化位置始终用 RTK 解 (用户要求: 不使用 SPP 初始化紧组合参数)
-        if quality == 1:  # FIX
-            pos_for_init = rr.copy()
-        else:  # FLOAT / DGPS: 用 SPP 位置做运动检测, 但初始化位置用 RTK
-            pos_for_init = x_spp[:3].copy()
-
-        gnss_sol = GnssSolution(
-            timestamp=t_gnss, week=0, position=pos_for_init,
-            quality=quality, num_sv=ns, sd=pos_sd,
-            velocity=None, vel_sd=None,
-        )
-        block = AlignedBlock(gnss=gnss_sol, imu_list=imu_block)
-
-        # 尝试初始化 (static 模式: yaw=0, 与 truth 一致; position_diff: 速度方向→yaw)
-        init_state = None
-        init_P = None
-        try:
-            init_state, init_P = self._initializer.initialize(
-                block, self._init_mode)
-        except ValueError as e:
-            logger.debug(f"TC init fail t={t_gnss:.1f}: {e}")
-        except Exception as e:
-            logger.debug(f"TC init excp t={t_gnss:.1f}: {e}")
-
-        # 恢复原始阈值
-        self._initializer.dynamic_speed_threshold = original_thr
-
-        if init_state is None:
-            buf_len = len(self._initializer.gnss_buffer)
-            logger.debug(f"TC init None t={t_gnss:.1f} buf={buf_len}/{self._initializer.gnss_buffer_size} "
-                         f"q={quality}")
+        if len(self._gnss_pos_cache) < 2:
             return
 
-        # 初始化位置始终用 RTK 解 (用户要求: 不使用 SPP 初始化紧组合参数)
-        # RTK FLOAT 虽然有噪声, 但精度远优于 SPP (SPP 高程误差可达 20m+)
+        t_first, pos_first = self._gnss_pos_cache[0]
+        t_last, pos_last = self._gnss_pos_cache[-1]
+        span = t_last - t_first
+        if span < 5.0:
+            return  # 不足 5 秒, 继续累积
+
+        # 动态速度阈值: 基于运动检测所用位置源
+        if quality == 1:  # FIX
+            init_speed_thr = 2.0
+        else:  # FLOAT / DGPS / SPP
+            init_speed_thr = 3.0
+
+        # 首尾位置差分计算速度矢量 (5 秒窗口)
+        vel_e = (pos_last - pos_first) / span
+
+        # 平面速度 (EN) 检查
+        lat, lon, _ = ecef2llh(pos_last)
+        C_e_n = cal_Ce2n(lat, lon)
+        vel_n = C_e_n @ vel_e
+        planar_speed = math.sqrt(vel_n[0] ** 2 + vel_n[1] ** 2)
+        if planar_speed < init_speed_thr:
+            logger.debug(f"TC init speed={planar_speed:.2f} < {init_speed_thr} "
+                         f"t={t_gnss:.1f} span={span:.1f}s")
+            return
+
+        # yaw = atan2(v_E, v_N), pitch=0, roll=0
+        yaw = math.atan2(vel_n[1], vel_n[0])
+        att_rpy = np.array([0.0, 0.0, yaw], dtype=np.float64)
+
+        # 初始化位置: RTK 模式用 RTK 解, SPP 模式用 SPP 解
         if self._mode in ("rtk", "rtd") and obsb is not None and quality != 5:
-            init_state.pos_e = rr.copy()
+            pos_for_state = rr.copy()
+        else:
+            pos_for_state = pos_last.copy()
+
+        gnss_sol = GnssSolution(
+            timestamp=t_gnss, week=0, position=pos_for_state,
+            quality=quality, num_sv=ns, sd=pos_sd,
+            velocity=vel_e, vel_sd=None,
+        )
+
+        # 装配初始状态 (使用 InsInitializer 的 _assemble_state / _set_initial_variance)
+        init_state = self._initializer._assemble_state(
+            gnss_sol, att_rpy, vel_e, InitMode.POSITION_DIFF)
+        init_P = self._initializer._set_initial_variance(InitMode.POSITION_DIFF)
 
         # 创建估计器 + 量测构造器
         self._est = TcEstimator(init_state, init_P, self._cfg, self._mode)
         builder_cls = _MEAS_BUILDERS.get(self._mode, SppTcMeas)
         self._meas_builder = builder_cls(self._cfg)
         # 用 SPP 钟差初始化 direct clk estimate (加速收敛, 否则需 150s+ 收敛)
-        # x_spp[3]=GPS c*dt(m), x_spp[4]=GLO-GPS bias(m), x_spp[5]=GAL-GPS bias(m)
-        # 修复后: _clk_stored 是 direct estimate, self.x[clk_bias] 是 ε_clk (init 0)
         si = self._est.si
         if si.clk_bias >= 0 and len(x_spp) >= 6:
             self._est._clk_stored[0] = float(x_spp[3])   # GPS
             self._est._clk_stored[1] = float(x_spp[4])   # GLO
             self._est._clk_stored[2] = float(x_spp[5])   # GAL
-            # SPP 钟差不确定度 ~10m, 远小于默认 100m
             for k in range(3):
                 self._est.P[si.clk_bias + k, si.clk_bias + k] = 10.0 ** 2
         self._initialized = True
@@ -437,7 +438,8 @@ class TcIntegration:
 
         logger.info(
             f"TcIntegration 初始化成功: t={init_state.timestamp:.3f}, "
-            f"mode={self._mode}, pos={init_state.pos_e}")
+            f"mode={self._mode}, span={span:.1f}s, "
+            f"planar_speed={planar_speed:.2f}m/s, yaw={math.degrees(yaw):.1f}°")
 
         # 回放缓冲中 init 时间戳之后的事件
         self._replay_buffer(init_state.timestamp)
@@ -445,6 +447,7 @@ class TcIntegration:
         # 清空初始化缓冲
         self._init_imu.clear()
         self._init_obs.clear()
+        self._gnss_pos_cache.clear()
 
     def _replay_buffer(self, init_ts: float) -> None:
         """回放初始化缓冲中 init_ts 之后的事件。"""
