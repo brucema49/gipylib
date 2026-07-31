@@ -152,9 +152,8 @@ class Constraints:
           - ‖ω‖ < nhc_max_gyro (剧烈转弯跳过整个 NHC)
           - 单维 |v^v[i]| < nhc_max_vel (逐维检查, 超阈剔除该维)
 
-        自适应 R: NHC 约束基于 v^e, 但 TC 模式无 GNSS 速度直接更新,
-        v^e 误差大时 NHC 会锁住错误 yaw。R_adaptive = R + H_vel @ P[vel] @ H_vel^T
-        在速度不确定时自动弱化 NHC, 防止 yaw-速度正反馈发散。
+        自适应 R: R += H_vel @ P[vel] @ H_vel^T + H_att @ P[att] @ H_att^T
+        MAXVEL=0.5 guard 跳过 yaw 大误差历元, 自适应 R 处理过渡期。
 
         Args:
             estimator: LcEstimator (提供 state/ins_update/si/joseph_update)
@@ -167,10 +166,7 @@ class Constraints:
         if gyro_norm >= self.nhc_max_gyro:
             return False
         Z, H, R = self._nhc.build_meas(estimator.state, imu, estimator.si)
-        # 自适应 R: 加入速度 + 姿态不确定度
-        # LC 模式无 GNSS 速度直接更新, v^e 误差大时 NHC 会锁住错误 yaw
-        # 姿态不确定度 (尤其 yaw) 大时, NHC 的侧向速度约束方向不确定,
-        # 需弱化 NHC 防止 yaw-速度正反馈发散
+        # 自适应 R: 加入速度 + 姿态不确定度 (过渡期保护)
         si = estimator.si
         P_vv = estimator.P[si.vel:si.vel+3, si.vel:si.vel+3]
         H_vel = H[:, si.vel:si.vel+3]

@@ -93,6 +93,10 @@ class LcIntegration:
         # add_imu 开始时置 2, _apply_gnss_update / _apply_constraints 触发后置 3,
         # 末尾 time_update(imu) 不重置 (保留本历元量测更新标记)
         self.last_qins: int = 2
+        # NHC warmup: 动态初始化后需等待首次 GNSS 量测更新修正 yaw, 再启用 NHC
+        # (与 TcIntegration._nhc_warmup 一致, 默认 1 = 至少 1 次 GNSS 更新后启用)
+        self._meas_count: int = 0
+        self._nhc_warmup = int(ins_cfg.get("nhc_warmup", 1))
 
     def add_imu(self, imu: ImuMeasurement) -> None:
         """GVINS 风格 IMU 消费: 每条 IMU 检查 GNSS 队头时间戳。
@@ -212,6 +216,7 @@ class LcIntegration:
 
         self.est.feedback()
         self.last_qins = 3  # LC 量测更新完成
+        self._meas_count += 1  # NHC warmup: 计数 GNSS 量测更新
 
         # 缓存当前 GNSS 位置供下次位置差分
         self._prev_gnss_pos = gnss.position.copy()
@@ -238,7 +243,8 @@ class LcIntegration:
             if self.zaru_enable and self._zaru_counter.should_trigger():
                 if self._constraints.zaru(self.est, imu):
                     applied = True
-        elif self.nhc_enable and self._nhc_counter.should_trigger():
+        elif (self.nhc_enable and self._nhc_counter.should_trigger()
+              and self._meas_count >= self._nhc_warmup):
             if self._constraints.nhc(self.est, imu):
                 applied = True
 
