@@ -6,13 +6,22 @@
 > 输出文件（POS/CSV）的时间字段通过 `unix_to_gpst()` 转回 (week, sow) 写入，便于与 rtklib 输出格式对齐。
 >
 > **当前实现状态**：
-> - ✅ 已实现：`src/log/writer_base.py::WriterBase(ABC)`、`src/log/solution_writer.py::SolutionWriter`（rtklib 风格 .pos）、`src/log/aligned_writer.py::AlignedWriter`（对齐块状 CSV）
+> - ✅ 已实现：`src/log/writer_base.py::WriterBase(ABC)`、`src/log/solution_writer.py::SolutionWriter`（rtklib 风格 .pos，接受 `position_format`/`time_format` 参数）、`src/log/aligned_writer.py::AlignedWriter`（对齐块状 CSV）
+> - ✅ 已实现：`src/log/rslt_writer.py::RSLTWriter`（INS 结果输出，接受 `position_format`/`time_format` 参数，100Hz `.rslt`）
+> - ✅ 已实现：`src/log/trace_file_writer.py::TraceFileWriter`（生成 `.trace` 文件，含 GPS week+sow 时间戳，过滤无效调试行如 `pos=[0. 0. 0.]`、`x[clk]=N/A`、`clk_stored=[0. 0. 0.]`）
 > - ✅ 已实现：`src/log/logger.py::Logger`（外部模式 / internal+on 模式：消费 imu_queue + gnss_queue，匹配后写 AlignedWriter；internal+on 模式下同时收集 IMU+GNSS 数据，流式结束后批量运行 LcRunner 输出松组合 .pos）
 > - ✅ 已实现：`src/log/solution_logger.py::SolutionLogger`（内部模式：仅消费 gnss_queue，写 SolutionWriter）
 > - ✅ 已实现：`src/log/aligner.py::Aligner`（IMU 积攒 + GNSS 收割的匹配器，时间戳基于 Unix）
 > - ✅ 已实现：`src/core/ins/initializer.py::InsInitializer`（INS 初始化，三种模式 + 三阈值检验，详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
 > - ✅ 已实现：`src/core/ins/lc_runner.py::LcRunner`（松组合批处理运行器，收集 IMU+GNSS 后批量执行 LC EKF，输出松组合 .pos，详见 [estimator.md](file:///home/mxl/workplace/gipylib/skills/estimator.md)）
-> - 🚧 预留：TraceWriter / RawDataWriter / Solution CSV/NMEA 输出 / INS 状态输出（当前未实现）
+> - 🚧 预留：RawDataWriter / Solution CSV/NMEA 输出 / INS 状态输出（当前未实现）
+>
+> **三种运行模式**（由 `ins.enabled` 配置项决定）：
+> - `ins.enabled=off`（纯 GNSS）→ SolutionLogger + SolutionWriter → `.pos`
+> - `ins.enabled=on`（松组合 LC）→ LcStream + RSLTWriter → `.rslt`（100Hz）
+> - `ins.enabled=tc`（紧组合 TC）→ TcStream + RSLTWriter → `.rslt`（100Hz）
+>
+> **输出格式配置**：`output.position_format`（`llh`/`xyz`）、`output.time_format`（`gpst`/`datetime`）、`trace_level`（0-3）。
 >
 > **框架设计模式集成**：
 > - **纯队列流水线**：`Logger` / `SolutionLogger` 作为估计线程或传感器线程的下游消费者，从对应队列取数据（`queue.get()`），**无观察者回调、无 notify()**，与传感器层统一为纯队列流水线
@@ -27,7 +36,7 @@
 - [2. 日志类型与架构](#2-日志类型与架构)
 - [3. Writer 类继承体系](#3-writer-类继承体系)
 - [4. SolutionWriter — 解算结果输出](#4-solutionwriter--解算结果输出)
-- [5. TraceWriter — 运行轨迹/调试输出](#5-tracewriter--运行轨迹调试输出)
+- [5. TraceFileWriter — 运行轨迹/调试输出](#5-tracefilewriter--运行轨迹调试输出)
 - [6. RawDataWriter — 原始数据记录](#6-rawdatawriter--原始数据记录)
 - [7. Logger 线程设计](#7-logger-线程设计)
 - [8. 输出格式定义](#8-输出格式定义)
@@ -43,13 +52,14 @@
 | 文件 | 职责 | 实现状态 |
 |------|------|---------|
 | `src/log/writer_base.py` | 输出器抽象基类 `WriterBase(ABC)`，定义 open/write/close 生命周期 | ✅ 已实现 |
-| `src/log/solution_writer.py` | rtklib 风格 `.pos` 输出 `SolutionWriter(WriterBase)`，ECEF→LLH，sd ECEF→ENU | ✅ 已实现 |
+| `src/log/solution_writer.py` | rtklib 风格 `.pos` 输出 `SolutionWriter(WriterBase)`，ECEF→LLH，sd ECEF→ENU，接受 `position_format`/`time_format` 参数 | ✅ 已实现 |
+| `src/log/rslt_writer.py` | INS 结果输出 `RSLTWriter(WriterBase)`，100Hz `.rslt`，接受 `position_format`/`time_format` 参数 | ✅ 已实现 |
 | `src/log/aligned_writer.py` | 对齐块状 CSV 输出 `AlignedWriter(WriterBase)`，G 行 + N 行 I | ✅ 已实现 |
+| `src/log/trace_file_writer.py` | 轨迹/调试输出 `TraceFileWriter`，生成 `.trace` 文件，含 GPS week+sow 时间戳，过滤无效调试行 | ✅ 已实现 |
 | `src/log/aligner.py` | IMU 积攒 + GNSS 收割的匹配器 `Aligner`（harvest_window=1.0s） | ✅ 已实现 |
 | `src/log/logger.py` | 日志线程 `Logger`（external+on / internal+on 模式，消费 imu_queue + gnss_queue；internal+on 下同时收集数据供 LcRunner 批量运行） | ✅ 已实现 |
 | `src/log/solution_logger.py` | 内部模式日志线程 `SolutionLogger`（仅消费 gnss_queue） | ✅ 已实现 |
 | `src/core/ins/lc_runner.py` | 松组合批处理运行器 `LcRunner`（收集 IMU+GNSS 后批量执行 LC EKF，输出松组合 .pos） | ✅ 已实现 |
-| `src/log/trace_writer.py` | 运行轨迹/调试输出 `TraceWriter(WriterBase)` | 🚧 预留 |
 | `src/log/raw_data_writer.py` | 原始数据记录 `RawDataWriter(WriterBase)` | 🚧 预留 |
 
 ### 1.2 日志层次
@@ -181,6 +191,10 @@ class SolutionWriter(WriterBase):
     ECEF → LLH（度）转换，sd ECEF → ENU。
     age/ratio 填 0（本项目 GnssSolution 无此字段）。
     timestamp 是 Unix 时间戳，输出时通过 unix_to_gpst() 转回 (week, sow)。
+
+    输出格式可配置:
+        position_format: "llh"（经纬度高，默认）或 "xyz"（ECEF 米）
+        time_format: "gpst"（GPS 周内秒，默认）或 "datetime"（日历时间）
     """
 
     HEADER = (
@@ -188,7 +202,8 @@ class SolutionWriter(WriterBase):
         "ns   sdn(m)   sde(m)   sdu(m)  sdne(m)  sdeu(m)  sdun(m) age(s)  ratio\n"
     )
 
-    def __init__(self, output_dir: str, filename: str = "solution.pos"): ...
+    def __init__(self, output_dir: str, filename: str = "solution.pos",
+                 position_format: str = "llh", time_format: str = "gpst"): ...
     def open(self) -> None: ...
     def write(self, sol: GnssSolution) -> None: ...
     def close(self) -> None: ...
@@ -229,7 +244,7 @@ class GnssSolution:
 
 ### 4.5 单滤波 Solution（INS 启用后，预留）
 
-INS 启用后（`internal` + `ins.enabled: "on"`），输出 Solution 会扩展为含 IMU 状态的完整字段：
+INS 启用后（`internal` + `ins.enabled: "lc"`），输出 Solution 会扩展为含 IMU 状态的完整字段：
 
 ```python
 @dataclass
@@ -254,13 +269,19 @@ class Solution:  # 预留，当前未实现
 
 ---
 
-## 5. TraceWriter — 运行轨迹/调试输出
+## 5. TraceFileWriter — 运行轨迹/调试输出
+
+> **实际实现**：`src/log/trace_file_writer.py::TraceFileWriter`，生成 `.trace` 文件，含 GPS week+sow 时间戳，过滤无效调试行（如 `pos=[0. 0. 0.]`、`x[clk]=N/A`、`clk_stored=[0. 0. 0.]`）。
 
 ### 5.1 类签名
 
 ```python
-class TraceWriter(WriterBase):
-    """运行轨迹/调试输出器，按 trace_level 控制输出详细程度"""
+class TraceFileWriter:
+    """运行轨迹/调试输出器（src/log/trace_file_writer.py），按 trace_level 控制输出详细程度
+
+    生成 .trace 文件，时间戳为 GPS week+sow。
+    过滤无效调试行：pos=[0. 0. 0.]、x[clk]=N/A、clk_stored=[0. 0. 0.] 等。
+    """
 
     def __init__(self, output_dir: str, trace_level: int = 1) -> None: ...
 
@@ -347,7 +368,7 @@ class RawDataWriter(WriterBase):
 > - **`Logger`（外部模式）**：消费 `imu_queue` + `gnss_queue`，通过 `Aligner` 匹配后写 `AlignedWriter`
 > - **`SolutionLogger`（内部模式）**：仅消费 `gnss_queue`，直接写 `SolutionWriter`
 >
-> **🚧 预留设计**：INS 启用后（`internal` + `ins.enabled: "on"`），将扩展为消费 `solution_queue` / `trace_queue` / `raw_log_queue` 三队列的完整 Logger（见 7.5 节）。
+> **🚧 预留设计**：INS 启用后（`internal` + `ins.enabled: "lc"`），将扩展为消费 `solution_queue` / `trace_queue` / `raw_log_queue` 三队列的完整 Logger（见 7.5 节）。
 
 ### 7.1 Logger（外部模式 / internal+on 模式，实际实现 src/log/logger.py）
 
@@ -465,20 +486,17 @@ class SolutionLogger(Thread):
 
 ### 7.3 Logger 的选用规则
 
-| 运行模式 | gnss_source | ins.enabled | 选用 Logger | 消费队列 | Writer | main.py 路径 |
-|---------|-------------|-------------|------------|---------|--------|-------------|
-| 外部对齐 | `external` | `on` | `Logger` | imu_queue + gnss_queue | AlignedWriter | 路径 A |
-| 内部纯 GNSS | `internal` | `off` | `SolutionLogger` | gnss_queue | SolutionWriter | 路径 B |
-| 内部对齐 + 松组合 | `internal` | `on` | `Logger` (+ gnss_writer + lc_runner) | imu_queue + gnss_queue | AlignedWriter + SolutionWriter (×2) | 路径 C |
-| 🚧 INS 启用（预留） | `internal` | `on` | 完整 Logger（7.5 节） | solution_queue + trace_queue + raw_log_queue | SolutionWriter + TraceWriter + RawDataWriter | 未来路径 D |
+三种运行模式由 `ins.enabled` 配置项决定（`coupling_mode` 字段已移除）：
 
-> **路径 C 说明**：`internal + ins.enabled=on` 模式输出**三个文件**：
-> 1. **纯 GNSS 定位结果** `RTK.pos`（由 `gnss_solution_filename` 配置）— `Logger` 每收到一个 GNSS 历元立即写入 `gnss_writer`（SolutionWriter）
-> 2. **对齐块状 CSV** `aligned_internal_rtk.csv`（由 `aligned_filename` 配置）— `Logger` + `Aligner` + `AlignedWriter` 匹配 IMU+GNSS 后写入
-> 3. **松组合定位结果** `RTKLC.pos`（由 `solution_filename` 配置）— 流式结束后 `Logger` 调用 `LcRunner.run()` 批量执行 LC EKF 输出
+| 运行模式 | ins.enabled | 选用处理流 | 选用 Logger | 消费队列 | Writer | 输出文件 |
+|---------|-------------|-----------|------------|---------|--------|---------|
+| 纯 GNSS | `off` | — | `SolutionLogger` | gnss_queue | SolutionWriter | `.pos` |
+| 松组合 LC | `on` | `LcStream` | `RSLTWriter` | solution_queue | RSLTWriter | `.rslt`（100Hz） |
+| 紧组合 TC | `tc` | `TcStream` | `RSLTWriter` | solution_queue | RSLTWriter | `.rslt`（100Hz） |
+
+> **输出格式配置**：`output.position_format`（`llh`/`xyz`）、`output.time_format`（`gpst`/`datetime`）、`trace_level`（0-3）由 SolutionWriter / RSLTWriter 构造函数接收。
 >
-> 传感器为 `InternalGnssSensor`（实时 RTK/SPP 解算）+ `ImuSensor`（IMU 流式读取）。
-> `Logger` 在消费数据的同时收集 IMU+GNSS 列表（`_lc_imu_log` / `_lc_gnss_log`），流式结束后（GNSS EOF）在 `finally` 块中调用 `_run_lc()` 批量运行松组合 EKF。
+> **历史模式说明**：早期版本中 `ins.enabled=on` 对应"外部对齐模式"（`Logger` + `Aligner` + `AlignedWriter`，输出 `aligned.csv`）与"内部对齐 + 松组合批处理"（`Logger` + `gnss_writer` + `lc_runner`，输出 `.pos` + `aligned.csv` + `RTKLC.pos`）。当前已升级为流式 `LcStream` + `RSLTWriter`（100Hz `.rslt`）。
 
 ### 7.4 Aligner — IMU 积攒 + GNSS 收割匹配器（实际实现 src/log/aligner.py）
 
@@ -508,7 +526,7 @@ class Aligner:
 
 ### 7.5 完整 Logger 设计（🚧 预留：INS 启用后）
 
-INS 启用后（`internal` + `ins.enabled: "on"`），Logger 将扩展为消费三队列的完整设计：
+INS 启用后（`internal` + `ins.enabled: "lc"`），Logger 将扩展为消费三队列的完整设计：
 
 ```python
 class Logger:  # 🚧 预留
@@ -531,7 +549,7 @@ class Logger:  # 🚧 预留
 | 属性 | 类型 | 说明 |
 |------|------|------|
 | `self.solution_writer` | `SolutionWriter` | 解算结果输出 |
-| `self.trace_writer` | `TraceWriter` | 轨迹/调试输出 |
+| `self.trace_writer` | `TraceFileWriter` | 轨迹/调试输出 |
 | `self.raw_data_writer` | `RawDataWriter` | 原始数据输出 |
 
 主循环流程：
@@ -659,7 +677,7 @@ class Logger:
 | StreamDesign.md | 本方案 | 扩展内容 |
 |----------------|--------|---------|
 | 单一 `_write_solution()` | `SolutionWriter(WriterBase)` | 多格式输出（POS/CSV/NMEA），ABC 继承体系 |
-| 无轨迹输出 | `TraceWriter(WriterBase)` | 分级调试输出 |
+| 无轨迹输出 | `TraceFileWriter` | 分级调试输出 |
 | 简单原始数据记录 | `RawDataWriter(WriterBase)` | CSV 格式，按数据源分文件 |
 | 无终端输出 | `Logger._print_summary()` | 定期终端摘要 |
 | 无运行日志 | Python `logging` | 统一运行日志管理 |
@@ -715,7 +733,7 @@ logging:
 |---------|------|------|
 | **依赖注入** | `Logger` 构造函数接收 `WriterBase` 实例 | 解耦 Logger 与具体输出格式，便于替换/测试 |
 | **OOP-封装** | 输出逻辑封装在 `WriterBase` 子类内部 | Logger 仅调用 `write()`，不关心格式细节 |
-| **OOP-继承** | `WriterBase(ABC)` → SolutionWriter/TraceWriter/RawDataWriter | 统一 open/write/close 生命周期接口 |
+| **OOP-继承** | `WriterBase(ABC)` → SolutionWriter/TraceFileWriter/RawDataWriter | 统一 open/write/close 生命周期接口 |
 | **OOP-多态** | Logger 持有 `WriterBase` 抽象引用 | 运行时调用具体子类的 write() 方法 |
 | **纯队列流水线** | `LcIntegration`(生产者) → 队列 → Logger(消费者) | 全程 `queue.put()`/`queue.get()`，无观察者回调，解耦生产与消费 |
 
@@ -848,7 +866,7 @@ def build_logger(config: dict, queues: dict, control) -> Logger:
     """装配完整日志记录器（依赖注入，INS 启用后）"""
     output_dir = config["logging"]["output_dir"]
     solution_writer = SolutionWriter(output_dir, format="pos")
-    trace_writer = TraceWriter(output_dir, trace_level=1)
+    trace_writer = TraceFileWriter(output_dir, trace_level=1)
     raw_data_writer = RawDataWriter(output_dir, enabled=False)
     return Logger(
         solution_queue=queues["solution"],
@@ -885,7 +903,7 @@ def build_logger(config: dict, queues: dict, control) -> Logger:
         ↓                                                → AlignedWriter.write(AlignedBlock)
   (None EOF sentinel 触发 Logger 退出)
 
-【当前实现：内部对齐 + 松组合模式（internal + ins.enabled=on，路径 C）】
+【当前实现：内部对齐 + 松组合模式（internal + ins.enabled=lc，路径 C）】
   ImuSensor.run()
     → ImuFormator.decode(line) → ImuMeasurement         (gpst_to_unix 时间戳)
     → imu_queue.put(SensorData(tag="imu"))
@@ -906,7 +924,7 @@ def build_logger(config: dict, queues: dict, control) -> Logger:
         → InsInitializer.initialize() → LcEstimator + LcIntegration
         → 整数秒输出 InsState+P → GnssSolution → lc_writer.write() → RTKLC.pos (松组合)
 
-【🚧 预留：INS 启用后的完整流水线（internal + ins.enabled=on，路径 D）】
+【🚧 预留：INS 启用后的完整流水线（internal + ins.enabled=lc，路径 D）】
   ImuSensor/GnssRoverSensor ──put()──→ imu_queue/sensor_queue
                                                 ↓
                                      Scheduler（仅转发）          🚧 预留
@@ -932,5 +950,5 @@ def build_logger(config: dict, queues: dict, control) -> Logger:
 | 特性 | 体现 |
 |------|------|
 | **封装** | 各 Writer 的格式化细节（POS/CSV/NMEA）封装在子类内部，Logger 仅调用 `write()` |
-| **继承** | `WriterBase(ABC)` → `SolutionWriter` / `TraceWriter` / `RawDataWriter`，统一 open/write/close 接口 |
+| **继承** | `WriterBase(ABC)` → `SolutionWriter` / `TraceFileWriter` / `RawDataWriter`，统一 open/write/close 接口 |
 | **多态** | Logger 持有三个 `WriterBase` 抽象引用，运行时调用具体子类的 `write()` 方法 |

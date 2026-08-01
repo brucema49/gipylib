@@ -1,7 +1,6 @@
 """松组合 EKF 估计器 (单滤波, StateIndex 参数块管理)。
 
 参考:
-- gnss_ins_lc_nhc navfilter.cc (TimeUpdate/MeasureUpdate/ReviseState)
 - ignav ins-gnss.cc (H 矩阵 + 序贯 Joseph form)
 - GINav ins_time_updata.m (中间值法 P 传播)
 
@@ -28,7 +27,7 @@ logger = logging.getLogger(__name__)
 class LcEstimator:
     """松组合 EKF 估计器 (单滤波, StateIndex 参数块管理)。
 
-    参考 gnss_ins_lc_nhc (单滤波 + StateIndex) 和 GREAT-MSF (block 矩阵操作)。
+    参考 GREAT-MSF (block 矩阵操作)。
     算法参考 ignav (H 矩阵公式, ψ-error 模型)。
     """
 

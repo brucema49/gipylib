@@ -2,7 +2,7 @@
 
 参考:
 - GINav ins_time_updata.m (每历元传播, 中间值法)
-- gnss_ins_lc_nhc navfilter.cc TimeUpdate (P = Φ·P·Φ^T + Q)
+- navfilter TimeUpdate (P = Φ·P·Φ^T + Q)
 
 本阶段为开环模式: 只传播 P, 不做量测更新, 不反馈修正 InsState。
 P = Φ·(P + 0.5Q)·Φ^T + 0.5Q  (GINav 中间值法)

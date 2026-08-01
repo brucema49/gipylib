@@ -1,10 +1,16 @@
-"""ignav outins 风格 .rslt 输出器 (LLH 位置 + ECEF 速度 + FRD 姿态)。
+"""ignav outins 风格 .rslt 输出器 (位置 + ECEF 速度 + FRD 姿态)。
 
 参考 tools/ignav/ins-gnss/solution.cc outins (L1490-1582)。
 组合导航模式 (internal+on) 专用，纯 GNSS 模式仍用 SolutionWriter。
 
+位置格式可配置 (position_format):
+  - llh (默认): lat deg, lon deg, h m
+  - xyz: ECEF x, y, z (m)
+时间格式可配置 (time_format):
+  - gpst (默认): GPS 周 + 周内秒
+  - datetime: YYYY/MM/DD HH:MM:SS.sss
+
 公共参数 (位置/sd/Q/ns/age/ratio) 与 SolutionWriter (RTK.pos) 完全一致:
-  - 位置: LLH (lat deg, lon deg, h m)
   - sd: ENU 顺序 (sdn sde sdu sdne sdeu sdun)
 INS 多出来的参数 (Qins/速度/姿态) 保持 ignav outins 风格:
   - 速度: ECEF (vx vy vz) + ECEF sd
@@ -17,7 +23,7 @@ import numpy as np
 
 from src.core.data_types import InsState
 from src.core.ins.state_index import StateIndex
-from src.core.time_utils import unix_to_gpst
+from src.core.time_utils import unix_to_gpst, sow_to_ymdhms
 from src.log.solution_writer import ecef2llh, ecef2enu_matrix
 from src.log.writer_base import WriterBase
 
@@ -35,44 +41,63 @@ def _signed_sqrt(c: float) -> float:
 
 
 class RSLTWriter(WriterBase):
-    """ignav outins 风格 .rslt 输出器 (LLH 位置 + ECEF 速度 + FRD 姿态)。
+    """ignav outins 风格 .rslt 输出器 (位置 + ECEF 速度 + FRD 姿态)。
 
-    输出格式:
+    输出格式 (position_format/time_format 可配置):
       表头两行 (注释 + 字段定义) + 每历元一行:
-        week sow lat lon h Q Qins ns
+        [time] [pos] Q Qins ns
         sdn sde sdu sdne sdeu sdun age ratio       (与 RTK.pos 公共参数一致, ENU 顺序)
         vx vy vz sdvx sdvy sdvz sdvxy sdvyz sdvzx  (ECEF, ignav outins 固定格式)
         roll pitch yaw sdroll sdpitch sdyaw        (FRD deg, ignav outins 固定格式)
 
-    位置 LLH, 位置 sd ENU; 速度 ECEF, 速度 sd ECEF; 姿态 deg, 姿态 sd deg。
+    位置 sd ENU; 速度 ECEF, 速度 sd ECEF; 姿态 deg, 姿态 sd deg。
     age/ratio 填 0 (LC 不跟踪)。
     """
 
-    HEADER = (
-        "% (lat/lon/h=WGS84,Q=1:fix,2:float,3:sbas,4:dgps,5:single,6:ppp,"
-        "ns=# of satellites),"
-        "Qins=1:ins mechanization,"
-        "2:ins mechanization and propagate states and covariance,"
-        "3:ins-gnss loosely-coupled updates\n"
-        "%  GPST          latitude(deg) longitude(deg)  height(m)   "
-        "Q Qins  ns   sdn(m)   sde(m)   sdu(m)  sdne(m)  sdeu(m)  sdun(m) "
-        "age(s)  ratio    vx(m/s)    vy(m/s)    vz(m/s)       "
-        "sdvx       sdvy       sdvz      sdvxy      sdvyz      sdvzx   "
-        "roll(deg)  pitch(deg)    yaw(deg)  sdroll(d) sdpitch(d)  sdyaw(d)"
-        "  lever_x(m)  lever_y(m)  lever_z(m)  sdlx(m)  sdly(m)  sdlz(m)\n"
-    )
-
-    def __init__(self, output_dir: str, filename: str = "RTKLC.rslt"):
+    def __init__(self, output_dir: str, filename: str = "RTKLC.rslt",
+                 position_format: str = "llh", time_format: str = "gpst"):
         self.output_dir = output_dir
         self.filename = filename
+        self.position_format = position_format
+        self.time_format = time_format
         self._fp = None
         self._closed = False
+
+    def _build_header(self) -> str:
+        if self.time_format == "datetime":
+            time_col = "  GPST(datetime)             "
+        else:
+            time_col = "  GPST          "
+        if self.position_format == "xyz":
+            pos_cols = "   x(m)        y(m)        z(m)   "
+        else:
+            pos_cols = " latitude(deg) longitude(deg)  height(m)   "
+        return (
+            "% (lat/lon/h=WGS84,Q=1:fix,2:float,3:sbas,4:dgps,5:single,6:ppp,"
+            "ns=# of satellites),"
+            "Qins=1:ins mechanization,"
+            "2:ins mechanization and propagate states and covariance,"
+            "3:ins-gnss loosely-coupled updates\n"
+            "%" + time_col + pos_cols +
+            "Q Qins  ns   sdn(m)   sde(m)   sdu(m)  sdne(m)  sdeu(m)  sdun(m) "
+            "age(s)  ratio    vx(m/s)    vy(m/s)    vz(m/s)       "
+            "sdvx       sdvy       sdvz      sdvxy      sdvyz      sdvzx   "
+            "roll(deg)  pitch(deg)    yaw(deg)  sdroll(d) sdpitch(d)  sdyaw(d)"
+            "  lever_x(m)  lever_y(m)  lever_z(m)  sdlx(m)  sdly(m)  sdlz(m)\n"
+        )
+
+    def _format_time(self, timestamp: float) -> str:
+        week, sow = unix_to_gpst(timestamp)
+        if self.time_format == "datetime":
+            y, mo, d, h, mi, s = sow_to_ymdhms(week, sow)
+            return "%04d/%02d/%02d %02d:%02d:%06.3f" % (y, mo, d, h, mi, s)
+        return "%4d %10.3f" % (week, sow)
 
     def open(self) -> None:
         os.makedirs(self.output_dir, exist_ok=True)
         path = Path(self.output_dir) / self.filename
         self._fp = open(path, "w", encoding="utf-8")
-        self._fp.write(self.HEADER)
+        self._fp.write(self._build_header())
         self._closed = False
 
     def write(self, state: InsState, P: np.ndarray, si: StateIndex,
@@ -95,15 +120,12 @@ class RSLTWriter(WriterBase):
         Pv = P[vel_idx:vel_idx + 3, vel_idx:vel_idx + 3]
         Pa = P[att_idx:att_idx + 3, att_idx:att_idx + 3]
 
-        week, sow = unix_to_gpst(state.timestamp)
+        time_str = self._format_time(state.timestamp)
         D2R = np.pi / 180.0
         att_deg = state.att_rpy / D2R  # rad → deg
 
-        # 位置: ECEF → LLH (与 SolutionWriter 一致)
+        # 位置: ECEF → LLH (用于 sd 旋转, 也可能直接输出)
         llh = ecef2llh(state.pos_e)
-        lat_deg = llh[0] / D2R
-        lon_deg = llh[1] / D2R
-        h = llh[2]
 
         # 位置 sd: ECEF Pp → ENU (与 SolutionWriter 一致, 顺序 sdn sde sdu sdne sdeu sdun)
         R = ecef2enu_matrix(llh)
@@ -133,16 +155,23 @@ class RSLTWriter(WriterBase):
         else:
             sdl = np.zeros(3)
 
+        if self.position_format == "xyz":
+            pos_fmt = "%14.4f %14.4f %14.4f"
+            pos_vals = (state.pos_e[0], state.pos_e[1], state.pos_e[2])
+        else:
+            pos_fmt = "%14.9f %14.9f %10.4f"
+            pos_vals = (llh[0] / D2R, llh[1] / D2R, llh[2])
+
         fmt = (
-            "%4d %10.3f %14.9f %14.9f %10.4f %3d %3d %3d"
+            "%s " + pos_fmt + " %3d %3d %3d"
             " %9.4f %9.4f %9.4f %9.4f %9.4f %9.4f %6.2f %6.1f"
             " %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f"
             " %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f"
             " %10.5f %10.5f %10.5f %9.5f %9.5f %9.5f\n"
         )
         self._fp.write(fmt % (
-            week, sow,
-            lat_deg, lon_deg, h,
+            time_str,
+            *pos_vals,
             q, qins, num_sv,
             sdn, sde, sdu, sdne, sdeu, sdun, 0.0, 0.0,
             state.vel_e[0], state.vel_e[1], state.vel_e[2],
@@ -173,9 +202,6 @@ class RSLTWriter(WriterBase):
         D2R = np.pi / 180.0
 
         llh = ecef2llh(pos_e)
-        lat_deg = llh[0] / D2R
-        lon_deg = llh[1] / D2R
-        h = llh[2]
 
         # 位置 sd: ECEF → ENU
         R = ecef2enu_matrix(llh)
@@ -188,8 +214,16 @@ class RSLTWriter(WriterBase):
         sdeu = _signed_sqrt(float(cov_enu[2, 0]))
         sdun = _signed_sqrt(float(cov_enu[1, 2]))
 
+        time_str = self._format_time(timestamp)
+        if self.position_format == "xyz":
+            pos_fmt = "%14.4f %14.4f %14.4f"
+            pos_vals = (pos_e[0], pos_e[1], pos_e[2])
+        else:
+            pos_fmt = "%14.9f %14.9f %10.4f"
+            pos_vals = (llh[0] / D2R, llh[1] / D2R, llh[2])
+
         fmt = (
-            "%4d %10.3f %14.9f %14.9f %10.4f %3d %3d %3d"
+            "%s " + pos_fmt + " %3d %3d %3d"
             " %9.4f %9.4f %9.4f %9.4f %9.4f %9.4f %6.2f %6.1f"
             " %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f"
             " %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f"
@@ -197,8 +231,8 @@ class RSLTWriter(WriterBase):
         )
         # Qins=0, 速度=0, 姿态=0, sd=0, 杆臂=0 (未初始化)
         self._fp.write(fmt % (
-            week, sow,
-            lat_deg, lon_deg, h,
+            time_str,
+            *pos_vals,
             q, 0, num_sv,   # Qins=0 (未初始化)
             sdn, sde, sdu, sdne, sdeu, sdun, 0.0, 0.0,
             0.0, 0.0, 0.0,   # 速度=0

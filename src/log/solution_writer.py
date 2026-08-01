@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 
 from src.core.data_types import GnssSolution
-from src.core.time_utils import unix_to_gpst
+from src.core.time_utils import unix_to_gpst, sow_to_ymdhms
 from src.log.writer_base import WriterBase
 
 
@@ -45,29 +45,56 @@ def ecef2enu_matrix(llh: np.ndarray) -> np.ndarray:
 class SolutionWriter(WriterBase):
     """rtklib 风格 .pos 输出器。
 
-    输出格式（参考 rtklib-py postpos.savesol）:
-      表头 + 每历元一行: week sow lat lon h Q ns sdn sde sdu sdne sdeu sdun age ratio
+    输出格式可配置:
+      - position_format: llh (经纬度+高, 默认) / xyz (ECEF 直角坐标)
+      - time_format: gpst (GPS周+周内秒, 默认) / datetime (YYYY/MM/DD HH:MM:SS.sss)
+
+    表头 + 每历元一行:
+      gpst+llh:   week sow lat lon h Q ns sdn sde sdu sdne sdeu sdun age ratio
+      gpst+xyz:   week sow x y z Q ns sdn sde sdu sdne sdeu sdun age ratio
+      datetime+llh: YYYY/MM/DD HH:MM:SS.sss lat lon h Q ns sdn sde sdu sdne sdeu sdun age ratio
+      datetime+xyz: YYYY/MM/DD HH:MM:SS.sss x y z Q ns sdn sde sdu sdne sdeu sdun age ratio
+
     ECEF → LLH（度）转换，sd ECEF → ENU。
     age/ratio 填 0（本项目 GnssSolution 无此字段）。
     """
 
-    HEADER = (
-        "%  GPST          latitude(deg) longitude(deg)  height(m)   Q  "
-        "ns   sdn(m)   sde(m)   sdu(m)  sdne(m)  sdeu(m)  sdun(m) age(s)  ratio\n"
-    )
-
-    def __init__(self, output_dir: str, filename: str = "solution.pos"):
+    def __init__(self, output_dir: str, filename: str = "solution.pos",
+                 position_format: str = "llh", time_format: str = "gpst"):
         self.output_dir = output_dir
         self.filename = filename
+        self.position_format = position_format
+        self.time_format = time_format
         self._fp = None
         self._closed = False
+
+    def _build_header(self) -> str:
+        if self.time_format == "datetime":
+            time_col = "  GPST(datetime)             "
+        else:
+            time_col = "  GPST          "
+        if self.position_format == "xyz":
+            pos_cols = "   x(m)        y(m)        z(m)   "
+        else:
+            pos_cols = " latitude(deg) longitude(deg)  height(m)   "
+        return (
+            "%" + time_col + pos_cols +
+            "Q  ns   sdn(m)   sde(m)   sdu(m)  sdne(m)  sdeu(m)  sdun(m) age(s)  ratio\n"
+        )
 
     def open(self) -> None:
         os.makedirs(self.output_dir, exist_ok=True)
         path = Path(self.output_dir) / self.filename
         self._fp = open(path, "w", encoding="utf-8")
-        self._fp.write(self.HEADER)
+        self._fp.write(self._build_header())
         self._closed = False
+
+    def _format_time(self, timestamp: float):
+        week, sow = unix_to_gpst(timestamp)
+        if self.time_format == "datetime":
+            y, mo, d, h, mi, s = sow_to_ymdhms(week, sow)
+            return "%04d/%02d/%02d %02d:%02d:%06.3f" % (y, mo, d, h, mi, s)
+        return "%4d %10.3f" % (week, sow)
 
     def write(self, sol: GnssSolution) -> None:
         if self._fp is None:
@@ -92,15 +119,19 @@ class SolutionWriter(WriterBase):
         sdun = np.sqrt(abs(cov_enu[1, 2])) * np.sign(cov_enu[1, 2])
 
         D2R = np.pi / 180.0
-        # timestamp 是 Unix 时间戳，输出时转回 (week, sow) 对齐 rtklib-py savesol
-        week, sow = unix_to_gpst(sol.timestamp)
-        fmt = (
-            "%4d %10.3f %14.9f %14.9f %10.4f %3d %3d %8.4f"
-            "  %8.4f %8.4f %8.4f %8.4f %8.4f %6.2f %6.1f\n"
-        )
-        self._fp.write(fmt % (
-            week, sow,
-            llh[0] / D2R, llh[1] / D2R, llh[2],
+        time_str = self._format_time(sol.timestamp)
+
+        if self.position_format == "xyz":
+            pos_fmt = "%14.4f %14.4f %14.4f"
+            pos_vals = (sol.position[0], sol.position[1], sol.position[2])
+        else:
+            pos_fmt = "%14.9f %14.9f %10.4f"
+            pos_vals = (llh[0] / D2R, llh[1] / D2R, llh[2])
+
+        line = "%s " + pos_fmt + " %3d %3d %8.4f  %8.4f %8.4f %8.4f %8.4f %8.4f %6.2f %6.1f\n"
+        self._fp.write(line % (
+            time_str,
+            *pos_vals,
             sol.quality, sol.num_sv,
             sdn, sde, sdu, sdne, sdeu, sdun,
             0.0, 0.0,

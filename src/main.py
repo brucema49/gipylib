@@ -20,11 +20,30 @@ from src.log.logger import Logger, TcLogger
 from src.log.rslt_writer import RSLTWriter
 from src.log.solution_writer import SolutionWriter
 from src.log.solution_logger import SolutionLogger
+from src.log.trace_file_writer import TraceFileWriter
 from src.utility.config_loader import load_config
 
 
 def main(config_path: str = "data/config.yaml"):
     config = load_config(config_path)
+
+    # trace 文件 (level > 0 时启用)
+    output_cfg = config.get("output", {})
+    trace_level = int(output_cfg.get("trace_level", 0))
+    trace_writer = None
+    if trace_level > 0:
+        # trace 文件名与主输出文件同名, 扩展名 .trace
+        ins_enabled = config["ins"]["enabled"]
+        if ins_enabled in ("lc", "tc"):
+            ref_filename = output_cfg.get("rslt_filename", "RTKLC.rslt")
+        else:
+            ref_filename = output_cfg.get("gnss_filename", "RTK.pos")
+        trace_writer = TraceFileWriter(
+            output_dir=output_cfg["output_dir"],
+            ref_filename=ref_filename,
+            trace_level=trace_level,
+        )
+        trace_writer.open()
 
     control = ThreadControl()
     imu_queue = Queue(maxsize=200)
@@ -43,7 +62,19 @@ def main(config_path: str = "data/config.yaml"):
     for s in sensors:
         s.join(timeout=2)
 
+    if trace_writer is not None:
+        trace_writer.close()
+
     print(f"运行时长: {elapsed:.1f}s ({int(elapsed // 60)}m {elapsed % 60:.1f}s)")
+
+
+def _get_output_formats(config: dict):
+    """从 config 提取输出格式参数。"""
+    output_cfg = config.get("output", {})
+    return (
+        output_cfg.get("position_format", "llh"),
+        output_cfg.get("time_format", "gpst"),
+    )
 
 
 def _assemble_pipeline(config, control, imu_queue, gnss_queue):
@@ -54,6 +85,7 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
     """
     gnss_source = config["gnss"]["gnss_source"]
     ins_enabled = config["ins"]["enabled"]
+    pos_fmt, time_fmt = _get_output_formats(config)
 
     if gnss_source == "external":
         # 路径 A: 现有块状对齐输出
@@ -67,12 +99,16 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
         # 路径 B: 纯 GNSS .pos 输出
         sensors = SensorFactory.create_sensors(config, imu_queue, gnss_queue, control)
         filename = config["output"].get("gnss_filename", "RTK.pos")
-        writer = SolutionWriter(output_dir=config["output"]["output_dir"],
-                                filename=filename)
+        writer = SolutionWriter(
+            output_dir=config["output"]["output_dir"],
+            filename=filename,
+            position_format=pos_fmt,
+            time_format=time_fmt,
+        )
         logger = SolutionLogger(gnss_queue, writer, control)
         return sensors, logger
 
-    if gnss_source == "internal" and ins_enabled == "on":
+    if gnss_source == "internal" and ins_enabled == "lc":
         # 路径 C: 内部 GNSS 实时解算 + IMU 对齐输出 + 松组合 EKF
         # 输出三个文件：纯 GNSS .pos + 对齐 CSV + 松组合 .rslt (100Hz, ECEF+速度+姿态)
         sensors = SensorFactory.create_sensors(config, imu_queue, gnss_queue, control)
@@ -86,12 +122,16 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
         gnss_writer = SolutionWriter(
             output_dir=config["output"]["output_dir"],
             filename=gnss_filename,
+            position_format=pos_fmt,
+            time_format=time_fmt,
         )
-        # 松组合定位结果 .rslt 文件（100Hz, ignav outins 风格 LLH位置+ECEF速度+FRD姿态）
-        lc_filename = config["output"].get("rslt_filename", "RTKTC.rslt")
+        # 松组合定位结果 .rslt 文件（100Hz, ignav outins 风格 位置+ECEF速度+FRD姿态）
+        lc_filename = config["output"].get("rslt_filename", "RTKLC.rslt")
         lc_writer = RSLTWriter(
             output_dir=config["output"]["output_dir"],
             filename=lc_filename,
+            position_format=pos_fmt,
+            time_format=time_fmt,
         )
         from src.core.ins.lc_stream import LcStream
         lc_stream = LcStream(config, lc_writer)
@@ -102,13 +142,15 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
 
     if gnss_source == "internal" and ins_enabled == "tc":
         # 路径 D: 紧组合 GNSS/INS (TcGnssSensor 原始观测 + TcStream + RSLTWriter)
-        # 输出一个文件：紧组合 .rslt (100Hz, ignav outins 风格 LLH位置+ECEF速度+FRD姿态)
+        # 输出一个文件：紧组合 .rslt (100Hz, ignav outins 风格 位置+ECEF速度+FRD姿态)
         # 不输出纯 GNSS .pos (TC 不做独立 GNSS 解算)
         sensors = SensorFactory.create_sensors(config, imu_queue, gnss_queue, control)
         tc_filename = config["output"].get("rslt_filename", "RTKTC.rslt")
         tc_writer = RSLTWriter(
             output_dir=config["output"]["output_dir"],
             filename=tc_filename,
+            position_format=pos_fmt,
+            time_format=time_fmt,
         )
         from src.core.tc.tc_stream import TcStream
         tc_stream = TcStream(config, tc_writer)
@@ -124,5 +166,5 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
 
 
 if __name__ == "__main__":
-    cfg = sys.argv[1] if len(sys.argv) > 1 else "data/spp-ins-tc.yaml"
+    cfg = sys.argv[1] if len(sys.argv) > 1 else "data/config.yaml"
     main(cfg)

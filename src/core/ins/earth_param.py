@@ -1,6 +1,6 @@
 """地球参数与坐标转换工具。
 
-参考 gnss_ins_lc_nhc navearth.hpp 与 KF-GINS Winearth.hpp。
+参考 KF-GINS Winearth.hpp。
 """
 import math
 from typing import Tuple
@@ -19,10 +19,7 @@ EARTH_FLATTENING = 1.0 / 298.257223563
 
 
 def ecef2llh(pos_e: np.ndarray) -> Tuple[float, float, float]:
-    """ECEF → [lat, lon, h] (WGS84)。
-
-    参考 gnss_ins_lc_nhc WGS84XYZ2BLH。
-    """
+    """ECEF → [lat, lon, h] (WGS84)。"""
     x, y, z = pos_e
     lon = math.atan2(y, x)
     p = math.sqrt(x * x + y * y)
@@ -56,7 +53,6 @@ def llh2ecef(lat: float, lon: float, h: float) -> np.ndarray:
 def cal_Ce2n(lat: float, lon: float) -> np.ndarray:
     """构造 ECEF→NED 旋转矩阵 C_e^n。
 
-    参考 gnss_ins_lc_nhc CalCe2n。
     NED: x=North, y=East, z=Down
     """
     sin_lat, cos_lat = math.sin(lat), math.cos(lat)

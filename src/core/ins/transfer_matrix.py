@@ -1,7 +1,6 @@
 """状态转移矩阵 F / Φ / Q 构造。
 
 参考:
-- gnss_ins_lc_nhc navmech.cc MechTransferMat (E 系 F 矩阵结构)
 - GINav ins_time_updata.m / update_trans_mat.m (Q 构造与中间值法)
 - 项目约定: 保留 Coriolis 项 (F_vv = -2*[ω_ie^e×], F_φφ = -[ω_ie^e×])
 - ignav ins-gnss.cc (可选参数块 F=0, Q=random walk PSD)
@@ -42,10 +41,7 @@ def skew(v: np.ndarray) -> np.ndarray:
 
 
 def rodrigues(phi: np.ndarray) -> np.ndarray:
-    """旋转向量 → 旋转矩阵 (Rodrigues 公式)。
-
-    参考 gnss_ins_lc_nhc RotationVector2Matrix。
-    """
+    """旋转向量 → 旋转矩阵 (Rodrigues 公式)。"""
     phi = np.asarray(phi, dtype=np.float64)
     angle = float(np.linalg.norm(phi))
     if angle < 1e-12:

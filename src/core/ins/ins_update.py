@@ -1,13 +1,12 @@
 """INS 机械编排核心 (E 系 ECEF)。
 
 参考:
-- gnss_ins_lc_nhc navmech.cc (E 系机械编排方程)
 - GINav ins_mech.m (算法结构: 锥补/划桨/旋转补偿/中点)
 
 本项目 IMU 为速率式 (gyro: rad/s, accel: m/s²),
 需 ×dt 转为增量后套用增量式算法。
 
-状态更新顺序: 姿态 → 速度 → 位置 (参考 gnss_ins_lc_nhc MechanicalArrangement)
+状态更新顺序: 姿态 → 速度 → 位置
 """
 import logging
 import math
@@ -133,7 +132,6 @@ class InsUpdate:
     def _attitude_update(self, dtheta_comp: np.ndarray) -> np.ndarray:
         """姿态更新 (E 系, 含锥补)。
 
-        参考 gnss_ins_lc_nhc MechAttitudeUpdate:
           phi_b = dtheta + skew(dtheta_prev) * dtheta / 12  (锥补)
           C_bb = rodrigues(phi_b)
           zeta = [0,0,ω_ie] * dt
@@ -155,7 +153,6 @@ class InsUpdate:
                          dvel_comp: np.ndarray, dt: float) -> np.ndarray:
         """速度更新 (E 系, 含旋转/划桨补偿)。
 
-        参考 gnss_ins_lc_nhc MechVelocityUpdate:
           v_rot  = 0.5 * cross(dtheta, dvel)            (旋转补偿)
           v_scul = (cross(dtheta_prev, dvel) + cross(dvel_prev, dtheta)) / 12  (划桨)
           delta_v_cor = (g_e - 2*cross(ω_ie, vel)) * dt  (重力+科氏)
@@ -192,7 +189,6 @@ class InsUpdate:
     def _position_update(self, vel_e_new: np.ndarray, dt: float) -> np.ndarray:
         """位置更新 (E 系, 梯形积分)。
 
-        参考 gnss_ins_lc_nhc MechPositionUpdate:
           pos_new = pos + 0.5 * (vel_prev + vel_new) * dt
         """
         return self.state.pos_e + 0.5 * (self.state.vel_e + vel_e_new) * dt

@@ -1,7 +1,7 @@
 # 融合估计指导方案
 
 > **单滤波**松组合 EKF：固定 15 维基础状态 + 可选参数块（GNSS 杆臂 3 / IMU 安装角 2 / IMU 杆臂 3 / 时间对齐 1），含 NHC 约束与 ZUPT 零速更新。
-> 参数块/矩阵块管理参考 gnss_ins_lc_nhc `StateIndex`；算法参考 ignav（H 矩阵公式、ψ-error 模型）；OOP 风格参考 gnss_ins_lc_nhc 和 GREAT-MSF-main。
+> 参数块/矩阵块管理采用 `StateIndex` dataclass；算法参考 ignav（H 矩阵公式、ψ-error 模型）；OOP 风格参考 GREAT-MSF-main。
 >
 > **设计原则**：不继承 ABC（YAGNI），`LcEstimator` / `LcIntegration` / `Constraints` 为普通类。
 >
@@ -93,7 +93,7 @@ class LcEstimator:
 
 ### 2.1 StateIndex 参数块管理
 
-> 参考 gnss_ins_lc_nhc `StateIndex` 结构。未启用的可选块索引为 -1。
+> `StateIndex` 结构管理参数块索引，未启用的可选块索引为 -1。
 
 ```python
 @dataclass

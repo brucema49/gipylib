@@ -1,6 +1,5 @@
 """姿态表示转换工具。
 
-参考 gnss_ins_lc_nhc navattitude.hpp。
 欧拉角顺序: ZYX (yaw → pitch → roll)
 旋转矩阵定义: C_b^n 表示从 b 系到 n 系的转换
 """
@@ -13,7 +12,6 @@ import numpy as np
 def euler2dcm(rpy: np.ndarray) -> np.ndarray:
     """欧拉角 [roll, pitch, yaw] (rad) → 旋转矩阵 C_b^n (ZYX 旋转顺序)。
 
-    参考 gnss_ins_lc_nhc Euler2RotationMatrix。
     旋转顺序: 先绕 Z 轴 (yaw), 再绕 Y 轴 (pitch), 最后绕 X 轴 (roll)
     """
     roll, pitch, yaw = rpy
@@ -41,10 +39,7 @@ def dcm2euler(C: np.ndarray) -> np.ndarray:
 
 
 def dcm2quat(C: np.ndarray) -> np.ndarray:
-    """旋转矩阵 → 四元数 [w, x, y, z]。
-
-    参考 gnss_ins_lc_nhc RotationMartix2Quaternion。
-    """
+    """旋转矩阵 → 四元数 [w, x, y, z]。"""
     trace = C[0, 0] + C[1, 1] + C[2, 2]
     if trace > 0.0:
         s = math.sqrt(trace + 1.0) * 2.0
@@ -85,10 +80,7 @@ def quat2dcm(q: np.ndarray) -> np.ndarray:
 
 
 def att_caln2e(lat: float, lon: float, C_b_n: np.ndarray) -> np.ndarray:
-    """n 系姿态矩阵 → E 系姿态矩阵 C_b^e = C_n^e × C_b^n。
-
-    参考 gnss_ins_lc_nhc AttCaln2e。
-    """
+    """n 系姿态矩阵 → E 系姿态矩阵 C_b^e = C_n^e × C_b^n。"""
     from src.core.ins.earth_param import cal_Cn2e
     C_n_e = cal_Cn2e(lat, lon)  # NED→ECEF
     return C_n_e @ C_b_n

@@ -27,7 +27,6 @@ def _build_R_b_v(pitch: float, yaw: float) -> np.ndarray:
     """IMU 安装角 [pitch, yaw] → R_b^v (b→v 旋转矩阵, roll=0)。
 
     R_b^v = R_z(yaw) · R_y(pitch)  (ZYX 顺序, roll=0)
-    参考 gnss_ins_lc_nhc 安装角旋转矩阵构造。
     """
     cp, sp = math.cos(pitch), math.sin(pitch)
     cy, sy = math.cos(yaw), math.sin(yaw)

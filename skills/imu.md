@@ -63,9 +63,9 @@
 | `src/stream/formators.py` | `ImuFormator`（GPST 格式）+ `EuRoCImuFormator`（EuRoC 格式）+ `PosSolFormator`（rtklib POS）解码器 | — | ✅ 已实现 |
 | `src/log/aligner.py` | IMU 积攒 + GNSS 收割的匹配器（基于 Unix 时间戳） | — | ✅ 已实现 |
 | `src/core/ins/interpolator.py` | IMU/GNSS 时间对齐插值（`is_to_update` / `imu_interpolate` / `find_bracket_imus`） | KF-GINS `imuInterpolate` / `isToUpdate` | ✅ 已实现 |
-| `src/core/ins/earth_param.py` | 地球参数（`ecef2llh` / `llh2ecef` / `cal_Ce2n` / `gravity_ecef` + WGS84 常量） | gnss_ins_lc_nhc `navearth.hpp` | ✅ 已实现 |
-| `src/core/ins/attitude.py` | 姿态表示与转换（`euler2dcm` / `dcm2euler` / `dcm2quat` / `quat2dcm` / `att_caln2e`） | gnss_ins_lc_nhc `navattitude.hpp` | ✅ 已实现 |
-| `src/core/ins/initializer.py` | `InsInitializer` 类：插值、模式选择、对准、状态装配，三阈值检验 | KF-GINS `initialize` + gnss_ins_lc_nhc `StartAligning` | ✅ 已实现 |
+| `src/core/ins/earth_param.py` | 地球参数（`ecef2llh` / `llh2ecef` / `cal_Ce2n` / `gravity_ecef` + WGS84 常量） | — | ✅ 已实现 |
+| `src/core/ins/attitude.py` | 姿态表示与转换（`euler2dcm` / `dcm2euler` / `dcm2quat` / `quat2dcm` / `att_caln2e`） | — | ✅ 已实现 |
+| `src/core/ins/initializer.py` | `InsInitializer` 类：插值、模式选择、对准、状态装配，三阈值检验 | KF-GINS `initialize` | ✅ 已实现 |
 | `src/core/ins/ins_core.py` | INS 核心：姿态/速度/位置更新、粗对准 | GREAT-MSF t_gsins | 🚧 预留 |
 | `src/core/ins/imu_preprocess.py` | IMU 数据预处理（增量/速率转换、异常检测） | GREAT-MSF t_gimu | 🚧 预留 |
 
@@ -108,7 +108,7 @@ IMU/GNSS 数据流（纯队列流水线，时间对齐在 Estimator 内部）:
 | **导航坐标系** | n 系 | 当地水平坐标系 | ENU（东-北-天），仅输出用 |
 | **惯性坐标系** | i 系 | ECI 惯性坐标系 | — |
 
-**本项目约定（参考 gnss_ins_lc_nhc）**：
+**本项目约定**：
 - **机械编排在 E 系（ECEF）下进行**，不在 n 系下
 - 体坐标系：**FRD**（前-右-下），与航空/惯导常用约定一致
 - 车体坐标系：**FRD**（前-右-下），与 b 系通过安装角旋转矩阵 R_b^v 关联
@@ -118,7 +118,7 @@ IMU/GNSS 数据流（纯队列流水线，时间对齐在 Estimator 内部）:
 ### 2.2 姿态矩阵 C_b^e
 
 ```
-E 系下姿态矩阵 C_b^e（b 系到 e 系），参考 gnss_ins_lc_nhc navmech.cc
+E 系下姿态矩阵 C_b^e（b 系到 e 系）
 
 姿态更新在 E 系下进行:
   C_b^e(k+1) = C_b^e(k) * ΔC_b(k→k+1)
@@ -134,7 +134,7 @@ b 系（IMU 本体）与 v 系（车体）之间通过安装角旋转矩阵 R_b^
 R_b^v 由安装角 [roll=0, pitch, yaw] 构造:
   R_b^v = R_z(yaw) * R_y(pitch)  （roll 假设为 0）
 
-安装角只有 2 维（pitch, yaw），参考 gnss_ins_lc_nhc
+安装角只有 2 维（pitch, yaw）
 安装角误差 δθ_imu = [δpitch, δyaw]
 ```
 
@@ -396,10 +396,7 @@ class EarthParam:
 
     @staticmethod
     def gravity_ecef(r_e: np.ndarray) -> np.ndarray:
-        """E 系下正常重力向量（含离心力项，主计算用）
-
-        参考 gnss_ins_lc_nhc navmech.cc
-        """
+        """E 系下正常重力向量（含离心力项，主计算用）"""
         ...
 
     @staticmethod
@@ -468,9 +465,8 @@ IMU 和 GNSS 具有不同的采样率（IMU 通常 100~200Hz，GNSS 通常 1~10H
 
 ### 5.2 对齐策略（GNSS 时间最近邻匹配）
 
-> **策略演变**：原计划参考 KF-GINS 的 `imuInterpolate()`（增量切分）或 gnss_ins_lc_nhc 的 `SortData()`（线性插值），但经调查发现：
+> **策略演变**：原计划参考 KF-GINS 的 `imuInterpolate()`（增量切分），但经调查发现：
 > - **KF-GINS** 使用增量式 IMU（`dtheta`/`dvel`），其 `imuInterpolate` 按比例切分增量，不适用于速率式 IMU
-> - **gnss_ins_lc_nhc** 的 `gyro_`/`acce_` 字段实为增量式数据（`navmech.cc:52` `wibb_ = gyro_ / dt` 印证），其 `SortData()` 做的是增量切分，不是速率式线性插值
 > - **GINav** 也使用增量式 IMU（`imu.dw`/`imu.dv`），初始化时无时间插值
 >
 > 因此本项目采用 **GNSS 时间最近邻匹配** 策略：在包夹 `t_gnss` 的两个 IMU 历元中，选时间戳最接近 `t_gnss` 的那个，直接作为 `t_gnss` 时刻的 IMU 测量值（不插值）。
@@ -629,14 +625,14 @@ GNSS(t_gnss) 到达，IMU 缓冲区有 imu_list
 
 ### 5.7 与参考项目的对比
 
-| 维度 | KF-GINS | gnss_ins_lc_nhc | GINav | 本项目 |
-|------|---------|-----------------|-------|--------|
-| **IMU 数据形式** | 增量 (dtheta/dvel) | 增量 (gyro_/acce_ 实为 dtheta/dvel) | 增量 (dw/dv) | 速率 (gyro/accel) |
-| **对齐方式** | 增量切分 | 增量切分 | 无初始化插值 | 最近邻匹配 |
-| **时间误差** | 无 | 无 | N/A | 最大半个采样周期（5ms） |
-| **误差补偿** | 无需 | 无需 | N/A | KF 在线估计 δt |
-| **坐标系** | n 系 | E 系 | n 系 | E 系 |
-| **接口参考** | `imuInterpolate` / `isToUpdate` | `SortData` | `ins_init.m` | `imu_interpolate` / `is_to_update` |
+| 维度 | KF-GINS | GINav | 本项目 |
+|------|---------|-------|--------|
+| **IMU 数据形式** | 增量 (dtheta/dvel) | 增量 (dw/dv) | 速率 (gyro/accel) |
+| **对齐方式** | 增量切分 | 无初始化插值 | 最近邻匹配 |
+| **时间误差** | 无 | N/A | 最大半个采样周期（5ms） |
+| **误差补偿** | 无需 | N/A | KF 在线估计 δt |
+| **坐标系** | n 系 | n 系 | E 系 |
+| **接口参考** | `imuInterpolate` / `isToUpdate` | `ins_init.m` | `imu_interpolate` / `is_to_update` |
 
 ### 5.8 详细实现位置
 
@@ -657,7 +653,7 @@ GNSS(t_gnss) 到达，IMU 缓冲区有 imu_list
 
 ### 6.1 机械编排方程
 
-参考 gnss_ins_lc_nhc navmech.cc，INS 机械编排在 **E 系（ECEF）** 下进行：
+INS 机械编排在 **E 系（ECEF）** 下进行：
 
 ```
 1. 姿态更新:  C_b^e(k+1) = C_b^e(k) * ΔC_b(k→k+1)
@@ -674,7 +670,7 @@ GNSS(t_gnss) 到达，IMU 缓冲区有 imu_list
 ### 6.2 姿态更新
 
 ```
-公式（E 系下，参考 gnss_ins_lc_nhc navmech.cc）:
+公式（E 系下）:
   C_b^e(k+1) = C_b^e(k) * ΔC_b(k→k+1)
 
 其中:
@@ -704,7 +700,7 @@ GNSS(t_gnss) 到达，IMU 缓冲区有 imu_list
 ### 6.3 速度更新
 
 ```
-公式（E 系下，参考 gnss_ins_lc_nhc navmech.cc + ignav rotscull_corr）:
+公式（E 系下，参考 ignav rotscull_corr）:
   v^e(k+1) = v^e(k) + delta_v_cor + delta_v
 
 其中:
@@ -757,7 +753,7 @@ E 系 vs n 系速度更新差异:
 ### 6.4 位置更新
 
 ```
-公式（E 系下，参考 gnss_ins_lc_nhc navmech.cc）:
+公式（E 系下）:
   r^e(k+1) = r^e(k) + v^e(k+1) * dt
 
 其中:
@@ -809,7 +805,7 @@ InsCore.update(imu_data):
 ### 7.1 可配置维度误差模型
 
 ```
-状态向量（可配置维度，参考 gnss_ins_lc_nhc，E 系下）:
+状态向量（可配置维度，E 系下）:
   δx = [δr^e, δv^e, δψ^e, δb_g, δb_a, δθ_imu, δl_imu, δl_gnss]^T
         0-2   3-5   6-8   9-11  12-14 15-16   17-19   20-22
 
@@ -898,7 +894,7 @@ F_aa: 加计零偏（一阶马尔可夫）
 
 ```
 安装角 (15:17): 假设为常数，F[15:17, :] = 0
-  参考 gnss_ins_lc_nhc: 安装角只有2维(pitch, yaw)，roll假设为0
+  安装角只有2维(pitch, yaw)，roll假设为0
 
 IMU杆臂 (17:20): 假设为常数，F[17:20, :] = 0
 
@@ -1085,7 +1081,7 @@ ENU 坐标系: [东, 北, 天]
 ### 9.4 正常重力
 
 ```
-E 系下（本项目主计算系，参考 gnss_ins_lc_nhc navmech.cc）:
+E 系下（本项目主计算系）:
   g^e = EarthParam.gravity_ecef(r^e)
 
   E 系重力向量包含引力+离心力:
@@ -1095,7 +1091,7 @@ E 系下（本项目主计算系，参考 gnss_ins_lc_nhc navmech.cc）:
   4. 转换到 E 系: g^e = C_n^e @ g^n + 离心力项
      其中 C_n^e = [C_e^n]^T，由 lat, lon 计算
 
-  简化计算（参考 gnss_ins_lc_nhc）:
+  简化计算:
   g^e = -g0 * [cos(lat)*cos(lon), cos(lat)*sin(lon), sin(lat)]^T + 离心力
 
 n 系下（仅输出用）:
@@ -1178,17 +1174,7 @@ E 系 ↔ n 系转换:
 | `t_gbase` | `AttitudeUtil` | 姿态转换工具（静态方法） |
 | `t_gbase` | `EarthParam` | 地球参数（静态方法） |
 
-### 11.2 gnss_ins_lc_nhc → 本项目
-
-| gnss_ins_lc_nhc | 本项目 | 对应关系 |
-|-----------------|--------|---------|
-| `navmech.cc` 姿态更新 | `InsCore.attitude_update()` | E 系下四元数/DCM 姿态递推 |
-| `navmech.cc` 速度更新 | `InsCore.velocity_update()` | E 系下比力+Coriolis+重力 |
-| `navmech.cc` 位置更新 | `InsCore.position_update()` | ECEF 位置递推 |
-| `navmech.cc` F矩阵构造 | `LcEstimator` (`TransferMatrix.build_F`) | E 系下可配置维度状态转移矩阵 |
-| `navinitalized.cc` | `InsCore.coarse_align_*()` | E 系下粗对准+精对准 |
-
-### 11.3 GINav → 本项目
+### 11.2 GINav → 本项目
 
 | GINav | 本项目 | 对应关系 |
 |-------|--------|---------|
@@ -1418,7 +1404,7 @@ class SensorFactory:
             → GnssSolSensor(gnss_path, gnss_queue, control)
         - gnss_source == "internal" and ins.enabled == "off":
             → InternalGnssSensor(config, gnss_queue, control)  # 内部解算，无独立 IMU 流
-        - gnss_source == "internal" and ins.enabled == "on":
+        - gnss_source == "internal" and ins.enabled == "lc":
             → ImuSensor(imu_path, imu_queue, control)
             → InternalGnssSensor(config, gnss_queue, control)  # 实时解算 + IMU 对齐输出
         """
@@ -1432,7 +1418,7 @@ class SensorFactory:
         elif gnss_source == "internal" and ins_enabled == "off":
             from src.stream.internal_gnss_sensor import InternalGnssSensor
             sensors.append(InternalGnssSensor(config, gnss_queue, control))
-        elif gnss_source == "internal" and ins_enabled == "on":
+        elif gnss_source == "internal" and ins_enabled == "lc":
             imu_path = config["ins"]["imu_data_path"]
             sensors.append(ImuSensor(imu_path, imu_queue, control))
             from src.stream.internal_gnss_sensor import InternalGnssSensor
@@ -1463,7 +1449,7 @@ IMU 数据到达（纯队列流水线，无观察者回调）:
         ↓
   SolutionLogger / SolutionWriter        (消费 gnss_queue，输出 .pos 文件)
 
-【当前实现：内部对齐模式 internal + ins.enabled=on（路径 C）】
+【当前实现：内部对齐模式 internal + ins.enabled=lc（路径 C）】
   ImuSensor.run()                        (与路径 A 相同的 IMU 流式读取)
     → imu_queue.put(SensorData(tag="imu"))
         ↓

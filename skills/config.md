@@ -5,9 +5,10 @@
 > 与 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md) 保持一致，初始化相关参数交叉引用初始化.md 对应章节。
 >
 > **配置文件布局**：
-> - `data/config.yaml`：完整配置模板（external + ins.on 模式，含所有参数）
-> - `data/cfg_test_spp.yaml`：SPP 测试配置（internal + ins.off）
-> - `data/cfg_test_rtk.yaml`：RTK 测试配置（internal + ins.off）
+> - `data/config.yaml`：完整配置模板（含所有参数）
+> - `data/spp-ins-lc.yaml`：SPP + 松组合参考配置（internal + ins.lc）
+> - `data/rtdtc.yaml` / `phone/rtdtc.yaml`：RTD + 紧组合参考配置（internal + ins.tc）
+> - `data/ignav-rtktc.conf`：ignav 紧组合参考配置
 >
 > **时间系统约定**：全框架内部统一使用 Unix 时间戳（`gtime_t.time + gtime_t.sec`），转换工具 `src/core/time_utils.py`（`gpst_to_unix` / `unix_to_gpst`，`GPST_EPOCH_UNIX = 315964800`）。
 >
@@ -73,10 +74,11 @@ GNSS 配置部分参考 rtklib-py 的 `config_phone.py` / `config_f9p.py`，已�
 
 **校验规则**（`src/utility/config_loader.py`）：
 - `gnss_source` 必须为 `internal` 或 `external`
+- `ins.enabled=off` 时 `gnss_source` 必须为 `internal`（纯 GNSS 模式不支持外部结果输入）
 - `external` 模式下 `ins.enabled` 必须为 `on`，且 `data_rate` 必须为 100
 - `internal` 模式下 `positioning_mode` 必填，`rover_path` 和 `eph_path` 必填
-- `internal` + `rtk` 模式下 `base_path` 必填
-- `internal` + `ins.enabled=on` 模式下 `imu_data_path` 必填
+- `internal` + `rtk`/`rtd` 模式下 `base_path` 必填
+- `internal` + `ins.enabled=on/tc` 模式下 `imu_data_path` 必填
 
 ### 1.2 定位模式
 
@@ -164,7 +166,8 @@ GNSS 配置部分参考 rtklib-py 的 `config_phone.py` / `config_f9p.py`，已�
 
 | 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
 |------|------|--------|------|---------|------|
-| `rb` | array[3] | `[0, 0, 0]` | m | — | 基站 ECEF 位置 [x, y, z]。全 0 表示使用 RINEX 头中的基站位置 |
+| `rb_format` | str | `"xyz"` | — | `xyz` / `llh` | 基站坐标格式。`xyz`=ECEF 直角坐标 [x,y,z] (m)；`llh`=经纬度高 [lat_deg, lon_deg, h_m]，由 `config_loader._normalize_rb()` 转为 xyz |
+| `rb` | array[3] | `[0, 0, 0]` | m | — | 基站位置（`rb_format=xyz`: ECEF [x,y,z]；`rb_format=llh`: [lat,lon,h]）。全 0 表示使用 RINEX 头中的基站位置 |
 | `rr_f` | array[6] | `[0, 0, 0, 0, 0, 0]` | m, m/s | — | 流动站初始位置速度（正向）[x, y, z, vx, vy, vz]。全 0 表示自动单精解 |
 | `rr_b` | array[6] | `[0, 0, 0, 0, 0, 0]` | m, m/s | — | 流动站初始位置速度（反向）[x, y, z, vx, vy, vz]。全 0 表示自动单精解 |
 
@@ -172,13 +175,13 @@ GNSS 配置部分参考 rtklib-py 的 `config_phone.py` / `config_f9p.py`，已�
 
 ## 2. INS 配置 (ins)
 
-INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/config/kf-gins.yaml`。
+INS 配置部分参考 ignav 的 `configure.ini` 和 `tools/KF-GINS/config/kf-gins.yaml`。
 
 ### 2.1 主开关与 Reboot
 
 | 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
 |------|------|--------|------|---------|------|
-| `enabled` | str | `"on"` | — | `on` / `off` | 主开关（必填）。`on`=组合导航路径；`off`=纯 GNSS 解算 |
+| `enabled` | str | `"lc"` | — | `off` / `lc` / `tc` | 主开关（必填）。`off`=纯 GNSS 解算；`lc`=松组合；`tc`=紧组合。已废弃的 `coupling_mode` 字段已移除，改用 `ins.enabled` 控制组合模式 |
 | `reboot` | double | `50` | s | >0 | GNSS 中断重启阈值，等价于 `gnss_outage_threshold`（[初始化.md 13.6 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#136-reboot-识别与重新初始化)）。INS 初始化完成后，若 GNSS 中断超过此阈值，重新进行组合导航初始化 |
 | `imu_outage_threshold` | double | `1.0` | s | >0 | IMU 中断 reboot 阈值。IMU 数据流中断超过此值时触发 reboot |
 | `timestamp_jump_threshold` | double | `10.0` | s | >0 | 时间戳跳变 reboot 阈值。IMU/GNSS 时间戳跳变超过此值时触发 reboot |
@@ -188,9 +191,10 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 | `reboot_use_prior_state` | bool | `false` | — | true/false | reboot 后重新初始化时是否使用前一次状态作为先验 |
 
 **校验规则**：
-- `enabled` 必填，必须为 `on` 或 `off`
+- `enabled` 必填，必须为 `off` / `on` / `tc`（`coupling_mode` 字段已废弃，存在则报错）
+- `enabled=off` 时 `gnss_source` 必须为 `internal`（纯 GNSS 模式不支持外部结果输入）
 - `external` 模式下 `enabled` 必须为 `on`
-- `internal` + `enabled=on` 模式下 `imu_data_path` 必填
+- `internal` + `enabled=on/tc` 模式下 `imu_data_path` 必填
 
 **Reboot 机制**（详见 [初始化.md 第 13.6 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#136-reboot-识别与重新初始化)）：
 - `Aligner` 负责检测数据流层面的 reboot 信号（GNSS 中断、IMU 中断、时间戳跳变）
@@ -296,7 +300,7 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 | `initial_gyro_bias` | array[3] | `[0, 0, 0]` | deg/h | — | 初始陀螺零偏 [x, y, z] |
 | `initial_acce_bias` | array[3] | `[0, 0, 0]` | mGal | — | 初始加计零偏 [x, y, z] |
 
-**单位转换**（参考 `tools/gnss_ins_lc_nhc` `StartAligning` 与 `constant.hpp`，[初始化.md 11.2 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#112-单位转换参考-kf-gins-loadconfig)）：
+**单位转换**（参考 ignav `StartAligning` 与 `constant.hpp`，[初始化.md 11.2 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#112-单位转换参考-kf-gins-loadconfig)）：
 - 纬度/经度：度 → 弧度（`rad = deg * D2R`）
 - 姿态角：度 → 弧度
 - 陀螺零偏：deg/h → rad/s（`rad/s = deg/h * dh2rs`，`dh2rs = π / 180.0 / 3600.0`）
@@ -426,7 +430,7 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 
 ### 2.10b 可选状态参数开关（单滤波 StateIndex 管理）
 
-> 参考gnss_ins_lc_nhc `evaluate_*`，由 `StateIndex` dataclass 管理参数块索引（-1=未启用）。
+> 参考 ignav `evaluate_*`，由 `StateIndex` dataclass 管理参数块索引（-1=未启用）。
 
 | 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
 |------|------|--------|------|---------|------|
@@ -479,11 +483,12 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 | 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
 |------|------|--------|------|---------|------|
 | `output_dir` | str | `"output"` | — | 有效目录 | 输出目录 |
-| `solution_format` | str | `"pos"` | — | `pos` / `csv` / `nmea` | 解算结果格式 |
-| `solution_filename` | str | `"RTKLC.pos"` | — | 有效文件名 | **双用途**：internal+off 模式=纯 GNSS 定位结果；internal+on 模式=松组合定位结果（由 `LcRunner` 输出） |
-| `gnss_solution_filename` | str | `"RTK.pos"` | — | 有效文件名 | 纯 GNSS 定位结果文件名（仅 internal+on 模式，由 `Logger.gnss_writer` 实时输出） |
-| `aligned_filename` | str | `"aligned.csv"` | — | 有效文件名 | 对齐块状 CSV 文件名（external+on / internal+on 模式，由 `AlignedWriter` 输出） |
-| `trace_level` | int | `1` | — | 0 / 1 / 2 / 3 | 轨迹输出级别。0=无；1=基本；2=详细；3=调试 |
+| `gnss_filename` | str | `"RTK.pos"` | — | 有效文件名 | 纯 GNSS 解算结果文件名（`.pos`，`ins.enabled=off/on` 输出，由 `SolutionWriter` 输出） |
+| `aligned_filename` | str | `"aligned.csv"` | — | 有效文件名 | 对齐块状 CSV 文件名（`ins.enabled=on` 输出，由 `AlignedWriter` 输出） |
+| `rslt_filename` | str | `"RTKLC.rslt"` | — | 有效文件名 | 组合导航结果文件名（`.rslt`，`ins.enabled=on/tc` 输出，100Hz，ECEF 位置/速度 + 姿态，由 `RSLTWriter` 输出） |
+| `position_format` | str | `"llh"` | — | `llh` / `xyz` | 位置输出格式。`llh`=经纬度高 (lat/lon/h)；`xyz`=ECEF 直角坐标 |
+| `time_format` | str | `"gpst"` | — | `gpst` / `datetime` | 时间输出格式。`gpst`=GPS 周+周内秒；`datetime`=YYYY/MM/DD HH:MM:SS.sss |
+| `trace_level` | int | `0` | — | 0 / 1 / 2 / 3 | trace 文件级别。0=off；1=info；2=detail；3=debug。生成与主输出同名的 `.trace` 文件，存放于 `output_dir`（由 `TraceFileWriter` 重定向 rtklib-py trace 输出，Unix 时间戳转 GPS 周+周内秒，过滤无效调试行） |
 | `log_raw_data` | bool | `false` | — | true/false | 是否记录原始数据到 `raw/` |
 | `log_level` | str | `"INFO"` | — | `DEBUG` / `INFO` / `WARNING` / `ERROR` | 运行日志级别 |
 | `terminal_summary_interval` | int | `10` | — | >0 | 终端摘要间隔（每 N 条解算结果输出一次摘要） |
@@ -493,9 +498,9 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 >
 > | 模式 | gnss_source | ins.enabled | 输出文件 |
 > |------|-------------|-------------|---------|
-> | 路径 A（外部对齐） | `external` | `on` | `aligned_filename`（对齐 CSV） |
-> | 路径 B（内部纯 GNSS） | `internal` | `off` | `solution_filename`（纯 GNSS .pos） |
-> | 路径 C（内部对齐+松组合） | `internal` | `on` | `gnss_solution_filename`（纯 GNSS .pos）+ `aligned_filename`（对齐 CSV）+ `solution_filename`（松组合 .pos） |
+> | 纯 GNSS | `internal` | `off` | `gnss_filename`（`.pos`，`SolutionLogger` + `SolutionWriter`） |
+> | 松组合 | `internal`/`external` | `on` | `gnss_filename`（`.pos`）+ `aligned_filename`（`.csv`，`AlignedWriter`）+ `rslt_filename`（`.rslt`，100Hz，`RSLTWriter`） |
+> | 紧组合 | `internal` | `tc` | `rslt_filename`（`.rslt`，100Hz，`TcStream` + `RSLTWriter`） |
 
 ---
 
@@ -503,10 +508,11 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 
 | 配置文件 | gnss_source | positioning_mode | ins.enabled | 用途 |
 |---------|-------------|------------------|-------------|------|
-| `config.yaml` | external | rtk | on | 完整配置模板（external + 组合导航） |
-| `cfg_test_spp.yaml` | internal | spp | off | SPP 测试（纯 GNSS 解算） |
-| `cfg_test_rtk.yaml` | internal | rtk | off | RTK 测试（纯 GNSS 解算） |
-| `cfg_test_internal_rtk_aligned.yaml` | internal | rtk | on | RTK + IMU 数据对齐测试（路径 C） |
+| `data/config.yaml` | internal | rtk | lc | 完整配置模板（含所有参数） |
+| `data/spp-ins-lc.yaml` | internal | spp | lc | SPP + 松组合参考配置 |
+| `data/rtdtc.yaml` | internal | rtd | tc | RTD + 紧组合参考配置 |
+| `phone/rtdtc.yaml` | internal | rtd | tc | 手机端 RTD + 紧组合参考配置 |
+| `data/ignav-rtktc.conf` | internal | rtk | tc | ignav 紧组合参考配置 |
 
 ## 附录：与初始化.md 的参数对应关系
 
@@ -546,15 +552,19 @@ INS 配置部分参考 `tools/gnss_ins_lc_nhc/configure.ini` 和 `tools/KF-GINS/
 
 参考 `src/utility/config_loader.py::load_config`：
 
-1. **`ins.enabled` 必填**：必须为 `on` 或 `off`
-2. **`gnss_source` 校验**：必须为 `internal` 或 `external`
-3. **`external` 模式校验**：
+1. **`coupling_mode` 已废弃**：存在该字段则报错，改用 `ins.enabled` 控制组合模式
+2. **`ins.enabled` 必填**：必须为 `off` / `on` / `tc`
+3. **`gnss_source` 校验**：必须为 `internal` 或 `external`
+4. **`ins.enabled=off` 校验**：`gnss_source` 必须为 `internal`（纯 GNSS 模式不支持外部结果输入）
+5. **基站坐标归一化**：`rb_format=llh` 时由 `_normalize_rb()` 转为 ECEF xyz
+6. **输出格式校验**：`position_format` ∈ {llh, xyz}；`time_format` ∈ {gpst, datetime}；`trace_level` ∈ {0,1,2,3}
+7. **`external` 模式校验**：
    - `ins.enabled` 必须为 `on`
    - `data_rate` 必须为 100
    - `external_sol_format` 必须为 `pos`（当前仅支持）
-4. **`internal` 模式校验**：
-   - `positioning_mode` 必填，必须为 `spp` 或 `rtk`
+8. **`internal` 模式校验**：
+   - `positioning_mode` 必填，必须为 `spp` / `rtd` / `rtk`
    - `rover_path` 必填
    - `eph_path` 必填
-   - `positioning_mode=rtk` 时 `base_path` 必填
-   - `ins.enabled=on` 时 `imu_data_path` 必填
+   - `positioning_mode=rtk/rtd` 时 `base_path` 必填
+   - `ins.enabled=on/tc` 时 `imu_data_path` 必填

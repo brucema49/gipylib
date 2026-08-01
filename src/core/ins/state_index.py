@@ -1,4 +1,4 @@
-"""状态参数块索引管理 (参考 gnss_ins_lc_nhc StateIndex)。
+"""状态参数块索引管理。
 
 固定 15 维基础状态 + 可选参数块, 根据配置动态构建索引。
 状态顺序:
@@ -12,7 +12,6 @@ from dataclasses import dataclass
 class StateIndex:
     """状态参数块索引管理。
 
-    参考 gnss_ins_lc_nhc navstruct.hpp StateIndex 结构。
     未启用的可选块索引为 -1。
     """
 
@@ -34,10 +33,7 @@ class StateIndex:
 
     @classmethod
     def from_config(cls, config: dict) -> "StateIndex":
-        """根据配置构建状态索引。
-
-        参考 gnss_ins_lc_nhc SetStateIndex (navinitialized.cc)。
-        """
+        """根据配置构建状态索引。"""
         si = cls()
         ins_cfg = config.get("ins", {}) if config else {}
         idx = 15

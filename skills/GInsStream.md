@@ -1,7 +1,7 @@
 # GInsStream 整体代码框架
 
 > GNSS/INS 松/紧组合流式导航项目，基于纯 threading + 队列流水线流式读取架构，实现 SPP+RTK/NHC/ZUPT 松组合融合导航。
-> 矩阵运算使用 numpy，框架参考 gnss_ins_lc_nhc、GINav、GREAT-MSF。
+> 矩阵运算使用 numpy，框架参考 GINav、GREAT-MSF。
 >
 > **⚠️ 架构更新说明（2026-07）**：
 > - 滤波器已从双滤波（P1/P2）迁移到**单滤波**架构，统一使用 `P`（维度 = `StateIndex.dim`，15~24 维）
@@ -117,20 +117,20 @@ RTD 是 RTK 的退化模式（RTK 不进行模糊度固定，仅使用码双差�
 | **GNSS 模式** | SPP（初始化/单点）+ RTK（载波差分/码差分退化）+ 外部结果流 |
 | **NHC 约束** | v 系（车体坐标系）下侧向+垂向速度=0（2 维观测），需安装角旋转矩阵 R_b^v，由 NHC 子滤波估计 |
 | **ZUPT 约束** | 零速更新：检测车辆静止时将 3 维速度误差作为量测约束（与 NHC 互斥：静止用 ZUPT，运动用 NHC） |
-| **机械编排** | E 系（ECEF）下进行，参考 gnss_ins_lc_nhc |
+| **机械编排** | E 系（ECEF）下进行 |
 | **IMU 数据格式** | 增量式（Δθ/Δv）和速率式（ω/f）均支持 |
 | **时间对齐** | 增量切分（参考 KF-GINS `imuInterpolate`），4 种时间对齐情况处理；**时间对齐是重中之重**；无时间同步状态参数 |
 | **时间系统** | 全框架内部统一使用 Unix 时间戳（float 秒，与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）；输入端 `gpst_to_unix(week, sow)`，输出端 `unix_to_gpst()` |
 | **矩阵运算** | numpy |
 | **坐标系** | e 系：ECEF；b 系：IMU 本体 FRD；v 系：车体 FRD；n 系：导航系 ENU（仅输出用） |
-| **参考框架** | gnss_ins_lc_nhc（C++松组合+NHC+安装角）、GINav（MATLAB组合导航）、GREAT-MSF（C++类继承体系）、KF-GINS（增量切分时间对齐） |
+| **参考框架** | GINav（MATLAB组合导航）、GREAT-MSF（C++类继承体系）、KF-GINS（增量切分时间对齐） |
 | **设计模式** | 工厂模式（SensorFactory 创建传感器）、策略模式（前端里程计算法切换）、依赖注入（构造函数接收具体实例） |
 | **并发模型** | 纯 threading + `queue.Queue`（不使用 asyncio，不使用 shared_memory） |
 | **流式架构** | 参考 StreamDesign.md |
 
 ### 2.1 双滤波架构
 
-> 参考 gnss_ins_lc_nhc 的滤波架构设计。本项目采用**真正双滤波架构**，主滤波与 NHC 子滤波完全独立，各自维护状态向量、协方差矩阵、F/H/Q/R 矩阵和反馈机制。
+> 本项目采用**真正双滤波架构**，主滤波与 NHC 子滤波完全独立，各自维护状态向量、协方差矩阵、F/H/Q/R 矩阵和反馈机制。
 
 #### 2.1.1 主滤波（E 系，P1 矩阵）
 
@@ -196,7 +196,7 @@ P1 反馈：修正 δr^e, δv^e,          P2 反馈：修正 δθ_imu, δl_imu
 - `estimate_imu_leverarm: true` → 启用 NHC 子滤波的 IMU 杆臂估计（3维）
 - `estimate_gnss_leverarm: false` → 主滤波估计 GNSS 杆臂（3维，默认关闭）
 - 当 `estimate_imu_angle=false` 且 `estimate_imu_leverarm=false` 时，NHC 子滤波不运行，NHC 直接使用固定安装角和杆臂
-- 安装角只有 2 维（pitch, yaw），roll 假设为 0（参考 gnss_ins_lc_nhc）
+- 安装角只有 2 维（pitch, yaw），roll 假设为 0
 - **不包含时间同步参数**：本项目通过 KF-GINS 增量切分方案精确对齐 IMU/GNSS 时间
 
 #### 2.1.5 安装角与 NHC 的关系
@@ -225,11 +225,11 @@ NHC 约束（v 系下）：
   v_right_v  = 0  →  侧向速度约束
   v_down_v   = 0  →  垂向速度约束
 
-观测方程（参考 gnss_ins_lc_nhc odo.md）：
+观测方程：
   Z_nhc = [v_right_v; v_down_v] = [0; 0]
 ```
 
-**双滤波下的 H 矩阵分离**（参考 gnss_ins_lc_nhc navstate.cc:343-353）：
+**双滤波下的 H 矩阵分离**：
 
 NHC 量测同时依赖主滤波状态（δv^e、δφ^e、δb_g）和 NHC 子滤波状态（δθ_imu、δl_imu）。
 为保持两套 P 矩阵独立，将 H 矩阵拆分为两部分：
@@ -373,7 +373,6 @@ gipylib/
 │
 ├── tools/                         # 组合导航参考代码（不修改，不导入）
 │   ├── GINav/                     # MATLAB 组合导航
-│   ├── gnss_ins_lc_nhc/          # C++ 松组合+NHC（主要参考）
 │   └── GREAT-MSF-main/           # C++ 类继承体系参考（ABC模式）
 │
 ├── data/                          # 测试数据 + 配置
@@ -1303,7 +1302,7 @@ class RawDataWriter(WriterBase):
 ```python
 @dataclass
 class InsState:
-    """主滤波 INS 导航状态（E 系下，参考 gnss_ins_lc_nhc NavInfo）
+    """主滤波 INS 导航状态（E 系下)
 
     对应主滤波 P1 矩阵，状态向量 x1 = [δr^e, δv^e, δφ^e, δb_g, δb_a, (δl_gnss)]
     """
@@ -1536,7 +1535,7 @@ gnss.pos ──→ GnssSolStreamer → gnss_sol_q┘    (时间对齐)     (EKF�
                                                          └──────────┘
 ```
 
-### 8.2 松组合处理流程（双滤波，参考 gnss_ins_lc_nhc + KF-GINS）
+### 8.2 松组合处理流程（双滤波，参考 KF-GINS）
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -1556,7 +1555,7 @@ gnss.pos ──→ GnssSolStreamer → gnss_sol_q┘    (时间对齐)     (EKF�
 │     │  增量式/速率式 → 标准化格式                                     │
 │     ▼                                                                │
 │  4. INS 机械编排（InsCore.update，E 系）                             │
-│     │  姿态→速度→位置更新（参考 gnss_ins_lc_nhc navmech.cc）          │
+│     │  姿态→速度→位置更新                                                    │
 │     ▼                                                                │
 │  5. 主滤波 EKF 时间更新（P1 矩阵）                                   │
 │     │  x1_pred = x1 + F1 * dt * dx1                                  │
@@ -1680,7 +1679,7 @@ gnss.pos ──→ GnssSolStreamer → gnss_sol_q┘    (时间对齐)     (EKF�
 
 **关键实现**：
 1. Integration：组合导航集成基类，参考 GREAT-MSF t_gintegration
-2. LcEstimator：松组合估计器（InsKf 子类，持有 P1/P2 双矩阵），参考 t_gsinskf + gnss_ins_lc_nhc navfilter.cc
+2. LcEstimator：松组合估计器（InsKf 子类，持有 P1/P2 双矩阵），参考 t_gsinskf
 3. 主滤波 F1/Q1 + NHC 子滤波 F2/Q2（参考 navmech.cc 中的 F 矩阵构造）
 4. 松组合量测更新：GNSS 位置/速度（更新 P1）+ NHC（H1 更新 P1，H2 更新 P2）+ ZUPT（仅更新 P1）
 5. 双滤波反馈机制：主滤波反馈（修正 δr^e/δv^e/δφ^e/δb_g/δb_a/δl_gnss）+ 子滤波反馈（修正 δθ_imu/δl_imu）
@@ -1782,9 +1781,9 @@ estimator:
   zupt_acc_threshold: 0.5         # 零速检测加速度阈值 (m/s²)
   zupt_gyro_threshold: 0.05       # 零速检测角速度阈值 (rad/s)
   zupt_min_static_window: 1.0     # 零速检测最小静止窗口 (s)
-  # IMU安装角初始值（参考 gnss_ins_lc_nhc 的 initial_imu_angle）
+  # IMU安装角初始值
   initial_imu_angle: [0.0, 0.0]   # IMU安装角初始值 (度, pitch/yaw)
-  # IMU杆臂初始值（参考 gnss_ins_lc_nhc 的 initial_imu_leverarm）
+  # IMU杆臂初始值
   initial_imu_leverarm: [0.0, 0.0, 0.0]  # IMU杆臂初始值 (m, b系)
   # GNSS杆臂初始值
   initial_gnss_leverarm: [0.0, 0.0, 0.0]  # GNSS天线杆臂初始值 (m, b系)
@@ -1845,18 +1844,7 @@ class TcMeasurement:
 | `LibGREAT/gins/gearth.h` | `core/imu/earth_param.py` | 地球参数 |
 | KF-GINS `GIEngine::newImuProcess` + `imuInterpolate` | `core/estimator/lc_estimator.py` 时间对齐逻辑 | 增量切分时间对齐方案，4 种时间对齐情况处理 |
 
-### 12.2 gnss_ins_lc_nhc → 本项目
-
-| gnss_ins_lc_nhc | 本项目 | 说明 |
-|-----------------|--------|------|
-| `src/filter/navfilter.cc` | `core/estimator/ekf.py` + `InsKf.time_update()` | EKF 预测+更新 |
-| `src/imu/navmech.cc` | `core/imu/ins_core.py` + `InsKf.set_Ft()` | 机械编排+F矩阵 |
-| `src/imu/navinitalized.cc` | `core/imu/ins_init.py` | INS 初始化 |
-| `src/process/navstate.cc` | `core/estimator/lc_measurement.py` + `nhc.py` | 量测更新+NHC |
-| `src/data/navgnss.cc` | `core/gnss/spp.py` + `core/gnss/rtk.py` | GNSS 数据处理 |
-| `src/data/navimu.cc` | `core/imu/imu_preprocess.py` | IMU 数据预处理 |
-
-### 12.3 rtklib-py → 本项目（已吸收）
+### 12.2 rtklib-py → 本项目（已吸收）
 
 > **重要变更**：rtklib-py 原为外部 `library/rtklib-py/`，已吸收为 `src/core/gnss/rtklib/` 子包。
 > 通过 `config.py` 的 `_CfgProxy` 单例管理配置（由 `RtklibEnv.setup()` 调用 `config.set_params()` 注入），
@@ -1886,7 +1874,7 @@ class TcMeasurement:
 - `sqrt(diag(Sol.qr[0:3,0:3]))` → `GnssSolution.sd`（ECEF 位置标准差）
 - `Sol.qr[0:3, 0:3]` → `GnssSolution.cov`（ECEF 协方差矩阵，含非对角项）
 
-### 12.4 GINav → 本项目
+### 12.3 GINav → 本项目
 
 | GINav | 本项目 | 说明 |
 |-------|--------|------|

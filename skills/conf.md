@@ -1,12 +1,12 @@
 # 配置文件说明
 
 > 定义 GInsStream 统一定位解算配置文件的格式、字段与默认值。
-> 配置文件采用 YAML 格式，存放于 `data/config.yaml`（测试样例：`data/cfg_test_spp.yaml`、`data/cfg_test_rtk.yaml`）。
+> 配置文件采用 YAML 格式，存放于 `data/config.yaml`（参考配置：`data/spp-ins-lc.yaml`、`data/rtdtc.yaml`、`phone/rtdtc.yaml`、`data/ignav-rtktc.conf`）。
 >
 > **配置来源约定**：
 > - **GNSS 部分配置项**：参考 rtklib-py 的 `config_phone.py` / `config_f9p.py` / `__ppk_config.py`
 >   （rtklib-py 已吸收到 `src/core/gnss/rtklib/`，配置通过 `src/core/gnss/rtklib_config_adapter.py` 注入）
-> - **组合导航部分配置项**：参考 `tools/gnss_ins_lc_nhc` 项目的 `config/configure.ini`
+> - **组合导航部分配置项**：参考 ignav 的 `configure.ini`（ignav 已吸收到 `src/core/ins/`）
 > - **文件格式**：仿照 `tools/KF-GINS/config/kf-gins.yaml` 的中英双语注释 YAML 风格
 >
 > **时间系统约定**：全框架内部统一使用 **Unix 时间戳（float 秒，与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）**。
@@ -14,22 +14,23 @@
 > 输出端（`src/log/solution_writer.py` / `aligned_writer.py`）通过 `unix_to_gpst()` 转回 (week, sow) 写文件。
 > 时间转换工具位于 `src/core/time_utils.py`，常量 `GPST_EPOCH_UNIX = 315964800`。
 >
-> **当前项目状态**：
-> - ✅ 已实现：内部 GNSS 模式（SPP/RTK，`gnss_source: "internal"` + `ins.enabled: "off"`）→ 输出 `.pos` 文件
-> - ✅ 已实现：外部 GNSS 模式（`gnss_source: "external"` + `ins.enabled: "on"`）→ 输出对齐块状 CSV
-> - ✅ 已实现：内部 GNSS + IMU 对齐模式（`gnss_source: "internal"` + `ins.enabled: "on"`）→ 实时 RTK/SPP 解算 + IMU 流式读取 → Aligner 匹配 → 输出对齐块状 CSV（数据对齐管线，不含 INS EKF）
+> **当前项目状态**（`ins.enabled` 控制组合模式：`off`=纯 GNSS / `lc`=松组合 / `tc`=紧组合；已废弃的 `coupling_mode` 字段已移除）：
+> - ✅ 已实现：纯 GNSS 模式（`ins.enabled: "off"`，`gnss_source` 必须为 `internal`）→ 输出 `.pos` 文件（`SolutionLogger` + `SolutionWriter`）
+> - ✅ 已实现：松组合模式（`ins.enabled: "lc"`）→ 输出 `.pos` + `aligned.csv` + `.rslt`（100Hz，ECEF 位置/速度 + 姿态）
+> - ✅ 已实现：紧组合模式（`ins.enabled: "tc"`）→ 输出 `.rslt`（100Hz，`TcStream` + `RSLTWriter`）
 > - ✅ 已实现：INS 初始化模块 `src/core/ins/initializer.py::InsInitializer`（三种模式：静态 / 速度矢量 / 位置差分，三阈值检验），详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)
 > - ✅ 已实现：`src/core/ins/` 下 `interpolator.py` / `earth_param.py` / `attitude.py`（初始化支撑模块）
 > - ✅ 已实现：`ImuSensor` RFU→FRD 坐标系自动转换（`_convert_to_frd()`）
 > - ✅ 已实现：SPP 多普勒测速（`pntpos.py::estvel` / `resdop`，速度填入 `sol.rr[3:6]`）
-> - 🚧 预留：INS 机械编排核心 `InsCore` / 单滤波 EKF `LcIntegration` / NHC / ZUPT / 紧组合接口（下一阶段实现）
+> - ✅ 已实现：`TraceFileWriter`（`src/log/trace_file_writer.py`）重定向 rtklib-py trace 输出，将 Unix 时间戳转换为 GPS 周+周内秒，过滤无效调试行（`pos=[0. 0. 0.]`、`x[clk]=N/A`、`clk_stored=[0. 0. 0.]`）
+> - ✅ 已实现：`SolutionWriter` / `RSLTWriter` 支持 `position_format` 与 `time_format` 输出格式参数
 >
 > **三种运行模式对比**：
-> | 模式 | gnss_source | ins.enabled | GNSS 来源 | IMU | 输出 | Logger |
-> |------|-------------|-------------|-----------|-----|------|--------|
-> | 纯 GNSS | internal | off | 实时解算 | 无 | `.pos` | SolutionLogger |
-> | 外部对齐 | external | on | 外部文件 | 流式 | `aligned.csv` | Logger |
-> | 内部对齐 | internal | on | 实时解算 | 流式 | `aligned.csv` | Logger |
+> | 模式 | gnss_source | ins.enabled | GNSS 来源 | IMU | 输出 | Logger/Writer |
+> |------|-------------|-------------|-----------|-----|------|---------------|
+> | 纯 GNSS | internal | off | 实时解算 | 无 | `.pos` | SolutionLogger + SolutionWriter |
+> | 松组合 | internal/external | on | 实时解算/外部文件 | 流式 | `.pos` + `aligned.csv` + `.rslt` | SolutionWriter + AlignedWriter + RSLTWriter |
+> | 紧组合 | internal | tc | 实时解算 | 流式 | `.rslt` | TcStream + RSLTWriter |
 >
 > **单滤波架构对应**（INS 启用后的设计，参考 [estimator.md](file:///home/mxl/workplace/gipylib/skills/estimator.md)）：
 > - 单一 P 矩阵（E 系，StateIndex 参数块，15~24 维 = 固定 15 维 + 可选 GNSS 杆臂 3 / IMU 安装角 2 / IMU 杆臂 3 / 时间对齐 1）
@@ -53,7 +54,7 @@
     - [3.7 单点定位参数](#37-单点定位参数)
     - [3.8 星座与信号配置](#38-星座与信号配置)
     - [3.9 基站与初始位置](#39-基站与初始位置)
-  - [4. 组合导航配置项（参考 gnss\_ins\_lc\_nhc）](#4-组合导航配置项参考-gnss_ins_lc_nhc)
+  - [4. 组合导航配置项（参考 ignav）](#4-组合导航配置项参考-ignav)
     - [4.1 处理时间](#41-处理时间)
     - [4.2 使能开关](#42-使能开关)
     - [4.3 数据路径与采样率](#43-数据路径与采样率)
@@ -83,7 +84,7 @@
 GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，涵盖：
 
 1. **GNSS 解算配置**（SPP/RTK/RTD，参考 rtklib-py）
-2. **组合导航配置**（INS 机械编排 + 单滤波 EKF + NHC/ZUPT，参考 gnss_ins_lc_nhc）
+2. **组合导航配置**（INS 机械编排 + 单滤波 EKF + NHC/ZUPT，参考 ignav）
 3. **输出配置**（POS/CSV/NMEA 格式、日志级别）
 
 配置文件支持两种 GNSS 数据源模式：
@@ -95,7 +96,7 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 ## 2. 配置文件格式
 
 - 文件格式：YAML 1.1
-- 文件位置：`data/config.yaml`（测试样例：`data/cfg_test_spp.yaml`、`data/cfg_test_rtk.yaml`）
+- 文件位置：`data/config.yaml`（参考配置：`data/spp-ins-lc.yaml`、`data/rtdtc.yaml`、`phone/rtdtc.yaml`、`data/ignav-rtktc.conf`）
 - 注释风格：中英双语注释（参考 kf-gins.yaml）
 - 数组：使用 YAML 内联数组语法 `[a, b, c]` 或块状语法
 - 布尔值：`true` / `false`
@@ -221,20 +222,21 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 
 | 字段 | 类型 | 默认值 | 单位 | 说明 | rtklib-py 对应 |
 |------|------|--------|------|------|---------------|
-| `rb` | [float, float, float] | `[0, 0, 0]` | m | 基站 ECEF 位置（0,0,0 表示用 RINEX 头） | `rb` |
+| `rb_format` | str | `"xyz"` | — | 基站坐标格式：`xyz`=ECEF 直角坐标 (m) / `llh`=经纬度高 [lat_deg, lon_deg, h_m]。`llh` 时由 `config_loader._normalize_rb()` 内部转为 xyz | — |
+| `rb` | [float, float, float] | `[0, 0, 0]` | m | 基站位置（`rb_format=xyz`: ECEF [x,y,z]；`rb_format=llh`: [lat, lon, h]；全 0 表示用 RINEX 头） | `rb` |
 | `rr_f` | list | `[0,0,0,0,0,0]` | m, m/s | 流动站初始位置速度（正向，0 表示自动单精解） | `rr_f` |
 | `rr_b` | list | `[0,0,0,0,0,0]` | m, m/s | 流动站初始位置速度（反向，0 表示自动单精解） | `rr_b` |
 
 ---
 
-## 4. 组合导航配置项（参考 gnss_ins_lc_nhc）
+## 4. 组合导航配置项（参考 ignav）
 
-> 以下配置项映射自 `tools/gnss_ins_lc_nhc/config/configure.ini`，命名与原项目一致。
+> 以下配置项参考 ignav 的 `configure.ini`（ignav 已吸收到 `src/core/ins/`），命名与原项目一致。
 > 坐标系约定：机械编排在 E 系（ECEF）下进行，IMU 体坐标系为 FRD，车体坐标系为 FRD。
 
 ### 4.1 处理时间
 
-| 字段 | 类型 | 默认值 | 单位 | 说明 | gnss_ins_lc_nhc 对应 |
+| 字段 | 类型 | 默认值 | 单位 | 说明 | 参考来源 |
 |------|------|--------|------|------|---------------------|
 | `process_date` | [int, int, int] | `[2024, 12, 20]` | — | 处理日期 [year, month, day] | `process_date` |
 | `start_time` | float | `0` | s | 起始时间（当日秒或 GPST 周） | `start_time` |
@@ -242,7 +244,7 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 
 ### 4.2 使能开关
 
-| 字段 | 类型 | 默认值 | 说明 | gnss_ins_lc_nhc 对应 |
+| 字段 | 类型 | 默认值 | 说明 | 参考来源 |
 |------|------|--------|------|---------------------|
 | `gnss_enable` | int | `1` | GNSS 量测使能（0=关闭） | `gnss_enable` |
 | `imu_enable` | int | `1` | IMU 机械编排放能 | `imu_enable` |
@@ -251,7 +253,7 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 
 ### 4.3 数据路径与采样率
 
-| 字段 | 类型 | 默认值 | 单位 | 说明 | gnss_ins_lc_nhc 对应 |
+| 字段 | 类型 | 默认值 | 单位 | 说明 | 参考来源 |
 |------|------|--------|------|------|---------------------|
 | `imu_data_path` | str | `""` | — | IMU 数据文件路径 | `imu_data_path` |
 | `gnss_data_path` | str | `""` | — | GNSS 数据文件路径（外部模式结果文件） | `gnss_data_path` |
@@ -266,7 +268,7 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 > 详见 [初始化.md 第 5 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#5-初始化模式分类) 和 [第 5.4 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#54-动态初始化默认模式选择基于-gnss-解算模式)。
 > **当前实现状态**：`InsInitializer` 已实现三种模式（静态 / 速度矢量 / 位置差分），详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)。
 
-| 字段 | 类型 | 默认值 | 单位 | 说明 | gnss_ins_lc_nhc 对应 |
+| 字段 | 类型 | 默认值 | 单位 | 说明 | 参考来源 |
 |------|------|--------|------|------|---------------------|
 | `alignnment_velocity_threshold` | float | `4.0` | m/s | **已废弃**（保留兼容），由 `static_speed_threshold` / `dynamic_speed_threshold` 替代 | `alignnment_velocity_threshold` |
 | `motion_threshold` | float | `0.5` | m/s | **已废弃**（保留兼容），由三阈值替代 | — |
@@ -301,7 +303,7 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 
 ### 4.5 初始状态
 
-| 字段 | 类型 | 默认值 | 单位 | 说明 | gnss_ins_lc_nhc 对应 |
+| 字段 | 类型 | 默认值 | 单位 | 说明 | 参考来源 |
 |------|------|--------|------|------|---------------------|
 | `initial_pos` | [float, float, float] | `[0, 0, 0]` | deg, deg, m | 初始位置 [lat, lon, alt] | `initial_pos` |
 | `initial_vel` | [float, float, float] | `[0, 0, 0]` | m/s | 初始速度 [N, E, D] | `initial_vel` |
@@ -311,7 +313,7 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 
 ### 4.6 IMU 噪声参数
 
-| 字段 | 类型 | 默认值 | 单位 | 说明 | gnss_ins_lc_nhc 对应 |
+| 字段 | 类型 | 默认值 | 单位 | 说明 | 参考来源 |
 |------|------|--------|------|------|---------------------|
 | `velocity_random_walk` | [float, float, float] | `[0.1, 0.1, 0.1]` | m/s/√hr | 速度随机游走 (VRW) | `velocity_random_walk` |
 | `attitude_random_walk` | [float, float, float] | `[0.1, 0.1, 0.1]` | deg/√hr | 姿态随机游走 (ARW) | `attitude_random_walk` |
@@ -325,7 +327,7 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 
 NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不腾空）作为虚拟速度观测，在 GNSS 中断期间抑制惯性推算误差发散。
 
-**`nhc_enable` 策略表**（参考 gnss_ins_lc_nhc）：
+**`nhc_enable` 策略表**（参考 ignav）：
 
 | `nhc_enable` | 观测维度 | 坐标系 | 观测量 | 作用目标 | 备注 |
 |:---:|:---:|:---:|---|---|---|
@@ -342,7 +344,7 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 
 **NHC 通用参数**：
 
-| 字段 | 类型 | 默认值 | 单位 | 说明 | gnss_ins_lc_nhc 对应 |
+| 字段 | 类型 | 默认值 | 单位 | 说明 | 参考来源 |
 |------|------|--------|------|------|---------------------|
 | `nhc_gt` | int | `0` | — | 1=使用真值参考速度/姿态（仿真用） | `nhc_gt` |
 | `nhc_lstm` | int | `0` | — | 1=使用 LSTM 预测速度/姿态（部署用，与 `nhc_gt` 互斥） | `nhc_lstm` |
@@ -379,7 +381,7 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 
 ### 4.9 杆臂与安装角
 
-| 字段 | 类型 | 默认值 | 单位 | 说明 | gnss_ins_lc_nhc 对应 |
+| 字段 | 类型 | 默认值 | 单位 | 说明 | 参考来源 |
 |------|------|--------|------|------|---------------------|
 | `leverarm` | [float, float, float] | `[0, 0, 0]` | m | GNSS 天线杆臂（b 系前右下） | `leverarm` |
 | `antlever` | [float, float, float] | `[0, 0, 0]` | m | 天线杆臂（IMU 系前右下，参考 kf-gins） | `antlever` |
@@ -393,7 +395,7 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 
 > 单滤波协方差 P_0，维度 = StateIndex.dim（默认 15，可选扩展）。
 
-| 字段 | 类型 | 默认值 | 单位 | 说明 | gnss_ins_lc_nhc 对应 |
+| 字段 | 类型 | 默认值 | 单位 | 说明 | 参考来源 |
 |------|------|--------|------|------|---------------------|
 | `use_define_variance_pos_vel` | int | `1` | — | 1=使用自定义位置速度方差 | `use_define_variance_pos_vel` |
 | `use_define_variance_att` | int | `1` | — | 1=使用自定义姿态方差 | `use_define_variance_att` |
@@ -405,7 +407,7 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 
 ### 4.11 GNSS 中断模拟
 
-| 字段 | 类型 | 默认值 | 说明 | gnss_ins_lc_nhc 对应 |
+| 字段 | 类型 | 默认值 | 说明 | 参考来源 |
 |------|------|--------|------|---------------------|
 | `gnsslog_enable` | int | `0` | GNSS 日志使能 | `gnsslog_enable` |
 | `gnss_break` | list | `[0, 30, 60, 0]` | 中断参数 [start, break_time, interval_time, break_number] | `gnss_break` |
@@ -419,9 +421,12 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `output_dir` | str | `"output"` | 输出目录 |
-| `solution_filename` | str | `"solution.pos"` | 内部模式输出 `.pos` 文件名（如 `test_spp.pos`、`test_rtk.pos`） |
-| `solution_format` | str | `"pos"` | 解算结果格式：`pos` / `csv` / `nmea` |
-| `trace_level` | int | `1` | 轨迹输出级别：0=无 / 1=基本 / 2=详细 / 3=调试 |
+| `gnss_filename` | str | `"RTK.pos"` | 纯 GNSS 解算结果文件名（`.pos`，`ins.enabled=off/on` 输出） |
+| `aligned_filename` | str | `"aligned.csv"` | 对齐块状 CSV 文件名（`ins.enabled=on` 输出） |
+| `rslt_filename` | str | `"RTKLC.rslt"` | 组合导航结果文件名（`.rslt`，`ins.enabled=on/tc` 输出，100Hz，ECEF 位置/速度 + 姿态） |
+| `position_format` | str | `"llh"` | 位置输出格式：`llh`=经纬度高 (lat/lon/h) / `xyz`=ECEF 直角坐标 |
+| `time_format` | str | `"gpst"` | 时间输出格式：`gpst`=GPS 周+周内秒 / `datetime`=YYYY/MM/DD HH:MM:SS.sss |
+| `trace_level` | int | `0` | trace 文件级别：0=off / 1=info / 2=detail / 3=debug。生成与主输出同名的 `.trace` 文件，存放于 `output_dir` |
 | `log_raw_data` | bool | `false` | 是否记录原始数据到 raw/ |
 | `log_level` | str | `"INFO"` | 运行日志级别：DEBUG/INFO/WARNING/ERROR |
 | `terminal_summary_interval` | int | `10` | 终端摘要间隔（每 N 条解算结果） |
@@ -496,21 +501,20 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 
 ### 7.4 输出文件
 
-| 文件 | 格式 | 内容 | 必须 |
-|------|------|------|------|
-| `output/test_spp.pos` / `output/test_rtk.pos` | POS | 内部纯 GNSS 模式解算结果（SPP/RTK），由 `src/log/solution_writer.py::SolutionWriter` 输出 | 是（internal+off 模式） |
-| `output/aligned.csv` | CSV | 外部对齐模式块状输出（G + N 行 I），由 `src/log/aligned_writer.py::AlignedWriter` 输出 | 是（external 模式） |
-| `output/aligned_internal_rtk.csv` | CSV | 内部对齐模式块状输出（G + N 行 I），实时 RTK 解算 + IMU 对齐 | 是（internal+on 模式） |
-| `output/solution.csv` | CSV | 解算结果（完整状态） | 可选（未实现） |
-| `output/solution.nmea` | NMEA | NMEA 格式 | 可选（未实现） |
-| `output/trace.txt` | 文本 | 运行轨迹/调试信息 | 可选（未实现） |
-| `output/raw/imu_raw.csv` | CSV | IMU 原始数据 | 可选（未实现） |
-| `output/raw/rover_raw.csv` | CSV | 流动站原始数据（内部模式） | 可选（未实现） |
+| 文件 | 格式 | 内容 | 触发模式 |
+|------|------|------|---------|
+| `output/RTK.pos` | POS | 纯 GNSS 解算结果（SPP/RTK），由 `src/log/solution_writer.py::SolutionWriter` 输出 | `ins.enabled=off/on` |
+| `output/aligned.csv` | CSV | 对齐块状输出（G + N 行 I），由 `src/log/aligned_writer.py::AlignedWriter` 输出 | `ins.enabled=on` |
+| `output/RTKLC.rslt` | RSLT | 组合导航结果（100Hz，ECEF 位置/速度 + 姿态），松组合由 `RSLTWriter` 输出 / 紧组合由 `TcStream` + `RSLTWriter` 输出 | `ins.enabled=on/tc` |
+| `output/<name>.trace` | 文本 | rtklib-py trace 输出，由 `src/log/trace_file_writer.py::TraceFileWriter` 重定向，Unix 时间戳转 GPS 周+周内秒，过滤无效调试行 | `trace_level>0` |
+| `output/raw/imu_raw.csv` | CSV | IMU 原始数据 | `log_raw_data=true`（可选） |
+| `output/raw/rover_raw.csv` | CSV | 流动站原始数据（内部模式） | `log_raw_data=true`（可选） |
 
-> 内部纯 GNSS 模式（`internal` + `ins.enabled: "off"`）主入口：`src/main.py` → 路径 B → `SolutionLogger` + `SolutionWriter`，
-> 输出 `.pos` 文件，文件名由 `output.solution_filename` 指定（如 `test_spp.pos`、`test_rtk.pos`）。
-> 外部对齐模式（`external` + `ins.enabled: "on"`）主入口：`src/main.py` → 路径 A → `Logger` + `AlignedWriter` + `Aligner`，
-> 输出对齐块状 CSV，文件名默认 `aligned.csv`。
-> 内部对齐模式（`internal` + `ins.enabled: "on"`）主入口：`src/main.py` → 路径 C → `Logger` + `AlignedWriter` + `Aligner`，
-> 输出对齐块状 CSV，文件名由 `output.aligned_filename` 指定（如 `aligned_internal_rtk.csv`）。
-> `config_loader.py` 校验 `internal + on` 时要求 `ins.imu_data_path` 必须存在（不再抛 `NotImplementedError`）。
+> 输出文件按 `ins.enabled` 启用：
+> - `off`（纯 GNSS）：`gnss_filename`（`.pos`，`SolutionLogger` + `SolutionWriter`）
+> - `on`（松组合）：`gnss_filename`（`.pos`）+ `aligned_filename`（`.csv`，`AlignedWriter`）+ `rslt_filename`（`.rslt`，100Hz，`RSLTWriter`）
+> - `tc`（紧组合）：`rslt_filename`（`.rslt`，100Hz，`TcStream` + `RSLTWriter`）
+>
+> `SolutionWriter` 与 `RSLTWriter` 接受 `position_format` 与 `time_format` 参数控制输出格式。
+> `trace_level>0` 时生成 `.trace` 文件（与主输出同名，存放于 `output_dir`），由 `TraceFileWriter` 重定向 rtklib-py trace 输出。
+> `config_loader.py` 校验 `ins.enabled=off` 时 `gnss_source` 必须为 `internal`；`ins.enabled=on/tc` 时 `imu_data_path` 必填。

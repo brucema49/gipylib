@@ -1,6 +1,6 @@
 """INS 初始化器。
 
-参考 KF-GINS initialize + gnss_ins_lc_nhc StartAligning/AcceLeveling/MotionAligned。
+参考 KF-GINS initialize。
 支持三种初始化模式: 静态、速度矢量、位置差分。
 
 本项目实现低精度 INS 初始化（初始化调整.md）：
@@ -231,8 +231,7 @@ class InsInitializer:
         原理: 车辆静止时, 陀螺测量值 = 地球自转分量 + 零偏 + 噪声。
         通过对静态 IMU 数据求平均可估计零偏。加速度计同理。
 
-        参考: gnss_ins_lc_nhc AcceLeveling (navinitialized.cc 行 47-59)
-        计算了平均陀螺但未用于零偏估计。本接口为后续优化预留。
+        本接口为后续优化预留。
 
         Args:
             imu_list: 静态期间的 IMU 数据列表
@@ -247,7 +246,7 @@ class InsInitializer:
                                ) -> Tuple[np.ndarray, np.ndarray]:
         """速度矢量对准: GNSS 速度方向计算 yaw（初始化调整.md）。
 
-        参考 gnss_ins_lc_nhc MotionAligned, 本项目简化版:
+        本项目简化版:
         - yaw = atan2(v_E, v_N) (东向速度与北向速度)
         - pitch = 0 (初始化调整.md: 其他姿态角设为 0)
         - roll = 0
@@ -287,7 +286,7 @@ class InsInitializer:
                                    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """位置差分对准: gnss_buffer_size 历元缓冲, 所有相邻历元平面速度(EN)均超阈值才初始化。
 
-        参考 gnss_ins_lc_nhc InterpolateGnssVel + MotionAligned + issue/7-30松组合.md。
+        参考 issue/7-30松组合.md。
         速度阈值检查使用平面速度范数 sqrt(v_E^2 + v_N^2) (不含垂向)。
         要求缓冲区内所有相邻历元差分得到的平面速度均 >= 阈值, 保证连续运动。
         速度计算使用首尾历元差分 (span 最大, 噪声最小), issue 要求 "首尾位置差分"。
@@ -363,10 +362,10 @@ class InsInitializer:
         C_b_e = att_caln2e(lat, lon, C_b_n)
         q_b_e = dcm2quat(C_b_e)
 
-        # 单位转换常量 (与 gnss_ins_lc_nhc constant.hpp 行 20-36 一致)
+        # 单位转换常量
         constant_g0 = 9.7803267715
         dh2rs = math.pi / 180.0 / 3600.0       # deg/hour → rad/s
-        constant_mgal = 1e-6 * constant_g0      # mGal → m/s² (gnss_ins_lc_nhc 定义)
+        constant_mgal = 1e-6 * constant_g0      # mGal → m/s²
 
         # IMU 零偏: 优先使用静态标定结果, 否则从 config 读取
         if (mode == InitMode.STATIC

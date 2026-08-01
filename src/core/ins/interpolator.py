@@ -8,7 +8,7 @@ GVINS 风格线性插值（imu_interpolate_linear）：
 
 最近邻策略（imu_interpolate）：
 - 历史保留接口，不再被项目代码使用
-- 原 gnss_ins_lc_nhc/GINav 增量切分不适用于速率式 IMU
+- 原 GINav 增量切分不适用于速率式 IMU
 """
 from typing import Optional
 
