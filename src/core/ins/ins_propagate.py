@@ -1,0 +1,66 @@
+"""INS 协方差传播。
+
+参考:
+- GINav ins_time_updata.m (每历元传播, 中间值法)
+- navfilter TimeUpdate (P = Φ·P·Φ^T + Q)
+
+本阶段为开环模式: 只传播 P, 不做量测更新, 不反馈修正 InsState。
+P = Φ·(P + 0.5Q)·Φ^T + 0.5Q  (GINav 中间值法)
+"""
+import logging
+
+import numpy as np
+
+from src.core.data_types import ImuMeasurement
+from src.core.ins.transfer_matrix import TransferMatrix
+
+logger = logging.getLogger(__name__)
+
+
+class InsPropagate:
+    """INS 协方差传播器。
+
+    维护协方差矩阵 P。
+    开环模式: 只传播, 不修正状态。
+    """
+
+    def __init__(self, P: np.ndarray, config: dict):
+        self._P = P.copy()
+        self._tm = TransferMatrix(config)
+        logger.info(
+            f"InsPropagate 初始化: P shape={P.shape}, "
+            f"trace={np.trace(P):.6e}"
+        )
+
+    @property
+    def P(self) -> np.ndarray:
+        return self._P
+
+    def propagate(self, imu: ImuMeasurement, ins_update, prev_timestamp: float) -> None:
+        """协方差传播: P = Φ·(P + 0.5Q)·Φ^T + 0.5Q。
+
+        Args:
+            imu: 当前 IMU 测量
+            ins_update: InsUpdate 实例 (提供 C_b_e, f_b, w_b_ib)
+            prev_timestamp: 上一历元时间戳 (用于计算 dt)
+        """
+        dt = imu.timestamp - prev_timestamp
+        if dt <= 0.0:
+            return
+
+        # 从 InsUpdate 获取当前状态量
+        C_b_e = ins_update.state.C_b_e
+        f_b = ins_update.f_b
+        w_b_ib = ins_update.w_b_ib
+
+        # 构造 F, Φ, Q
+        F = self._tm.build_F(C_b_e, f_b, w_b_ib, ins_update.state.pos_e)
+        Phi = self._tm.build_Phi(F, dt)
+        Q = self._tm.build_Q(dt, C_b_e)
+
+        # GINav 中间值法: P = Φ·(P + 0.5Q)·Φ^T + 0.5Q
+        P0 = self._P + 0.5 * Q
+        self._P = Phi @ P0 @ Phi.T + 0.5 * Q
+
+        # 对称化 (数值稳定性)
+        self._P = 0.5 * (self._P + self._P.T)

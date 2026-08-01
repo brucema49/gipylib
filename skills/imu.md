@@ -4,9 +4,29 @@
 > 以及 IMU/GNSS 时间对齐插值。
 > 参考 GREAT-MSF 的 t_gsins、t_gimu、t_gbase、t_ginterp 类设计。
 >
-> **时间系统约定**：全框架统一使用 GPS 秒（GPST，since 1980-01-06），不使用 Unix epoch 或本地时间。
+> **时间系统约定**：全框架内部统一使用 **Unix 时间戳（float 秒，与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）**。
+> `ImuMeasurement.timestamp` 字段为 Unix 秒，`week` 为由 timestamp 派生的便利字段。
+> 时间转换工具：`src/core/time_utils.py`（`gpst_to_unix` / `unix_to_gpst`，`GPST_EPOCH_UNIX = 315964800`）。
 >
-> **框架设计模式集成**：
+> **当前实现状态**：
+> - ✅ 已实现：`src/stream/imu_sensor.py::ImuSensor`（IMU 文本流式读取，逐行解码 + 队列推入，**含 RFU→FRD 坐标系自动转换** `_convert_to_frd()`）
+> - ✅ 已实现：`src/stream/formators.py::ImuFormator`（GPST 格式 IMU CSV 解码：`week,sow,gx,gy,gz,ax,ay,az` → `ImuMeasurement`，时间戳通过 `gpst_to_unix(week, sow)` 转换）
+> - ✅ 已实现：`src/stream/formators.py::EuRoCImuFormator`（EuRoC 格式 IMU CSV 解码：`timestamp_ns,wx,wy,wz,ax,ay,az` → `ImuMeasurement`，纳秒时间戳除以 1e9 转 Unix 秒，GPS 周号由 `unix_to_gpst` 派生；坐标系默认 RFU，由 `ImuSensor._convert_to_frd()` 转 FRD）
+> - ✅ 已实现：`src/core/data_types.py::ImuMeasurement`（实际数据结构，字段：`timestamp`, `week`, `accel`, `gyro`）
+> - ✅ 已实现：`src/log/aligner.py::Aligner`（IMU 积攒 + GNSS 收割的匹配器，时间戳基于 Unix）
+> - ✅ 已实现：`src/core/ins/interpolator.py`（`is_to_update` / `imu_interpolate` / `find_bracket_imus`，与 [初始化.md 第 4 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#4-imu-数据插值到-gnss-时间戳) 共用）
+> - ✅ 已实现：`src/core/ins/earth_param.py`（`ecef2llh` / `llh2ecef` / `cal_Ce2n` / `gravity_ecef` + WGS84 常量）
+> - ✅ 已实现：`src/core/ins/attitude.py`（`euler2dcm` / `dcm2euler` / `dcm2quat` / `quat2dcm` / `att_caln2e`）
+> - ✅ 已实现：`src/core/ins/initializer.py::InsInitializer`（三种初始化模式：静态 / 速度矢量 / 位置差分，详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
+> - 🚧 预留：`InsCore` / `ImuPreprocessor` / `ImuMechStrategy` 等 INS 机械编排核心类（当前未实现）
+>
+> **IMU 坐标系约定**：
+> - 项目标准体坐标系 b 系：**FRD（前-右-下）**
+> - 原始 IMU 数据可能为 **RFU（右-前-上）**（如 `data/cpt_imu.csv`），由 `ImuSensor._convert_to_frd()` 在读取时自动转换
+> - 转换关系：`FRD = [RFU_y, RFU_x, -RFU_z]`（即 `gyro_frd = [gyro_rfu_y, gyro_rfu_x, -gyro_rfu_z]`，accel 同理）
+> - 配置项：`ins.imu_coordinate_system`（`FRD` / `RFU`，详见 [config.md 2.5](file:///home/mxl/workplace/gipylib/skills/config.md#25-初始对准)）
+>
+> **框架设计模式集成**（INS 启用后的设计）：
 > - **策略模式（仅前端）**：IMU 机械编排封装为 `ImuMechStrategy(OdometryStrategy)`，作为前端里程计策略，IMU 不可用时可降级为 `GnssPositioningStrategy`
 > - **纯队列流水线**：IMU 传感器 `ImuSensor(BaseSensor)` **不作为 Subject**，无 `notify()`，数据通过 `output_queue.put()` 推入 imu_queue → Scheduler 转发到 estimate_queue → `LcIntegration.process_epoch()` 处理
 > - **依赖注入**：`ImuMechStrategy` 通过构造函数接收 `InsCore` 与 `ImuPreprocessor` 实例
@@ -35,13 +55,19 @@
 
 ### 1.1 模块文件
 
-| 文件 | 职责 | 参考 |
-|------|------|------|
-| `ins_core.py` | INS 核心：姿态/速度/位置更新、粗对准 | GREAT-MSF t_gsins |
-| `imu_preprocess.py` | IMU 数据预处理（增量/速率转换、异常检测） | GREAT-MSF t_gimu |
-| `interpolator.py` | IMU/GNSS 时间对齐插值 | GREAT-MSF t_ginterp / t_gpoly |
-| `earth_param.py` | 地球参数（重力、自转角速度、曲率半径） | GREAT-MSF t_gbase |
-| `attitude.py` | 姿态表示与转换（四元数/欧拉角/DCM） | GREAT-MSF t_gbase |
+| 文件 | 职责 | 参考 | 实现状态 |
+|------|------|------|---------|
+| `src/core/data_types.py` | `ImuMeasurement` 数据结构定义 | — | ✅ 已实现 |
+| `src/core/time_utils.py` | 时间转换（`gpst_to_unix` / `unix_to_gpst`） | rtklib-py gtime_t | ✅ 已实现 |
+| `src/stream/imu_sensor.py` | IMU 文本流式读取（继承 `StreamerBase`，含 RFU→FRD 转换 `_convert_to_frd()`） | — | ✅ 已实现 |
+| `src/stream/formators.py` | `ImuFormator`（GPST 格式）+ `EuRoCImuFormator`（EuRoC 格式）+ `PosSolFormator`（rtklib POS）解码器 | — | ✅ 已实现 |
+| `src/log/aligner.py` | IMU 积攒 + GNSS 收割的匹配器（基于 Unix 时间戳） | — | ✅ 已实现 |
+| `src/core/ins/interpolator.py` | IMU/GNSS 时间对齐插值（`is_to_update` / `imu_interpolate` / `find_bracket_imus`） | KF-GINS `imuInterpolate` / `isToUpdate` | ✅ 已实现 |
+| `src/core/ins/earth_param.py` | 地球参数（`ecef2llh` / `llh2ecef` / `cal_Ce2n` / `gravity_ecef` + WGS84 常量） | — | ✅ 已实现 |
+| `src/core/ins/attitude.py` | 姿态表示与转换（`euler2dcm` / `dcm2euler` / `dcm2quat` / `quat2dcm` / `att_caln2e`） | — | ✅ 已实现 |
+| `src/core/ins/initializer.py` | `InsInitializer` 类：插值、模式选择、对准、状态装配，三阈值检验 | KF-GINS `initialize` | ✅ 已实现 |
+| `src/core/ins/ins_core.py` | INS 核心：姿态/速度/位置更新、粗对准 | GREAT-MSF t_gsins | 🚧 预留 |
+| `src/core/ins/imu_preprocess.py` | IMU 数据预处理（增量/速率转换、异常检测） | GREAT-MSF t_gimu | 🚧 预留 |
 
 ### 1.2 与 Estimator 的关系
 
@@ -57,15 +83,15 @@ IMU/GNSS 数据流（纯队列流水线，时间对齐在 Estimator 内部）:
                                     InsCore ←─────── 时间对齐后的 IMU
                                     (正向递推)
                                        ↓
-                                  双滤波 EKF (P1 主滤波 + P2 NHC 子滤波)
+                                  单滤波 EKF (P, StateIndex 参数块)
                                        ↓
-                                  双滤波独立反馈
+                                  单滤波统一反馈
 ```
 
 - `InsCore` 负责 INS 正向递推（姿态、速度、位置更新）
 - `Interpolator` 负责 IMU/GNSS 时间对齐（**在 Estimator 内部调用**，Scheduler 仅转发）
-- `InsKf`/`LcEstimator` 负责构造双滤波状态转移矩阵 F1/F2（误差传播）
-- InsCore 是正向递推，InsKf/LcEstimator 是误差传播，两者共享相同的物理模型
+- `LcEstimator` 负责构造状态转移矩阵 F（误差传播，StateIndex 参数块）
+- InsCore 是正向递推，LcEstimator 是误差传播，两者共享相同的物理模型
 - IMU 数据通过 `queue.put()` 流转，**无观察者回调、无 notify()**
 
 ---
@@ -82,7 +108,7 @@ IMU/GNSS 数据流（纯队列流水线，时间对齐在 Estimator 内部）:
 | **导航坐标系** | n 系 | 当地水平坐标系 | ENU（东-北-天），仅输出用 |
 | **惯性坐标系** | i 系 | ECI 惯性坐标系 | — |
 
-**本项目约定（参考 gnss_ins_lc_nhc）**：
+**本项目约定**：
 - **机械编排在 E 系（ECEF）下进行**，不在 n 系下
 - 体坐标系：**FRD**（前-右-下），与航空/惯导常用约定一致
 - 车体坐标系：**FRD**（前-右-下），与 b 系通过安装角旋转矩阵 R_b^v 关联
@@ -92,7 +118,7 @@ IMU/GNSS 数据流（纯队列流水线，时间对齐在 Estimator 内部）:
 ### 2.2 姿态矩阵 C_b^e
 
 ```
-E 系下姿态矩阵 C_b^e（b 系到 e 系），参考 gnss_ins_lc_nhc navmech.cc
+E 系下姿态矩阵 C_b^e（b 系到 e 系）
 
 姿态更新在 E 系下进行:
   C_b^e(k+1) = C_b^e(k) * ΔC_b(k→k+1)
@@ -108,7 +134,7 @@ b 系（IMU 本体）与 v 系（车体）之间通过安装角旋转矩阵 R_b^
 R_b^v 由安装角 [roll=0, pitch, yaw] 构造:
   R_b^v = R_z(yaw) * R_y(pitch)  （roll 假设为 0）
 
-安装角只有 2 维（pitch, yaw），参考 gnss_ins_lc_nhc
+安装角只有 2 维（pitch, yaw）
 安装角误差 δθ_imu = [δpitch, δyaw]
 ```
 
@@ -370,10 +396,7 @@ class EarthParam:
 
     @staticmethod
     def gravity_ecef(r_e: np.ndarray) -> np.ndarray:
-        """E 系下正常重力向量（含离心力项，主计算用）
-
-        参考 gnss_ins_lc_nhc navmech.cc
-        """
+        """E 系下正常重力向量（含离心力项，主计算用）"""
         ...
 
     @staticmethod
@@ -420,196 +443,209 @@ ImuPreprocessor.check_imu_data() 检测内容：
 
 ---
 
-## 5. IMU/GNSS 插值与时间对齐
+## 5. IMU/GNSS 时间对齐（最近邻匹配）
 
 ### 5.1 问题背景
 
 IMU 和 GNSS 具有不同的采样率（IMU 通常 100~200Hz，GNSS 通常 1~10Hz），
-且两者的时间戳通常不对齐。在松组合融合中，需要在 GNSS 历元时刻获取
-对应的 INS 预测状态，因此需要将 IMU 数据插值到 GNSS 时间戳。
+且两者的时间戳通常不对齐。在松组合融合与初始化对准中，需要在 GNSS 历元时刻获取
+对应的 IMU 测量数据，因此需要将 IMU 数据对齐到 GNSS 时间戳。
 
-**核心问题**：当 GNSS 量测时刻 t1 落在两个 IMU 时刻 t0 和 t2 之间时，
-如何在不丢失 t2 数据的前提下进行精确插值？
+**核心问题**：当 GNSS 量测时刻 `t_gnss` 落在两个 IMU 时刻 `t0` 和 `t2` 之间时，
+选择哪个 IMU 历元作为 `t_gnss` 时刻的代表性测量？
 
-**两种 GNSS 数据源模式下的插值需求**：
+**两种 GNSS 数据源模式下的一致策略**：
 
-| 模式 | GNSS 数据来源 | 插值需求 |
+| 模式 | GNSS 数据来源 | 对齐需求 |
 |------|-------------|---------|
-| 内部解算模式 | GnssProcessor 内部解算 | IMU 插值到 GNSS 观测历元 |
-| 外部结果模式 | GnssExternalProvider 读取外部文件 | IMU 插值到外部结果时间戳 |
+| 内部解算模式 | GnssProcessor 内部解算 | IMU 对齐到 GNSS 观测历元 |
+| 外部结果模式 | GnssExternalProvider 读取外部文件 | IMU 对齐到外部结果时间戳 |
 
-两种模式的插值逻辑完全一致，区别仅在于 GNSS 时间戳的来源。
+两种模式的对齐逻辑完全一致，区别仅在于 GNSS 时间戳的来源。
 
-### 5.2 插值策略（参考 KF-GINS 增量切分）
+### 5.2 对齐策略（GNSS 时间最近邻匹配）
 
-> 参考 KF-GINS 的 `GIEngine::newImuProcess()` 和 `imuInterpolate()` 实现。
+> **策略演变**：原计划参考 KF-GINS 的 `imuInterpolate()`（增量切分），但经调查发现：
+> - **KF-GINS** 使用增量式 IMU（`dtheta`/`dvel`），其 `imuInterpolate` 按比例切分增量，不适用于速率式 IMU
+> - **GINav** 也使用增量式 IMU（`imu.dw`/`imu.dv`），初始化时无时间插值
+>
+> 因此本项目采用 **GNSS 时间最近邻匹配** 策略：在包夹 `t_gnss` 的两个 IMU 历元中，选时间戳最接近 `t_gnss` 的那个，直接作为 `t_gnss` 时刻的 IMU 测量值（不插值）。
+> 时间对齐误差（最大半个 IMU 采样周期 ≈ 5ms @100Hz）后续由卡尔曼滤波在线估计。
 
-**KF-GINS 的核心思想**：**增量切分而非弹出**。
+**最近邻匹配核心思想**：
 
-```
-IMU 时间线:  t0 ----------- t2 ---- t3
+```text
+IMU 时间线:  t0 ----------- t2
                   ↑
-GNSS 历元:   t1 (t0 < t1 < t2)
+GNSS 历元:   t_gnss (t0 < t_gnss < t2)
 
-错误做法（会丢失 t2 数据）:
-  弹出 t2 → 插值到 t1 → 机械编排 t0→t1
-  下一次缺少 t2 数据，无法编排 t2→t3
-
-正确做法（KF-GINS 增量切分）:
-  切分 t2 的增量:
-    midimu = t0→t1 增量（前半段）
-    imucur 保留 t1→t2 剩余增量（后半段）
-  机械编排: t0→t1 → GNSS更新 → t1→t2
-  下一次: imupre=imucur(t2剩余), imucur=t3, 正常编排 t2→t3
+策略:
+  dt0 = |t0 - t_gnss|
+  dt2 = |t2 - t_gnss|
+  if dt0 <= dt2:
+      使用 imu_pre (t0) 作为 t_gnss 时刻的 IMU 数据
+  else:
+      使用 imu_cur (t2) 作为 t_gnss 时刻的 IMU 数据
 ```
 
-### 5.3 ImuMeasurement 数据结构
+**与增量切分的对比**：
+
+| 维度 | KF-GINS 增量切分 | 本项目最近邻匹配 |
+|------|------------------|------------------|
+| IMU 数据形式 | 增量 (dtheta/dvel) | 速率 (gyro/accel) |
+| 对齐方式 | 按比例切分增量 | 选时间戳最近的历元 |
+| 时间误差 | 无（精确切分） | 最大半个采样周期（5ms @100Hz） |
+| 误差补偿 | 无需 | KF 在线估计 δt |
+| 修改原始数据 | imu_cur 被原地修改 | 不修改，仅复制数据 |
+
+### 5.3 ImuMeasurement 数据结构（实际实现，src/core/data_types.py）
 
 ```python
 @dataclass
 class ImuMeasurement:
-    """IMU 测量数据
-
-    使用角速度/加速度形式（非增量形式）
-    与 KF-GINS 的 dtheta/dvel 增量形式不同
-    """
-    timestamp: float                    # 秒 (Unix epoch 或 GPST)
-    angular_velocity: np.ndarray        # [3] 角速度 (rad/s), 机体坐标系
-    acceleration: np.ndarray            # [3] 加速度 (m/s^2), 机体坐标系
-    dt: float = 0.0                     # 距上一时刻的时间间隔 (秒)
-
-    # dt 字段说明:
-    #   - 正常情况下 dt = timestamp - prev.timestamp
-    #   - 增量切分后 dt 会被修改（参考 5.4 节）
-    #   - 机械编排时通过 dt 计算增量: dtheta = omega * dt, dvel = f * dt
+    """IMU 单次测量（实际实现，字段命名与 rtklib-py 习惯对齐）"""
+    timestamp: float          # Unix 时间戳（秒，与 rtklib-py gtime_t 一致）
+    week: int                 # GPS 周号（由 timestamp 派生，便利字段）
+    accel: np.ndarray         # [3] m/s² 机体坐标系（加速度/比力）
+    gyro: np.ndarray          # [3] rad/s 机体坐标系（角速度）
 ```
 
-### 5.4 IMU 增量切分（参考 KF-GINS imuInterpolate）
+> **与早期设计的差异**：
+> - 字段名从 `angular_velocity` / `acceleration` 改为 `gyro` / `accel`（更简洁，与项目代码一致）
+> - 时间戳统一为 Unix 秒（不再支持"Unix epoch 或 GPST"二选一）
+> - 新增 `week` 派生字段（便利字段，由 `unix_to_gpst(timestamp)` 得到）
+> - 移除 `dt` 字段（机械编排时由调用方根据相邻 IMU 时间戳计算，不存入数据结构）
+>
+> **IMU CSV 输入格式**（由 `src/stream/formators.py` 解码，支持两种格式，由配置项 `ins.imu_format` 选择，详见 [config.md 2.4](file:///home/mxl/workplace/gipylib/skills/config.md#24-数据路径与采样率)）：
+>
+> **GPST 格式**（`imu_format: "gpst"`，由 `ImuFormator` 解码，对应 `data/cpt_imu.csv`）：
+> ```
+> week,sow,gx,gy,gz,ax,ay,az
+> ```
+> 解码时 `timestamp = gpst_to_unix(week, sow)`，`week` 直接保留输入值。
+>
+> **EuRoC 格式**（`imu_format: "euroc"`，由 `EuRoCImuFormator` 解码，对应 `data/cpt_euroc.csv`）：
+> ```
+> timestamp_ns,wx,wy,wz,ax,ay,az
+> ```
+> 解码时 `timestamp = timestamp_ns / 1e9`（Unix 纳秒 → Unix 秒），`week = unix_to_gpst(timestamp)[0]`（GPS 周号由 Unix 时间戳派生）。原始坐标系默认为 RFU，由 `ImuSensor._convert_to_frd()` 转 FRD。
+>
+> **格式选择**：`ImuSensor._create_formator(imu_format)` 工厂方法根据 `imu_format` 配置值创建对应解码器实例（`"gpst"` → `ImuFormator()`，`"euroc"` → `EuRoCImuFormator()`，其他值抛 `ValueError`）。
+
+### 5.4 最近邻匹配实现（src/core/ins/interpolator.py）
+
+> **已实现**。函数名 `imu_interpolate` 保留以兼容调用方，但实际行为是最近邻匹配而非插值。
 
 ```python
 def imu_interpolate(imu_pre: ImuMeasurement,
                     imu_cur: ImuMeasurement,
-                    timestamp: float) -> ImuMeasurement:
-    """IMU 增量切分（参考 KF-GINS imuInterpolate）
+                    t_gnss: float) -> Optional[ImuMeasurement]:
+    """最近邻匹配：返回时间戳最接近 t_gnss 的 IMU 历元（不插值）。
 
-    关键：imu_cur 被原地修改，保留剩余增量！
-
-    与 KF-GINS 的差异:
-      - KF-GINS 使用增量形式 (dtheta/dvel)，按比例切分增量
-      - 本项目使用角速度/加速度形式，切分时只修改 dt
-      - 机械编排时通过 dt 计算增量: dtheta = omega * dt
+    速率式 IMU 最近邻策略：
+    - 在包夹区间 [imu_pre, imu_cur] 内，选时间戳最接近 t_gnss 的历元
+    - 时间对齐误差（最大半个 IMU 采样周期）后续由 KF 估计
     """
-    dt_total = imu_cur.timestamp - imu_pre.timestamp
-    lamda = (timestamp - imu_pre.timestamp) / dt_total
+    case = is_to_update(imu_pre.timestamp, imu_cur.timestamp, t_gnss)
+    if case == 0:
+        return None  # 不在区间内
 
-    # 创建中间时刻 IMU（前半段）
-    midimu = ImuMeasurement(
-        timestamp=timestamp,
-        angular_velocity=imu_cur.angular_velocity,  # 角速度不变
-        acceleration=imu_cur.acceleration,          # 加速度不变
-        dt=timestamp - imu_pre.timestamp            # 前半段 dt
+    dt_pre = abs(imu_pre.timestamp - t_gnss)
+    dt_cur = abs(imu_cur.timestamp - t_gnss)
+    nearest = imu_pre if dt_pre <= dt_cur else imu_cur
+
+    # 返回标记为 t_gnss 时刻的 IMU（数据复制自最近邻历元）
+    return ImuMeasurement(
+        timestamp=t_gnss,
+        week=nearest.week,
+        accel=nearest.accel.copy(),
+        gyro=nearest.gyro.copy(),
     )
-
-    # 关键：imu_cur 原地保留剩余增量（只修改 dt）
-    imu_cur.dt = imu_cur.timestamp - timestamp
-
-    return midimu
 ```
 
-### 5.5 四种时间对齐情况
+**关键设计**：
+- **不修改原始 IMU 历元**：`imu_pre` 和 `imu_cur` 保持不变，仅生成新的 `ImuMeasurement`
+- **数据复制**：`accel.copy()` / `gyro.copy()` 避免引用共享
+- **timestamp 标记**：返回的 `ImuMeasurement.timestamp` 设为 `t_gnss`，但数据来自最近邻历元
 
-参考 KF-GINS 的 `isToUpdate()` 函数，判断 GNSS 更新时机：
+### 5.5 时间对齐情况判断（2 种情况，最近邻版）
 
 ```python
 def is_to_update(t0: float, t2: float, t_gnss: float,
                  threshold: float = 1e-3) -> int:
-    """判断 GNSS 更新时机（参考 KF-GINS isToUpdate）
+    """判断 GNSS 时间戳与 IMU 时间区间的关系（最近邻版）。
 
-    返回值:
-        0: GNSS 时间不在 [t0, t2] 之间，只做 INS 传播
-        1: GNSS 时间靠近 t0，先 GNSS 更新再 INS 传播
-        2: GNSS 时间靠近 t2，先 INS 传播再 GNSS 更新
-        3: GNSS 时间在 (t0, t2) 之间但不靠近任一，需增量切分
+    Args:
+        t0: imu_pre.timestamp
+        t2: imu_cur.timestamp
+        t_gnss: GNSS 时间戳
+        threshold: 保留参数（最近邻策略不使用，兼容接口）
+
+    Returns:
+        0: t_gnss 不在 [t0, t2] 之间
+        1: 最近邻为 imu_pre（t_gnss 靠近 t0）
+        2: 最近邻为 imu_cur（t_gnss 靠近 t2）
     """
-    if abs(t0 - t_gnss) < threshold:
-        return 1  # 靠近 t0
-    elif abs(t2 - t_gnss) <= threshold:
-        return 2  # 靠近 t2
-    elif t0 < t_gnss < t2:
-        return 3  # 在中间
-    else:
-        return 0  # 不在区间内
+    if t0 <= t_gnss <= t2:
+        dt0 = abs(t0 - t_gnss)
+        dt2 = abs(t2 - t_gnss)
+        return 1 if dt0 <= dt2 else 2
+    return 0
 ```
 
-### 5.6 四种情况处理流程图
+> **与 KF-GINS 4 种情况的差异**：KF-GINS 的 `isToUpdate()` 有 4 种情况（含"在中间需增量切分"的情况 3），最近邻策略简化为 2 种（在区间内选最近邻 / 不在区间内），因为不需要区分"靠近端点"和"在中间"。
 
-```
-GNSS(t1) 到达，IMU 缓冲区有 t0, t2
+### 5.6 包夹条件与处理流程
+
+```text
+GNSS(t_gnss) 到达，IMU 缓冲区有 imu_list
 ─────────────────────────────────────────────────────────────
 
-情况1 (res=1): |t1 - t0| < 阈值 (GNSS 靠近 t0)
-  ┌─────────────────────────────────────┐
-  │ 1. GNSS 更新 (使用 t0 时刻状态)     │
-  │ 2. 状态反馈                          │
-  │ 3. INS 传播: t0 → t2 (完整增量)     │
-  └─────────────────────────────────────┘
+步骤 1: find_bracket_imus(imu_list, t_gnss) 寻找包夹区间
+  ┌─────────────────────────────────────────────────────────┐
+  │ 遍历 imu_list 相邻历元对 (imu_list[i], imu_list[i+1])   │
+  │ 找到 imu_list[i].timestamp ≤ t_gnss ≤ imu_list[i+1].timestamp │
+  │ 返回 (imu_pre, imu_cur, case)                            │
+  │ 若找不到 → 返回 None（不满足包夹条件）                   │
+  └─────────────────────────────────────────────────────────┘
 
-情况2 (res=2): |t1 - t2| < 阈值 (GNSS 靠近 t2)
-  ┌─────────────────────────────────────┐
-  │ 1. INS 传播: t0 → t2 (完整增量)     │
-  │ 2. GNSS 更新 (使用 t2 时刻状态)     │
-  │ 3. 状态反馈                          │
-  └─────────────────────────────────────┘
+步骤 2: imu_interpolate(imu_pre, imu_cur, t_gnss) 最近邻匹配
+  ┌─────────────────────────────────────────────────────────┐
+  │ dt_pre = |imu_pre.timestamp - t_gnss|                   │
+  │ dt_cur = |imu_cur.timestamp - t_gnss|                   │
+  │ nearest = imu_pre if dt_pre <= dt_cur else imu_cur      │
+  │ 返回 ImuMeasurement(timestamp=t_gnss, data=nearest 数据) │
+  └─────────────────────────────────────────────────────────┘
 
-情况3 (res=3): t0 < t1 < t2 且不靠近任一 (GNSS 在中间)
-  ┌─────────────────────────────────────┐
-  │ 1. 增量切分:                         │
-  │    midimu = t0→t1 增量               │
-  │    imucur 保留 t1→t2 剩余增量        │
-  │                                      │
-  │ 2. INS 传播: t0 → t1 (前半段)        │
-  │ 3. GNSS 更新 (t1 时刻状态)           │
-  │ 4. 状态反馈                          │
-  │ 5. INS 传播: t1 → t2 (后半段)        │
-  │    (imucur 已切分，dt 变小)          │
-  └─────────────────────────────────────┘
-
-情况0 (res=0): GNSS 时间不在 [t0, t2] 之间
-  ┌─────────────────────────────────────┐
-  │ 只做 INS 传播: t0 → t2 (完整增量)   │
-  └─────────────────────────────────────┘
-
-下一次 IMU 数据 t3 到达:
-  ┌─────────────────────────────────────┐
-  │ imupre = imucur (t2, 剩余增量)      │
-  │ imucur = 新数据 t3                   │
-  │ 正常处理 t2 → t3                     │
-  └─────────────────────────────────────┘
+不满足包夹条件 (case=0):
+  ┌─────────────────────────────────────────────────────────┐
+  │ 延迟初始化，继续等待更多 IMU 数据                        │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-### 5.7 与 KF-GINS 的对比
+### 5.7 与参考项目的对比
 
-| 维度 | KF-GINS | 本项目 |
-|------|---------|--------|
-| **IMU 数据形式** | 增量 (dtheta/dvel) | 角速度/加速度 |
-| **切分方式** | 按比例切分增量 | 只修改 dt |
-| **坐标系** | n 系 | E 系 |
-| **架构** | 单线程顺序处理 | 多线程流式 |
-| **GNSS 暂存** | gnssdata_ 成员变量 | pending_gnss 成员变量 |
-| **时间对齐阈值** | TIME_ALIGN_ERR | time_align_threshold |
-| **4 种情况处理** | isToUpdate() | is_to_update() |
+| 维度 | KF-GINS | GINav | 本项目 |
+|------|---------|-------|--------|
+| **IMU 数据形式** | 增量 (dtheta/dvel) | 增量 (dw/dv) | 速率 (gyro/accel) |
+| **对齐方式** | 增量切分 | 无初始化插值 | 最近邻匹配 |
+| **时间误差** | 无 | N/A | 最大半个采样周期（5ms） |
+| **误差补偿** | 无需 | N/A | KF 在线估计 δt |
+| **坐标系** | n 系 | n 系 | E 系 |
+| **接口参考** | `imuInterpolate` / `isToUpdate` | `ins_init.m` | `imu_interpolate` / `is_to_update` |
 
 ### 5.8 详细实现位置
 
-时间同步与 IMU 插值的完整实现位于估计器中，详见 [estimator.md 第 9 节](file:///e:/program_project/python/GInsStream/skills/estimator.md#9-时间同步与-imu-插值)。
+- **初始化阶段**：`src/core/ins/interpolator.py`（已实现），详见 [初始化.md 第 4 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#4-imu-时间对齐到-gnss-时间戳最近邻匹配)
+- **机械编排阶段**（预留）：估计器内的时间同步逻辑，详见 [estimator.md 第 9 节](file:///home/mxl/workplace/gipylib/skills/estimator.md#9-时间同步与-imu-插值)
 
-### 5.9 插值注意事项
+### 5.9 时间对齐注意事项
 
-- 插值应在原始 IMU 测量域进行（比力、角速度），而非在导航结果域
-- 本项目采用增量切分方式，角速度/加速度本身不变，只修改 dt
-- 增量切分后采样间隔会变化，严格上不满足 INSMech 的等间隔假设，但影响较小（参考 KF-GINS 注释）
-- 插值边界处理：当 GNSS 历元超出 IMU 缓冲区范围时，使用最近邻外推
-- 参考 GREAT-MSF ginterp：还支持样条插值（SplineInterpolator），可后续扩展
+- **不进行精细化插值**：最近邻匹配直接取最近邻历元的原始测量值，不对 gyro/accel 做比例计算
+- **不修改原始 IMU 历元**：`imu_pre` 和 `imu_cur` 保持不变，仅生成新的 `ImuMeasurement`（timestamp 标记为 `t_gnss`，数据复制自最近邻）
+- **时间对齐误差容忍**：100Hz IMU 下最大 5ms 误差，由 KF 在线估计补偿（δt 作为状态参数）
+- **包夹条件强制**：GNSS 时间戳前后必须各有一个 IMU 历元，不满足时延迟处理
+- **边界处理**：当 GNSS 历元超出 IMU 缓冲区范围时，不满足包夹条件，延迟处理
 
 ---
 
@@ -617,7 +653,7 @@ GNSS(t1) 到达，IMU 缓冲区有 t0, t2
 
 ### 6.1 机械编排方程
 
-参考 gnss_ins_lc_nhc navmech.cc，INS 机械编排在 **E 系（ECEF）** 下进行：
+INS 机械编排在 **E 系（ECEF）** 下进行：
 
 ```
 1. 姿态更新:  C_b^e(k+1) = C_b^e(k) * ΔC_b(k→k+1)
@@ -634,7 +670,7 @@ GNSS(t1) 到达，IMU 缓冲区有 t0, t2
 ### 6.2 姿态更新
 
 ```
-公式（E 系下，参考 gnss_ins_lc_nhc navmech.cc）:
+公式（E 系下）:
   C_b^e(k+1) = C_b^e(k) * ΔC_b(k→k+1)
 
 其中:
@@ -664,22 +700,49 @@ GNSS(t1) 到达，IMU 缓冲区有 t0, t2
 ### 6.3 速度更新
 
 ```
-公式（E 系下，参考 gnss_ins_lc_nhc navmech.cc）:
-  v^e(k+1) = v^e(k) + (f^e - 2*ω_ie^e × v^e + g^e) * dt
+公式（E 系下，参考 ignav rotscull_corr）:
+  v^e(k+1) = v^e(k) + delta_v_cor + delta_v
 
 其中:
+  delta_v_cor = (g^e - 2*ω_ie^e × v^e) * dt         重力 + Coriolis
+  delta_v = C_ee_v @ C_b^e @ (dvel_comp + v_rot + v_scul)  比力积分
+
+旋转补偿 (精确 Rodrigues, 参考 ignav rotscull_corr):
+  dak = dtheta_comp (已补偿角增量)
+  dvk = dvel_comp   (已补偿速度增量)
+  dak_norm = |dak|
+  if dak_norm < 1e-12:
+    v_rot = 0
+  else:
+    a1 = (1 - cos(dak_norm)) / dak_norm²
+    a2 = (1 - sin(dak_norm)/dak_norm) / dak_norm²
+    v_rot = a1·cross(dak, dvk) + a2·cross(dak, cross(dak, dvk))
+
+划桨补偿 (sculling):
+  v_scul = (cross(prev_dtheta, dvel_comp) + cross(prev_dvel, dtheta_comp)) / 12
+
+其中:
+  dtheta_comp = gyro*dt - gyro_bias*dt  已补偿角增量
+  dvel_comp = accel*dt - accel_bias*dt  已补偿速度增量
+  prev_dtheta/prev_dvel: 上一历元的已补偿增量 (参考 ignav omgbp/fbp)
+  C_ee_v = I - skew(ω_ie * 0.5 * dt)  地球自转半步补偿
   f^e = C_b^e * f^b                              比力在 E 系投影
   ω_ie^e = [0, 0, ω_e]^T                          地球自转角速度（E 系常数）
   g^e = EarthParam.gravity_ecef(r^e)               E 系下正常重力向量
-  -2*ω_ie^e × v^e                                  Coriolis 加速度
 
 计算步骤:
-  1. f^e = C_b^e * f_b_corrected
-  2. ω_ie^e = [0, 0, ω_e]^T    (常数，ω_e = 7.2921151467e-5 rad/s)
-  3. g^e = EarthParam.gravity_ecef(state.position)    E 系重力
-  4. coriolis = -2 * skew(ω_ie^e) @ v^e
-  5. dv = (f^e + coriolis + g^e) * dt
-  6. v^e(k+1) = v^e(k) + dv
+  1. dtheta_comp, dvel_comp = IMU补偿(速率×dt - bias×dt)
+  2. v_rot = 精确Rodrigues旋转补偿(dtheta_comp, dvel_comp)
+  3. v_scul = 划桨补偿(prev_dtheta, prev_dvel, dtheta_comp, dvel_comp)
+  4. g^e = EarthParam.gravity_ecef(state.position)    E 系重力
+  5. delta_v_cor = (g^e - 2*cross(ω_ie^e, v^e)) * dt
+  6. C_ee_v = I - skew(ω_ie^e * 0.5 * dt)
+  7. delta_v = C_ee_v @ C_b^e @ (dvel_comp + v_rot + v_scul)
+  8. v^e(k+1) = v^e(k) + delta_v_cor + delta_v
+
+_prev 存储 (参考 ignav omgbp/fbp):
+  - _prev_dtheta = dtheta_comp.copy()  (存已补偿值, 非原始值)
+  - _prev_dvel = dvel_comp.copy()      (存已补偿值, 非原始值)
 
 E 系 vs n 系速度更新差异:
   - E 系无导航系旋转角速度 ω_en^n 项（不存在）
@@ -690,7 +753,7 @@ E 系 vs n 系速度更新差异:
 ### 6.4 位置更新
 
 ```
-公式（E 系下，参考 gnss_ins_lc_nhc navmech.cc）:
+公式（E 系下）:
   r^e(k+1) = r^e(k) + v^e(k+1) * dt
 
 其中:
@@ -742,8 +805,8 @@ InsCore.update(imu_data):
 ### 7.1 可配置维度误差模型
 
 ```
-状态向量（可配置维度，参考 gnss_ins_lc_nhc，E 系下）:
-  δx = [δr^e, δv^e, δφ^e, δb_g, δb_a, δθ_imu, δl_imu, δl_gnss]^T
+状态向量（可配置维度，E 系下）:
+  δx = [δr^e, δv^e, δψ^e, δb_g, δb_a, δθ_imu, δl_imu, δl_gnss]^T
         0-2   3-5   6-8   9-11  12-14 15-16   17-19   20-22
 
 基础 15 维始终估计（E 系主滤波）。
@@ -761,8 +824,8 @@ GNSS杆臂(3维)可选（主滤波，E系下估计，默认关闭）。
 
 ```
 F = [F_rr  F_rv  0     0     0     0     0     0    ]   位置误差方程（E 系）
-    [F_vr  F_vv  F_vφ  F_vb  F_va  0     0     0    ]   速度误差方程（E 系）
-    [0     0     F_φφ  F_pb  0     0     0     0    ]   姿态误差方程（E 系）
+    [F_vr  F_vv  F_vψ  F_vb  F_va  0     0     0    ]   速度误差方程（E 系, ψ-error）
+    [0     0     F_ψψ  F_ψb  0     0     0     0    ]   姿态误差方程（E 系, ψ-error）
     [0     0     0     F_bb  0     0     0     0    ]   陀螺零偏方程
     [0     0     0     0     F_aa  0     0     0    ]   加计零偏方程
     [0     0     0     0     0     0     0     0    ]   安装角方程（常数）
@@ -789,32 +852,32 @@ F_rv: 位置对速度的偏导（E 系下）
 
 ```
 F_vr: 速度对位置的偏导（E 系下，重力梯度项）
-  F_vr = ∂g^e/∂r^e    （E 系重力对位置的偏导，通常可忽略或简化）
-  参考 gnss_ins_lc_nhc navmech.cc
+  F_vr = -2/(re·|pos|) · ge ⊗ pos   (参考 ignav getF)
+  re = georadi(lat) 地心半径, ge = gravity_ecef(pos) 重力向量
 
 F_vv: 速度对速度的偏导（E 系 Coriolis 效应）
   F_vv = -[2*ω_ie^e ×]   （E 系下地球自转为常数 [0,0,ω_e]）
 
-F_vφ: 速度对姿态的偏导（E 系下）
-  F_vφ = [f^e ×]   或 C_b^e * [f^b ×] * C_e^b
+F_vψ: 速度对姿态的偏导（E 系下, ψ-error 负号）
+  F_vψ = -[f^e ×]   (ψ-error: 负号, 对齐 ignav; φ-error 为 +[f^e×])
   E 系下比力反对称矩阵
 
 F_vb: 速度对陀螺零偏的偏导（间接耦合）
   F_vb = 0   （E 系下速度对陀螺零偏无直接耦合，通过姿态间接影响）
 
 F_va: 速度对加计零偏的偏导
-  F_va = -C_b^e
+  F_va = +C_b^e   (加计零偏 → 速度误差)
 ```
 
 #### 姿态误差方程 (6:9, :)
 
 ```
-F_φφ: 姿态对姿态的偏导（E 系下）
-  F_φφ = -[ω_ie^e ×]
+F_ψψ: 姿态对姿态的偏导（E 系下）
+  F_ψψ = -[ω_ie^e ×]
   E 系下无 ω_en^n 项（n 系下此项为 -[ω_in^n ×]）
 
-F_pb: 姿态对陀螺零偏的偏导
-  F_pb = -C_b^e
+F_ψb: 姿态对陀螺零偏的偏导（ψ-error 正号）
+  F_ψbg = +C_b^e   (ψ-error: 正号, 对齐 ignav; φ-error 为 -C_b^e)
 ```
 
 #### 传感器零偏方程
@@ -831,7 +894,7 @@ F_aa: 加计零偏（一阶马尔可夫）
 
 ```
 安装角 (15:17): 假设为常数，F[15:17, :] = 0
-  参考 gnss_ins_lc_nhc: 安装角只有2维(pitch, yaw)，roll假设为0
+  安装角只有2维(pitch, yaw)，roll假设为0
 
 IMU杆臂 (17:20): 假设为常数，F[17:20, :] = 0
 
@@ -882,6 +945,10 @@ Q 仅有以下非零子块:
 ---
 
 ## 8. INS 初始化
+
+> **注意**：本节描述 INS 初始化在机械编排层的设计概念（`InsCore.coarse_align_*`，🚧 预留）。
+> **当前已实现的初始化模块**为独立的 `src/core/ins/initializer.py::InsInitializer`，支持三种模式（静态 / 速度矢量 / 位置差分），采用三阈值检验（`static_speed_threshold` / `dynamic_speed_threshold` / `angular_velocity_threshold_deg`）。
+> 完整实现规范详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)。
 
 ### 8.1 初始化流程
 
@@ -1014,7 +1081,7 @@ ENU 坐标系: [东, 北, 天]
 ### 9.4 正常重力
 
 ```
-E 系下（本项目主计算系，参考 gnss_ins_lc_nhc navmech.cc）:
+E 系下（本项目主计算系）:
   g^e = EarthParam.gravity_ecef(r^e)
 
   E 系重力向量包含引力+离心力:
@@ -1024,7 +1091,7 @@ E 系下（本项目主计算系，参考 gnss_ins_lc_nhc navmech.cc）:
   4. 转换到 E 系: g^e = C_n^e @ g^n + 离心力项
      其中 C_n^e = [C_e^n]^T，由 lat, lon 计算
 
-  简化计算（参考 gnss_ins_lc_nhc）:
+  简化计算:
   g^e = -g0 * [cos(lat)*cos(lon), cos(lat)*sin(lon), sin(lat)]^T + 离心力
 
 n 系下（仅输出用）:
@@ -1107,17 +1174,7 @@ E 系 ↔ n 系转换:
 | `t_gbase` | `AttitudeUtil` | 姿态转换工具（静态方法） |
 | `t_gbase` | `EarthParam` | 地球参数（静态方法） |
 
-### 11.2 gnss_ins_lc_nhc → 本项目
-
-| gnss_ins_lc_nhc | 本项目 | 对应关系 |
-|-----------------|--------|---------|
-| `navmech.cc` 姿态更新 | `InsCore.attitude_update()` | E 系下四元数/DCM 姿态递推 |
-| `navmech.cc` 速度更新 | `InsCore.velocity_update()` | E 系下比力+Coriolis+重力 |
-| `navmech.cc` 位置更新 | `InsCore.position_update()` | ECEF 位置递推 |
-| `navmech.cc` F矩阵构造 | `InsKf.set_Ft()` / `LcEstimator.set_Ft()` | E 系下可配置维度状态转移矩阵 |
-| `navinitalized.cc` | `InsCore.coarse_align_*()` | E 系下粗对准+精对准 |
-
-### 11.3 GINav → 本项目
+### 11.2 GINav → 本项目
 
 | GINav | 本项目 | 对应关系 |
 |-------|--------|---------|
@@ -1125,7 +1182,7 @@ E 系 ↔ n 系转换:
 | `ins_init.m` | `InsCore` + 协方差设置 | INS 初始化 |
 | `ins_align.m` | `InsCore.coarse_align_*()` | INS 对准 |
 | `earth_update.m` | `EarthParam` | 地球参数更新 |
-| `update_trans_mat.m` | `InsKf.set_Ft()` / `LcEstimator.set_Ft()` | 状态转移矩阵更新 |
+| `update_trans_mat.m` | `LcEstimator` (`TransferMatrix.build_F`) | 状态转移矩阵更新 |
 | `Cnb2att.m` / `att2Cnb.m` | `AttitudeUtil` | 姿态转换 |
 
 ---
@@ -1186,130 +1243,236 @@ class ImuMechStrategy(OdometryStrategy):
 
 ### 12.3 纯队列流水线 — IMU 传感器（无 Subject 角色）
 
-IMU 传感器继承 `BaseSensor`（**仅作为数据读取抽象，无 Subject 角色、无 `_observers`、无 `attach()`、无 `notify()`**），实现 `get_data()` 接口，数据通过 `output_queue.put()` 推入 imu_queue：
+IMU 传感器继承 `StreamerBase`（`BaseSensor` + `Thread`，**无 Subject 角色、无 `_observers`、无 `attach()`、无 `notify()`**），实现 `get_data()` 接口，数据通过 `output_queue.put()` 推入 imu_queue：
 
 ```python
+# ✅ 实际实现（src/stream/base.py）
 class BaseSensor(ABC):
     """传感器抽象基类（数据读取抽象，定义于 StreamDesign.md）
 
     ※ 不作为 Subject，无观察者列表，无 attach/notify 方法。
-       仅定义数据读取接口和共享线程框架。
+       仅定义数据读取接口。
     """
 
-    def __init__(self, name: str = "", output_queue: 'Queue' = None):
-        self._name = name               # 传感器标识
-        self._output_queue = output_queue  # 输出队列（imu_queue / sensor_queue）
-
-    @property
-    def name(self) -> str:
-        return self._name
+    def __init__(self, name: str):
+        self.name = name
 
     @abstractmethod
-    def get_data(self) -> 'SensorData':
-        """强制实现的传感器数据读取接口"""
-        ...
-
-    def run(self) -> None:
-        """传感器线程主循环（纯 threading，由 StreamerBase 驱动）
-
-        循环: get_data() → output_queue.put(data) → 直到 stop
-        """
+    def get_data(self):
+        """获取一条数据（非阻塞，无数据返回 None）。"""
         ...
 
 
-class ImuSensor(BaseSensor):
-    """IMU 传感器（数据源，非 Subject）
+class StreamerBase(BaseSensor, Thread):
+    """流式读取器基类 — 逐行读取文本文件，O(1) 内存。
 
-    读取 IMU 原始数据（角速度/加速度 或 角增量/速度增量），
-    由 SensorFactory 动态创建，实现 get_data() 接口。
-    数据通过 output_queue.put() 推入 imu_queue，**无 notify() 调用**。
+    继承 BaseSensor 与 Thread，内部封装：逐行读取 → Formator 解码 → 推入队列。
+    文件读完后向队列推入 None 作为 EOF sentinel。
     """
 
-    def get_data(self) -> 'SensorData':
-        """读取一条 IMU 测量数据（不通知任何观察者）"""
-        imu_meas = self._reader.read_measurement()
-        data = SensorData(tag="imu", imu=imu_meas)
-        # 不调用 notify()，由上层 run() 负责 output_queue.put(data)
-        return data
+    def __init__(self, file_path: str, formator, output_queue: Queue,
+                 control: ThreadControl, tag: str):
+        Thread.__init__(self, name=tag, daemon=True)
+        BaseSensor.__init__(self, name=tag)
+        self.file_path = file_path
+        self.formator = formator
+        self.output_queue = output_queue
+        self.control = control
+        self.tag = tag
+
+    def run(self):
+        """线程入口：逐行读取 → 解码 → 入队 → EOF sentinel。"""
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not self.control.is_running():
+                        break
+                    data = self.formator.decode(line)
+                    if data is not None:
+                        self.output_queue.put(data)
+        finally:
+            self.output_queue.put(None)  # EOF sentinel
+
+    def get_data(self):
+        """非阻塞返回队列头部数据。"""
+        try:
+            return self.output_queue.get_nowait()
+        except Empty:
+            return None
+
+
+# ✅ 实际实现（src/stream/imu_sensor.py）
+class ImuSensor(StreamerBase):
+    """IMU 文本读取，支持 GPST 和 EuRoC 两种格式。
+
+    支持 IMU 坐标系转换：若 imu_coordinate_system != "FRD"，
+    在读取时将原始坐标系转换到 FRD（项目标准 b 系）。
+
+    由 SensorFactory 动态创建，run() 线程逐行读取 → formator.decode →
+    _convert_to_frd → output_queue.put()。
+
+    Args:
+        file_path: IMU 数据文件路径
+        output_queue: 输出队列
+        control: 线程控制
+        imu_coordinate_system: IMU 原始坐标系（FRD / RFU），默认 "FRD"
+        imu_format: 数据格式（gpst / euroc），默认 "gpst"
+    """
+
+    def __init__(self, file_path: str, output_queue: Queue,
+                 control: ThreadControl,
+                 imu_coordinate_system: str = "FRD",
+                 imu_format: str = "gpst"):
+        formator = self._create_formator(imu_format)
+        super().__init__(
+            file_path=file_path,
+            formator=formator,
+            output_queue=output_queue,
+            control=control,
+            tag="imu",
+        )
+        self.coordinate_system = imu_coordinate_system.upper()
+
+    @staticmethod
+    def _create_formator(imu_format: str):
+        """根据格式名称创建对应的解码器（工厂方法）。"""
+        fmt = imu_format.lower()
+        if fmt == "gpst":
+            return ImuFormator()
+        elif fmt == "euroc":
+            return EuRoCImuFormator()
+        else:
+            raise ValueError(
+                f"Unsupported imu_format: {imu_format} (expected 'gpst' or 'euroc')"
+            )
+
+    def run(self):
+        """线程入口：逐行读取 → 解码 → 坐标系转换 → 入队 → EOF sentinel。"""
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not self.control.is_running():
+                        break
+                    data = self.formator.decode(line)
+                    if data is not None:
+                        if data.imu is not None:
+                            data.imu = self._convert_to_frd(data.imu)
+                        self.output_queue.put(data)
+        finally:
+            self.output_queue.put(None)
 ```
 
 ### 12.4 纯 threading 处理高频 IMU 数据
 
-IMU 采样率高（100~200Hz），采用**纯 threading** 阻塞式读取，**不使用 asyncio、不使用共享内存**（参考 StreamDesign.md）：
+IMU 采样率高（100~200Hz），采用**纯 threading** 阻塞式读取，**不使用 asyncio、不使用共享内存**（参考 StreamDesign.md）。
+
+> **实际实现**：`ImuSensor` 继承 `StreamerBase(BaseSensor, Thread)`，线程入口为 `StreamerBase.run()`，无需额外的 `ImuSensorThread` 包装类。
 
 ```python
-import threading
-from queue import Queue, Empty
+# ✅ 实际实现：线程由 StreamerBase.run() 驱动（src/stream/base.py）
+# ImuSensor 继承 StreamerBase，自动获得 Thread 能力
+# 启动方式：imu_sensor = ImuSensor(path, imu_queue, control); imu_sensor.start()
 
-class ImuSensorThread:
-    """IMU 传感器线程包装（纯 threading）
+# StreamerBase.run() 已在 12.3 节给出，核心逻辑：
+#   1. open(file_path) 逐行读取
+#   2. formator.decode(line) → SensorData
+#   3. output_queue.put(data)  推入 imu_queue
+#   4. 文件读完 → output_queue.put(None)  EOF sentinel
+#   5. control.is_running() 检查线程退出标志
 
-    在独立线程中循环调用 ImuSensor.get_data()，
-    将数据通过 imu_queue.put() 推入流水线。
-
-    ※ 不使用 asyncio，不使用 multiprocessing.shared_memory。
-       高频 IMU 的并发处理依赖 Python threading + Queue 实现。
-    """
-
-    def __init__(self, sensor: 'ImuSensor', imu_queue: 'Queue',
-                 stop_event: threading.Event):
-        self._sensor = sensor
-        self._queue = imu_queue
-        self._stop = stop_event
-        self._thread: threading.Thread = None
-
-    def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def _run(self) -> None:
-        """线程主循环：get_data() → imu_queue.put()"""
-        while not self._stop.is_set():
-            try:
-                data = self._sensor.get_data()
-                if data is not None:
-                    self._queue.put(data)  # 推入 imu_queue
-            except Exception:
-                # 异常时记录日志并继续（不中断线程）
-                continue
+# ※ 不使用 asyncio，不使用 multiprocessing.shared_memory。
+#    高频 IMU 的并发处理依赖 Python threading + Queue 实现。
+#    Thread.__init__ 在 BaseSensor.__init__ 之前调用（因 Thread.name 为 property）。
 ```
 
 ### 12.5 工厂模式创建 IMU 传感器
 
-`SensorFactory` 根据配置动态创建 IMU 传感器实例（**无 async_io 参数，无 AsyncImuSensor 分支**，参考 StreamDesign.md）：
+`SensorFactory` 根据配置动态创建传感器实例列表（**无 async_io 参数，无 AsyncImuSensor 分支**，参考 `src/stream/factory.py`）：
 
 ```python
+# ✅ 实际实现（src/stream/factory.py）
 class SensorFactory:
-    """传感器工厂（参考 StreamDesign.md）"""
+    """传感器工厂：根据 gnss_source + ins.enabled 装配传感器列表"""
 
     @staticmethod
-    def create(sensor_type: str, config: dict,
-               output_queue: 'Queue' = None) -> BaseSensor:
-        if sensor_type == "imu":
-            # 仅创建 ImuSensor，统一由 ImuSensorThread 线程驱动
-            return ImuSensor(config, output_queue=output_queue)
-        elif sensor_type == "gnss":
-            return GnssRoverSensor(config, output_queue=output_queue)
-        # ...
+    def create_sensors(config, imu_queue, gnss_queue, control):
+        """创建传感器列表，主程序持有 list[BaseSensor] 并逐个 start()。
+
+        装配逻辑:
+        - gnss_source == "external":
+            → ImuSensor(imu_path, imu_queue, control)
+            → GnssSolSensor(gnss_path, gnss_queue, control)
+        - gnss_source == "internal" and ins.enabled == "off":
+            → InternalGnssSensor(config, gnss_queue, control)  # 内部解算，无独立 IMU 流
+        - gnss_source == "internal" and ins.enabled == "lc":
+            → ImuSensor(imu_path, imu_queue, control)
+            → InternalGnssSensor(config, gnss_queue, control)  # 实时解算 + IMU 对齐输出
+        """
+        sensors = []
+        gnss_source = config["gnss"]["gnss_source"]
+        ins_enabled = config["ins"]["enabled"]
+
+        if gnss_source == "external":
+            sensors.append(ImuSensor(imu_path, imu_queue, control))
+            sensors.append(GnssSolSensor(gnss_path, gnss_queue, control))
+        elif gnss_source == "internal" and ins_enabled == "off":
+            from src.stream.internal_gnss_sensor import InternalGnssSensor
+            sensors.append(InternalGnssSensor(config, gnss_queue, control))
+        elif gnss_source == "internal" and ins_enabled == "lc":
+            imu_path = config["ins"]["imu_data_path"]
+            sensors.append(ImuSensor(imu_path, imu_queue, control))
+            from src.stream.internal_gnss_sensor import InternalGnssSensor
+            sensors.append(InternalGnssSensor(config, gnss_queue, control))
+        return sensors
 ```
 
 ### 12.6 数据流与队列流水线时序
 
 ```
 IMU 数据到达（纯队列流水线，无观察者回调）:
-  ImuSensorThread._run()
-    → ImuSensor.get_data()               (读取 IMU 测量：角速度/加速度)
-    → imu_queue.put(SensorData(tag="imu"))  (推入 imu_queue)
+
+【当前实现：外部对齐模式 external + ins.enabled=on（路径 A）】
+  ImuSensor.run()                        (StreamerBase 继承的线程入口)
+    → open(file_path) 逐行读取
+    → ImuFormator.decode(line)            (解码：week,sow,gx,gy,gz,ax,ay,az → ImuMeasurement)
+                                          (时间戳：gpst_to_unix(week, sow) → Unix 时间戳)
+    → imu_queue.put(SensorData(tag="imu")) (推入 imu_queue)
         ↓
-  Scheduler（仅转发，不做时间对齐）
+  Logger                                 (消费 imu_queue + gnss_queue，对齐输出)
+    → _drain_imu_queue() → Aligner.push_imu()
+    → gnss_queue.get() → Aligner.harvest() → AlignedWriter.write(AlignedBlock)
+
+【当前实现：内部纯 GNSS 模式 internal + ins.enabled=off（路径 B，无 IMU 流）】
+  InternalGnssSensor._run_impl()         (内部 GNSS 解算线程)
+    → 加载 RINEX + 逐历元 pntpos/relpos
+    → gnss_queue.put(SensorData(tag="gnss_solution"))
+        ↓
+  SolutionLogger / SolutionWriter        (消费 gnss_queue，输出 .pos 文件)
+
+【当前实现：内部对齐模式 internal + ins.enabled=lc（路径 C）】
+  ImuSensor.run()                        (与路径 A 相同的 IMU 流式读取)
+    → imu_queue.put(SensorData(tag="imu"))
+        ↓
+  InternalGnssSensor._run_impl()         (实时 RTK/SPP 解算)
+    → gnss_queue.put(SensorData(tag="gnss_solution"))
+        ↓
+  Logger                                 (与路径 A 完全相同的对齐管线)
+    → _drain_imu_queue() → Aligner.push_imu()
+    → gnss_queue.get() → Aligner.harvest() → AlignedWriter.write(AlignedBlock)
+
+【🚧 预留：INS 启用后的完整流水线（路径 D，未来实现）】
+  ImuSensor.run()
+    → imu_queue.put(SensorData(tag="imu"))
+        ↓
+  Scheduler（仅转发，不做时间对齐）        🚧 预留
     → estimate_queue.put(SensorData)
         ↓
   LcIntegration.process_epoch()          (从 estimate_queue.get())
     → _time_align()                       (时间对齐：增量切分，在 Estimator 内部)
     → ImuMechStrategy.execute()           (前端策略：机械编排 E 系递推)
-    → InsKf.time_update()                 (双滤波 EKF 预测：P1 + P2 独立)
-    → [GNSS 到达时] meas_update()         (双滤波量测更新：H1 作用于 P1, H2 作用于 P2)
-    → feedback()                          (双滤波独立反馈)
+    → LcEstimator.time_update()           (单滤波 EKF 预测：P = Φ·(P+0.5Q)·Φ^T + 0.5Q)
+    → [GNSS 到达时] meas_update()         (单滤波量测更新：H 作用于 P, Joseph form)
+    → feedback()                          (单滤波统一反馈)
     → solution_queue.put(Solution)        (输出解)
 ```
 
@@ -1331,6 +1494,6 @@ integration._frontend = frontend
 
 | 特性 | 体现 |
 |------|------|
-| **封装** | 机械编排状态（姿态/速度/位置）封装在 `InsCore` 内部，双滤波状态分别封装在 P1/P2 矩阵中，外部仅通过策略接口访问 |
+| **封装** | 机械编排状态（姿态/速度/位置）封装在 `InsCore` 内部，误差状态封装在单一 P 矩阵中（StateIndex 参数块），外部仅通过策略接口访问 |
 | **继承** | `ImuPreprocessor(ABC)` → `RateImuPreprocessor` / `DeltaImuPreprocessor`；`OdometryStrategy(ABC)` → `ImuMechStrategy`；`BaseSensor(ABC)` → `ImuSensor` |
 | **多态** | 框架持有 `OdometryStrategy` 抽象引用（`_frontend`），运行时调用 `ImuMechStrategy` / `SppStrategy` / `RtkStrategy`；传感器层多态通过 `BaseSensor` 抽象引用 |

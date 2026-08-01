@@ -4,6 +4,7 @@ from typing import Optional
 import numpy as np
 
 from src.core.data_types import GnssSolution
+from src.core.time_utils import unix_to_gpst
 
 SOLQ_NONE = 0
 SOLQ_FIX = 1
@@ -22,21 +23,30 @@ def sol_to_gnss_solution(sol) -> Optional[GnssSolution]:
         return None
 
     # rtklib-py 的 gtime_t.time 是 Unix 秒（从 1970-01-01 起算），
-    # 需减去 GPST epoch（1980-01-06 = Unix 315964800s）才能算 GPS 周/周内秒
-    SECONDS_PER_WEEK = 604800
-    GPST_EPOCH_UNIX = 315964800  # 1980-01-06 00:00:00 UTC 的 Unix 时间戳
-    total_sec = sol.t.time + sol.t.sec - GPST_EPOCH_UNIX
-    week = int(total_sec // SECONDS_PER_WEEK)
-    sow = total_sec - week * SECONDS_PER_WEEK
+    # gtime_t.sec 是不足秒的小数部分。timestamp 直接使用 Unix 时间戳。
+    unix_ts = sol.t.time + sol.t.sec
+    week, _ = unix_to_gpst(unix_ts)
 
     position = np.array(sol.rr[0:3], dtype=float)
-    sd = np.sqrt(np.abs(np.diag(sol.qr[0:3, 0:3])))
+    qr3 = np.array(sol.qr[0:3, 0:3], dtype=float)
+    sd = np.sqrt(np.abs(np.diag(qr3)))
+
+    velocity = None
+    vel_sd = None
+    if len(sol.rr) >= 6 and np.any(sol.rr[3:6] != 0):
+        velocity = np.array(sol.rr[3:6], dtype=float)
+        if hasattr(sol, 'qv') and sol.qv is not None:
+            qv3 = np.array(sol.qv[0:3, 0:3], dtype=float)
+            vel_sd = np.sqrt(np.abs(np.diag(qv3)))
 
     return GnssSolution(
-        timestamp=sow,
+        timestamp=unix_ts,
         week=week,
         position=position,
         quality=int(sol.stat),
         num_sv=int(sol.ns),
         sd=sd,
+        cov=qr3,
+        velocity=velocity,
+        vel_sd=vel_sd,
     )

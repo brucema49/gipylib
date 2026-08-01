@@ -8,7 +8,26 @@
 > - **工厂模式 SensorFactory**：根据配置动态创建传感器实例，主程序不 new 具体类
 > - **纯队列流水线**：Streamer → Queue → Scheduler → estimate_queue → Estimator → solution_queue → Logger，**不使用观察者模式**
 > - **纯 threading**：所有数据流通过 `queue.Queue` + 独立线程驱动，**不使用 asyncio**，**不使用 shared_memory**
-> - **时间系统**：全框架统一使用 GPS 秒（GPST，since 1980-01-06）
+>
+> **时间系统约定**：全框架内部统一使用 **Unix 时间戳（float 秒，与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）**。
+> 输入端（`formators.py`）通过 `gpst_to_unix(week, sow)` 把 GPS 周+周内秒转为 Unix 时间戳；
+> 输出端通过 `unix_to_gpst()` 转回 (week, sow) 写文件。
+> 时间转换工具：`src/core/time_utils.py`（`gpst_to_unix` / `unix_to_gpst`，`GPST_EPOCH_UNIX = 315964800`）。
+>
+> **当前实现状态**：
+> - ✅ 已实现：`src/stream/base.py::BaseSensor` + `StreamerBase`（流式读取基类，逐行读取 + EOF sentinel）
+> - ✅ 已实现：`src/stream/factory.py::SensorFactory`（根据 gnss_source + ins.enabled 装配传感器）
+> - ✅ 已实现：`src/stream/formators.py::ImuFormator`（GPST 格式）/ `EuRoCImuFormator`（EuRoC 格式）/ `PosSolFormator`（rtklib POS 解码，时间戳 Unix 化）
+> - ✅ 已实现：`src/stream/imu_sensor.py::ImuSensor`（IMU 传感器线程，含 RFU→FRD 坐标系自动转换 `_convert_to_frd()`）
+> - ✅ 已实现：`src/stream/gnss_sol_sensor.py::GnssSolSensor`（外部 GNSS 结果传感器线程）
+> - ✅ 已实现：`src/stream/internal_gnss_sensor.py::InternalGnssSensor`（内部 GNSS 解算传感器线程，逐历元调用 pntpos/relpos，SPP 模式含多普勒测速）
+> - ✅ 已实现：`src/core/ins/initializer.py::InsInitializer`（INS 初始化，三种模式 + 三阈值检验，详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
+> - ✅ 已实现：单滤波 EKF `LcEstimator` / `LcIntegration`（StateIndex 参数块，最近邻时间对齐，详见 [estimator.md](file:///home/mxl/workplace/gipylib/skills/estimator.md)）
+> - ✅ 已实现：`src/core/ins/constraints.py::Constraints`（NHC/ZUPT/ZARU 约束，独立模块，参考 ignav 分离架构）
+> - ✅ 已实现：`src/core/ins/lc_runner.py::LcRunner`（松组合批处理运行器，路径 C 下由 `Logger` 在流式结束后调用，输出松组合 .pos）
+> - ✅ 已验证：路径 C 三文件输出（RTK.pos + aligned_internal_rtk.csv + RTKLC.pos），松组合结果与纯 GNSS 一致（planar <0.5m, elev <1m）
+> - 🚧 预留：RoverSensor / EphSensor / RefSensor（独立星历/基站流，当前由 `InternalGnssSensor` 内部 RINEX 加载完成）
+> - 🚧 预留：Scheduler / 独立星历基站流（当前三种模式均无 Scheduler，传感器直接推入 queue 由 Logger/SolutionLogger 消费）
 
 ---
 
@@ -111,10 +130,23 @@ ref.txt ──→ RefStreamer ──→ RefFormator ────┘        │
 
 ### 3.1 IMU 数据
 
+> **实际实现**（参考 `src/core/data_types.py`）：
+
 ```python
 @dataclass
 class ImuMeasurement:
-    timestamp: float                    # 秒 (Unix epoch 或 GPST)
+    timestamp: float          # Unix 时间戳（秒，与 rtklib-py gtime_t 一致）
+    week: int                 # GPS 周号（由 timestamp 派生，便利字段）
+    accel: np.ndarray         # [3] m/s² 机体坐标系
+    gyro: np.ndarray          # [3] rad/s 机体坐标系
+```
+
+> **早期设计版本**（含 `dt` 字段，预留 INS 启用后机械编排使用）：
+
+```python
+@dataclass
+class ImuMeasurement_Design:
+    timestamp: float                    # Unix 时间戳（秒）
     acceleration: np.ndarray            # [3] 加速度 (m/s^2), 机体坐标系
     angular_velocity: np.ndarray        # [3] 角速度 (rad/s), 机体坐标系
     dt: float = 0.0                     # 距上一时刻的时间间隔 (秒)
@@ -123,6 +155,22 @@ class ImuMeasurement:
     #   - 增量切分后 dt 会被修改（参考 estimator.md 第9节）
     #   - 机械编排时通过 dt 计算增量: dtheta = omega * dt, dvel = f * dt
 ```
+
+**IMU CSV 输入格式**（由 `src/stream/formators.py` 解码，支持两种格式，由配置项 `ins.imu_format` 选择）：
+
+**GPST 格式**（`imu_format: "gpst"`，由 `ImuFormator` 解码）：
+```
+GPS week, GPS sow, gx, gy, gz, ax, ay, az
+```
+解码时通过 `gpst_to_unix(week, sow)` 转换为 Unix 时间戳。
+
+**EuRoC 格式**（`imu_format: "euroc"`，由 `EuRoCImuFormator` 解码）：
+```
+timestamp_ns, wx, wy, wz, ax, ay, az
+```
+解码时 `timestamp = timestamp_ns / 1e9`（Unix 纳秒 → Unix 秒），GPS 周号由 `unix_to_gpst(timestamp)` 派生。原始坐标系默认为 RFU，由 `ImuSensor._convert_to_frd()` 转 FRD。
+
+**格式选择**：`ImuSensor._create_formator(imu_format)` 工厂方法根据 `imu_format` 配置值创建对应解码器实例。
 
 ### 3.2 GNSS 观测值
 
@@ -307,274 +355,205 @@ class ThreadControl:
 
 ### 5.1 类层次
 
+> **实际实现**（参考 `src/stream/base.py` / `imu_sensor.py` / `gnss_sol_sensor.py` / `internal_gnss_sensor.py`）：
+
 ```
 ═══════════════════════════════════════════════════════════
   传感器抽象层（统一 get_data 接口，无观察者模式）
 ═══════════════════════════════════════════════════════════
-BaseSensor(ABC)                  # 传感器抽象基类，强制 get_data()（无 Subject 角色）
-├── StreamerBase(BaseSensor)     # 文件流读取基类（逐行读取 + Formator 解码，仅 queue.put）
-│   ├── IMUStreamer              #   IMU 文本读取
-│   ├── RoverStreamer            #   流动站 GNSS 观测值读取
-│   ├── EphStreamer              #   广播星历读取（永不暂停）
-│   ├── RefStreamer              #   基准站 GNSS 观测值读取
-│   └── GnssSolStreamer          #   外部 GNSS 定位结果读取（外部模式）
-└── (未来扩展: SerialSensor / NetSensor)
+BaseSensor(ABC)                          # 传感器抽象基类，强制 get_data()（无 Subject 角色）
+└── StreamerBase(BaseSensor, Thread)     # ✅ 文件流读取基类（逐行读取 + Formator 解码，仅 queue.put）
+    ├── ImuSensor(StreamerBase)          # ✅ IMU 文本读取（继承 StreamerBase，绑定 ImuFormator）
+    └── GnssSolSensor(StreamerBase)      # ✅ 外部 GNSS 结果读取（继承 StreamerBase，绑定 PosSolFormator）
 
-SensorFactory                    # 工厂模式：根据配置创建 BaseSensor 实例列表
+InternalGnssSensor(Thread)               # ✅ 内部 GNSS 解算传感器（直接继承 Thread，不继承 BaseSensor）
+                                         #   逐历元调用 SppProcessor/RtkProcessor，推入 gnss_queue
+
+SensorFactory                            # ✅ 工厂模式：根据 gnss_source + ins.enabled 创建传感器列表
 
 ═══════════════════════════════════════════════════════════
   解码层（Formator，自定义格式适配）
 ═══════════════════════════════════════════════════════════
-FormatorBase (抽象基类, 自定义解码接口)
-├── IMUFormator       — IMU 文本解码
-├── RoverFormator     — 流动站 GNSS 观测值文本解码
-├── EphFormator       — 广播星历文本解码
-└── RefFormator       — 基准站 GNSS 观测值文本解码
+FormatorBase (抽象基类, 自定义解码接口)   # ✅
+├── ImuFormator       — ✅ IMU CSV 解码（GPST 格式: week,sow → Unix 时间戳）
+├── EuRoCImuFormator  — ✅ IMU CSV 解码（EuRoC 格式: timestamp_ns → Unix 时间戳, GPS 周号派生）
+└── PosSolFormator    — ✅ rtklib POS 格式解码（ymdhms → GPST → Unix 时间戳）
 ```
 
 **设计要点**：
-- `StreamerBase` 继承 `BaseSensor`，实现 `get_data()` 返回解码后的数据
+- `StreamerBase` 继承 `BaseSensor` 与 `Thread`，实现 `get_data()` 返回解码后的数据
 - **不使用 asyncio**：高频 IMU 仍走 `queue.Queue` + 独立线程，统一并发模型
 - **不使用 shared_memory**：所有数据通过 `queue.put()` 传递，简化内存管理
-- `SensorFactory.create_sensors(config)` 返回 `list[BaseSensor]`，主程序遍历调用
-- **数据通路**：Streamer `run()` 线程 → `output_queue.put()` → Scheduler 拉取 → `estimate_queue.put()` → Estimator
+- `SensorFactory.create_sensors(config, imu_queue, gnss_queue, control)` 返回 `list[BaseSensor]`
+- **数据通路**：Streamer `run()` 线程 → `output_queue.put()` → Logger 拉取（当前无 Scheduler）
+- **InternalGnssSensor 特殊**：不继承 `StreamerBase`，因为内部解算不是"逐行读取文件"，
+  而是"加载 RINEX + 逐历元解算"，所以直接继承 `Thread`
 
-### 5.2 StreamerBase 接口
+### 5.2 StreamerBase 接口（实际实现）
 
-> `StreamerBase` 继承 `BaseSensor`，实现 `get_data()` 接口。它内部封装逐行读取 + Formator 解码 + 队列推送的完整流程，
-> **不作为观察者 Subject**，数据通过 `output_queue.put()` 传递给 Scheduler。
+> `StreamerBase` 继承 `BaseSensor` 与 `Thread`，实现 `get_data()` 接口。
+> 内部封装逐行读取 + Formator 解码 + 队列推送的完整流程，文件读完后推入 `None` 作为 EOF sentinel。
 
 ```python
-class StreamerBase(BaseSensor):
-    """流式读取器基类 — 逐行读取文本文件，O(1) 内存
+# src/stream/base.py
+class BaseSensor(ABC):
+    """传感器抽象基类，强制 get_data() 接口。"""
 
-    继承 BaseSensor，实现 get_data() 统一接口。
-    内部封装：逐行读取 → Formator 解码 → 推入队列（无 notify 观察者）。
+    def __init__(self, name: str):
+        self.name = name
+
+    @abstractmethod
+    def get_data(self):
+        """获取一条数据（非阻塞，无数据返回 None）。"""
+        ...
+
+
+class StreamerBase(BaseSensor, Thread):
+    """流式读取器基类 — 逐行读取文本文件，O(1) 内存。
+
+    继承 BaseSensor 与 Thread，内部封装：逐行读取 → Formator 解码 → 推入队列。
+    文件读完后向队列推入 None 作为 EOF sentinel。
     """
 
-    def __init__(self, file_path: str, formator: FormatorBase,
-                 output_queue: Queue, control: ThreadControl,
-                 tag: str, playback_mode: str = "asap",
-                 speed: float = 100.0, raw_log_queue: Optional[Queue] = None):
-        super().__init__(name=tag)   # BaseSensor 初始化（不含观察者列表）
+    def __init__(self, file_path: str, formator, output_queue: Queue,
+                 control: ThreadControl, tag: str):
+        # 注意：必须先初始化 Thread，因为 Thread.name 是 property
+        Thread.__init__(self, name=tag, daemon=True)
+        BaseSensor.__init__(self, name=tag)
         self.file_path = file_path
         self.formator = formator
         self.output_queue = output_queue
         self.control = control
         self.tag = tag
-        self.playback_mode = playback_mode  # "asap" (尽速读取) 或 "timed" (按数据时间驱动)
-        self.speed = speed                  # 仅 timed 模式有效: 加速倍率, 默认100倍
-        self.raw_log_queue = raw_log_queue  # 可选: 原始数据日志队列
-        self._file = None
-        self._paused = False          # 暂停标志 (调度器控制)
-        self._last_data_time = None   # 上一条数据的时间戳 (timed 模式用)
-        self._last_wall_time = None   # 上一条数据的挂钟时间 (timed 模式用)
-
-    # ── BaseSensor 接口实现 ──
-    def get_data(self) -> Optional[object]:
-        """获取一条解码后的数据（非阻塞，无数据返回 None）
-
-        实现 BaseSensor 强制接口。从 Formator 缓冲区取已解码数据，
-        若缓冲为空则读一行并解码。
-        """
-        ...
-
-    def open(self) -> bool:
-        """打开文件，准备读取"""
-        self._file = open(self.file_path, 'r')
-        return True
-
-    @abstractmethod
-    def read_line(self) -> Optional[str]:
-        """从文件读取一行文本。文件结束时返回 None"""
-        ...
 
     def run(self):
-        """线程主循环: 逐行读取 → 解码 → 推入队列"""
+        """线程入口：逐行读取 → 解码 → 入队 → EOF sentinel。"""
         try:
-            self.open()
-        except Exception as e:
-            logger.error("无法打开文件 %s: %s", self.file_path, e)
-            return
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not self.control.is_running():
+                        break
+                    data = self.formator.decode(line)
+                    if data is not None:
+                        self.output_queue.put(data)
+        finally:
+            self.output_queue.put(None)  # EOF sentinel
 
-        while self.control.is_running():
-            if self._paused:
-                time.sleep(0.001)
-                continue
-
-            try:
-                line = self.read_line()
-            except Exception as e:
-                logger.error("读取文件 %s 出错: %s", self.file_path, e)
-                break
-
-            if line is None:
-                # 文件读完 → 刷新 Formator 缓冲区 (处理最后不完整历元)
-                remaining = self.formator.flush()
-                if remaining is not None:
-                    sensor_data = SensorData(tag=self.tag)
-                    self._fill_sensor_data(sensor_data, remaining)
-                    self.output_queue.put(sensor_data, timeout=1.0)
-                # 推入 EOF 标记
-                self.output_queue.put(EOF_SENSOR_DATA, timeout=1.0)
-                break
-
-            try:
-                data = self.formator.decode(line)
-            except Exception as e:
-                logger.warning("解码失败 (文件 %s): %s", self.file_path, e)
-                continue  # 跳过这一行, 继续读取
-
-            if data is not None:
-                # timed 模式: 按数据时间戳控制读取节奏
-                if self.playback_mode == "timed":
-                    self._timed_sleep(data)
-
-                sensor_data = SensorData(tag=self.tag)
-                self._fill_sensor_data(sensor_data, data)
-
-                # 反压机制: 队列满时阻塞等待, 最多等待 1 秒
-                # 级联反压: estimate_queue 满 → Scheduler 阻塞 → 传感器队列满 → Streamer 阻塞
-                try:
-                    self.output_queue.put(sensor_data, timeout=1.0)
-                except queue.Full:
-                    logger.warning("队列 %s 已满, 等待消费 (文件 %s)", self.tag, self.file_path)
-                    try:
-                        self.output_queue.put(sensor_data, timeout=5.0)  # 再等待 5 秒
-                    except queue.Full:
-                        logger.error("队列 %s 长时间已满, 丢弃数据 (文件 %s)", self.tag, self.file_path)
-
-                # 可选: 推入原始数据日志队列 (用于调试)
-                if self.raw_log_queue is not None:
-                    try:
-                        self.raw_log_queue.put(sensor_data, timeout=0.1)
-                    except queue.Full:
-                        pass  # 日志队列满时静默丢弃
-
-        self.close()
-
-    def _timed_sleep(self, decoded):
-        """按数据时间戳模拟实时流, speed 控制加速倍率"""
-        data_time = self.formator.get_timestamp(decoded)
-        if self._last_data_time is not None and self._last_wall_time is not None:
-            data_dt = data_time - self._last_data_time
-            if data_dt > 0:
-                wall_dt = data_dt / self.speed
-                elapsed = time.time() - self._last_wall_time
-                sleep_time = wall_dt - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-        self._last_data_time = data_time
-        self._last_wall_time = time.time()
-
-    @abstractmethod
-    def _fill_sensor_data(self, sensor_data: SensorData, decoded):
-        """将解码结果填入 SensorData 对应字段"""
-        ...
-
-    def pause(self):
-        """暂停读取 (由调度器控制)"""
-        self._paused = True
-
-    def resume(self):
-        """恢复读取 (由调度器控制)"""
-        self._paused = False
-        # timed 模式恢复时重置挂钟基准, 避免累积误差
-        if self.playback_mode == "timed":
-            self._last_wall_time = None
-
-    def close(self):
-        if self._file:
-            self._file.close()
+    def get_data(self):
+        """非阻塞返回队列头部数据。"""
+        try:
+            return self.output_queue.get_nowait()
+        except Empty:
+            return None
 ```
 
-**读取模式说明**：
+**关键点**：
+- 文件读完后在 `finally` 块中推入 `None` 作为 EOF sentinel，确保即使异常也会推入
+- `get_data()` 从 `output_queue` 非阻塞取数据，无数据返回 `None`
+- `Thread.__init__` 必须先于 `BaseSensor.__init__` 调用（因为 `Thread.name` 是 property）
+
+### 5.3 ImuFormator / EuRoCImuFormator / PosSolFormator（实际实现）
+
+> 三个 Formator 都在 `src/stream/formators.py` 中实现，时间戳在解码时统一转为 Unix 时间戳。
+> `ImuSensor._create_formator(imu_format)` 工厂方法根据配置项 `ins.imu_format`（`gpst` / `euroc`）创建对应 IMU 解码器实例。
+
+```python
+# src/stream/formators.py
+class ImuFormator(FormatorBase):
+    """IMU 文本解码（GPST 格式）。
+    输入列: GPS week, GPS sow, gx, gy, gz, ax, ay, az
+    """
+    def decode(self, line: str) -> Optional[SensorData]:
+        parts = line.strip().split(",")
+        week, sow = int(parts[0]), float(parts[1])
+        imu = ImuMeasurement(
+            timestamp=gpst_to_unix(week, sow),  # GPST → Unix 时间戳
+            week=week,
+            accel=np.array([ax, ay, az], dtype=np.float64),
+            gyro=np.array([gx, gy, gz], dtype=np.float64),
+        )
+        return SensorData(tag="imu", imu=imu)
+
+
+class EuRoCImuFormator(FormatorBase):
+    """IMU 文本解码（EuRoC 格式）。
+    输入列: timestamp [ns], w_x, w_y, w_z, a_x, a_y, a_z
+    时间戳为 Unix 纳秒，除以 1e9 转换为 Unix 秒。
+    GPS 周号由 Unix 时间戳派生（unix_to_gpst）。
+    坐标系默认为 RFU (Right-Front-Up)，由 ImuSensor 负责转换为 FRD。
+    """
+    def decode(self, line: str) -> Optional[SensorData]:
+        parts = line.strip().split(",")
+        timestamp_ns = int(parts[0])
+        timestamp = timestamp_ns / 1e9  # Unix 纳秒 → Unix 秒
+        week, _ = unix_to_gpst(timestamp)  # GPS 周号派生
+        imu = ImuMeasurement(
+            timestamp=timestamp,
+            week=week,
+            accel=np.array([ax, ay, az], dtype=np.float64),
+            gyro=np.array([wx, wy, wz], dtype=np.float64),
+        )
+        return SensorData(tag="imu", imu=imu)
+
+
+class PosSolFormator(FormatorBase):
+    """rtklib POS 格式解码。
+    数据行: yyyy/mm/dd hh:mm:ss.s  x  y  z  Q  ns  sdx  sdy  sdz  ...
+    """
+    def decode(self, line: str) -> Optional[SensorData]:
+        parts = line.split()
+        y, mo, d = (int(x) for x in parts[0].split("/"))
+        h, mi, s = parts[1].split(":")
+        week, sow = ymdhms_to_gpst(y, mo, d, int(h), int(mi), float(s))
+        sol = GnssSolution(
+            timestamp=gpst_to_unix(week, sow),  # GPST → Unix 时间戳
+            week=week,
+            position=np.array([x, y_pos, z], dtype=np.float64),
+            quality=q,
+            num_sv=ns,
+            sd=np.array([sdx, sdy, sdz], dtype=np.float64),
+        )
+        return SensorData(tag="gnss_solution", gnss_solution=sol)
+```
+
+### 5.4 FormatorBase 接口 — 自定义解码（实际实现）
+
+```python
+# src/stream/formators.py
+class FormatorBase(ABC):
+    """解码层抽象基类。"""
+
+    @abstractmethod
+    def decode(self, line: str) -> Optional[SensorData]:
+        """解码一行文本。
+
+        Returns:
+            SensorData 或 None（注释/空行）
+        """
+        ...
+```
+
+> **与早期设计的差异**：
+> - 实际 `FormatorBase.decode()` 返回 `SensorData`（已封装），而非原始数据对象
+> - 移除了 `get_timestamp()` 抽象方法（时间戳在 `decode()` 内部通过 `gpst_to_unix()` 直接转换）
+> - 移除了 `flush()` 方法（当前 IMU/POS 格式无需多行累积，每行独立解码）
+
+**读取模式说明**（早期设计，当前未实现 `timed` 模式）：
 
 | 模式 | `playback_mode` | 行为 | 适用场景 | 是否需要 `speed` |
 |------|-----------------|------|----------|-----------------|
-| **尽速读取** | `"asap"` (默认) | 读一行→解码→推队列，无 sleep，CPU 全速 | 后处理，多线程尽速读取，Scheduler 做时间对齐 | **不需要** |
-| **按数据时间驱动** | `"timed"` | 读一行→提取时间戳→sleep(Δt/speed)→推队列 | 模拟实时流，测试实时算法行为 | **需要**，默认 100 倍 |
+| **尽速读取** | `"asap"` (默认，当前唯一实现) | 读一行→解码→推队列，无 sleep，CPU 全速 | 后处理，多线程尽速读取 | **不需要** |
+| **按数据时间驱动** | `"timed"` (🚧 预留) | 读一行→提取时间戳→sleep(Δt/speed)→推队列 | 模拟实时流，测试实时算法行为 | **需要**，默认 100 倍 |
 
-**为什么后处理默认不需要加速倍率**：多线程尽速读取下，各读取线程以 CPU 全速将数据推入队列，Scheduler 消费队列做时间对齐。数据到达速度远超实时，无需额外加速。仅当需要模拟实时数据到达节奏（如测试缓冲区溢出、算法延迟）时，才切换为 `timed` 模式并设置 `speed`。
+### 5.5 流式 RINEX 解码框架（🚧 预留，当前由 InternalGnssSensor 内部完成）
 
-### 5.3 FormatorBase 接口 — 自定义解码
-
-```python
-class FormatorBase(ABC):
-    """自定义文件解码接口 — 用户继承此类实现自己的文本格式解析"""
-
-    @abstractmethod
-    def decode(self, line: str):
-        """解码一行文本数据。返回解码后的数据对象，解析失败返回 None"""
-        ...
-
-    @abstractmethod
-    def get_timestamp(self, decoded) -> float:
-        """从解码结果中提取时间戳"""
-        ...
-```
-
-**设计意图**：用户只需继承 `FormatorBase` 并实现 `decode()` 和 `get_timestamp()`，即可适配任意文本格式。例如：
-
-```python
-# 用户自定义 IMU 格式: timestamp,ax,ay,az,gx,gy,gz
-class MyIMUFormator(FormatorBase):
-    def decode(self, line: str) -> Optional[ImuMeasurement]:
-        parts = line.strip().split(',')
-        if len(parts) < 7:
-            return None
-        return ImuMeasurement(
-            timestamp=float(parts[0]),
-            acceleration=np.array([float(x) for x in parts[1:4]]),
-            angular_velocity=np.array([float(x) for x in parts[4:7]])
-        )
-
-    def get_timestamp(self, decoded: ImuMeasurement) -> float:
-        return decoded.timestamp
-
-# 用户自定义流动站 GNSS 格式 (多行历元)
-class MyRoverFormator(FormatorBase):
-    def __init__(self):
-        self._current_epoch = []       # 累积当前历元的行
-        self._current_timestamp = None
-
-    def decode(self, line: str) -> Optional[GnssMeasurement]:
-        parts = line.strip().split(',')
-        if len(parts) < 8:
-            return None
-
-        timestamp = float(parts[0])
-        if self._current_timestamp is not None and timestamp != self._current_timestamp:
-            # 新历元开始 → 返回上一个完整历元
-            result = GnssMeasurement(
-                timestamp=self._current_timestamp,
-                observations=self._current_epoch
-            )
-            self._current_epoch = []
-            self._current_timestamp = timestamp
-            return result
-
-        self._current_timestamp = timestamp
-        self._current_epoch.append(GnssObservation(
-            timestamp=timestamp,
-            satellite_id=parts[1],
-            pseudorange=float(parts[2]),
-            phaserange=float(parts[3]),
-            doppler=float(parts[4]),
-            snr=float(parts[5]),
-            frequency_label=parts[6]
-        ))
-        return None  # 历元未完成
-
-    def get_timestamp(self, decoded: GnssMeasurement) -> float:
-        return decoded.timestamp
-```
-
-### 5.4 流式 RINEX 解码框架
-
-> 项目目录中包含两个 RINEX 解码参考项目：
-> - `rtklib-py/src/rinex.py` — GNSS 解算库的一部分，全量读取
-> - `pyrinex-master/pyrinex/rinex3.py` — 纯 RINEX 解码库，全量读取，输出 xarray
+> **当前实现**：本项目未独立实现流式 RINEX 解码器，而是由 `InternalGnssSensor` 内部调用
+> rtklib-py 已吸收的 `src/core/gnss/rtklib/rinex.py` 的 `rnx_decode` / `decode_obsfile` / `decode_nav`
+> 完成全量加载，再逐历元解算。以下为早期设计的流式 RINEX 解码方案，预留未来扩展。
+>
+> 参考项目：
+> - `library/rtklib-py/src/rinex.py` — GNSS 解算库的一部分（已吸收到 `src/core/gnss/rtklib/rinex.py`）
+> - `library/pyrinex-master/pyrinex/rinex3.py` — 纯 RINEX 解码库，全量读取，输出 xarray
 >
 > 本框架**仅参考解码逻辑**，改为**流式逐行解码**而非全量加载。
 
@@ -902,12 +881,17 @@ class RinexObsFormator(FormatorBase):
 
     @staticmethod
     def _epoch2time(ep: list) -> float:
-        """年月日时分秒 → GPS 秒 (简化版)"""
+        """年月日时分秒 → Unix 时间戳（与 rtklib-py gtime_t 一致）
+
+        实际实现使用 src/core/time_utils.py 中的 ymdhms_to_gpst + gpst_to_unix。
+        """
         # 参考 rtklib-py epoch2time
         import datetime
         dt = datetime.datetime(ep[0], ep[1], ep[2], ep[3], ep[4], int(ep[5]))
         gps_epoch = datetime.datetime(1980, 1, 6)
-        return (dt - gps_epoch).total_seconds()
+        gpst_seconds = (dt - gps_epoch).total_seconds()
+        # 转换为 Unix 时间戳：GPST_EPOCH_UNIX = 315964800
+        return 315964800.0 + gpst_seconds
 ```
 
 #### 5.4.4 RINEX NAV 流式解码器
@@ -2227,57 +2211,69 @@ def _find_ref_near(self, rover_time: float, max_age: float = 0.05
 
 ## 10. 目录结构
 
+> **说明**：以下为实际实现的 `src/stream/` 目录结构（与 GInsStream.md 第 4 节整体结构对应）。✅ 标记已实现，🚧 标记预留。
+
 ```
-ins_gnss_fusion/
-├── design.md                  # 本设计文档
-├── config.yaml                # 配置文件
-├── main.py                    # 主入口
+gipylib/
+├── skills/
+│   └── StreamDesign.md          # 本设计文档
 │
-├── stream/                    # 传感器抽象层 + 流式读取层
-│   ├── __init__.py
-│   ├── base_sensor.py         # BaseSensor 传感器抽象基类（仅 get_data 接口，无观察者 Subject）
-│   ├── sensor_factory.py      # SensorFactory 工厂模式动态创建传感器
-│   ├── streamer_base.py       # StreamerBase 文件流读取基类（继承 BaseSensor，仅 queue.put）
-│   ├── formator_base.py       # FormatorBase 自定义解码接口
-│   ├── imu_streamer.py        # IMU 读取器（纯 threading，不使用 asyncio）
-│   ├── rover_streamer.py      # 流动站 GNSS 观测值读取器
-│   ├── eph_streamer.py        # 星历读取器 (永不暂停, 直到读完)
-│   ├── ref_streamer.py        # 基准站 GNSS 观测值读取器
-│   └── gnss_sol_streamer.py   # 外部 GNSS 定位结果读取器（外部模式）
+├── data/
+│   └── config.yaml              # 统一配置文件
 │
-├── integration/               # 数据集成层
-│   ├── __init__.py
-│   ├── scheduler.py           # 调度器（仅转发到 estimate_queue，不做时间对齐）
-│   ├── ephemeris_buffer.py    # 星历缓冲区
-│   └── init_state.py          # 初始化状态枚举
+├── src/
+│   ├── main.py                  # ✅ 主入口（三种运行模式装配：路径 A/B/C）
+│   │
+│   ├── stream/                  # ✅ 传感器抽象层 + 流式读取层
+│   │   ├── __init__.py
+│   │   ├── base.py              # ✅ BaseSensor（抽象基类）+ StreamerBase（流式读取基类，继承 BaseSensor + Thread）
+│   │   ├── factory.py           # ✅ SensorFactory 工厂模式动态创建传感器
+│   │   ├── formators.py         # ✅ FormatorBase + ImuFormator (GPST) + EuRoCImuFormator (EuRoC) + PosSolFormator（解码器统一在此文件）
+│   │   ├── imu_sensor.py        # ✅ ImuSensor IMU 传感器线程（继承 StreamerBase）
+│   │   ├── gnss_sol_sensor.py   # ✅ GnssSolSensor 外部 GNSS 结果传感器线程（继承 StreamerBase）
+│   │   ├── internal_gnss_sensor.py # ✅ InternalGnssSensor 内部 GNSS 解算传感器线程（直接 Thread 子类）
+│   │   ├── rover_sensor.py      # 🚧 预留：GnssRoverSensor 流动站传感器（当前由 InternalGnssSensor 内部 RINEX 加载）
+│   │   ├── eph_sensor.py        # 🚧 预留：EphSensor 星历传感器（同上）
+│   │   └── ref_sensor.py        # 🚧 预留：GnssRefSensor 基准站传感器（同上）
+│   │
+│   ├── core/                    # 核心解算
+│   │   ├── thread_control.py    # ✅ ThreadControl 线程控制
+│   │   ├── time_utils.py        # ✅ 时间转换（gpst_to_unix / unix_to_gpst / ymdhms_to_gpst）
+│   │   ├── data_types.py        # ✅ 核心数据类型（ImuMeasurement / GnssSolution / SensorData / AlignedBlock）
+│   │   ├── gnss/                # ✅ GNSS 解算模块（含 rtklib/ 吸收子包）
+│   │   └── ins/                 # ✅ INS/松组合模块
+│   │       ├── initializer.py       # ✅ InsInitializer（三种初始化模式 + 三阈值检验）
+│   │       ├── lc_estimator.py      # ✅ LcEstimator（单滤波 EKF，StateIndex 参数块，Joseph form）
+│   │       ├── lc_integration.py    # ✅ LcIntegration（最近邻时间对齐主循环）
+│   │       ├── lc_runner.py         # ✅ LcRunner（松组合批处理运行器，输出 RTKLC.pos）
+│   │       ├── constraints.py       # ✅ Constraints（NHC/ZUPT/ZARU 约束，独立模块）
+│   │       ├── static_detect.py     # ✅ StaticDetect（GLRT/MV/MAG/ARE/ALL 静态检测）
+│   │       ├── transfer_matrix.py   # ✅ TransferMatrix（F/Φ/Q，读取 pos_psd 等过程噪声 PSD）
+│   │       └── ...                  # ✅ 其他 INS 支撑模块（interpolator/earth_param/attitude 等）
+│   │
+│   ├── log/                     # ✅ 日志层
+│   │   ├── logger.py            # ✅ Logger（external+on / internal+on 模式，消费 imu_queue + gnss_queue；internal+on 下收集数据供 LcRunner 批量运行）
+│   │   ├── solution_logger.py   # ✅ SolutionLogger（internal+off 模式，仅消费 gnss_queue）
+│   │   ├── writer_base.py       # ✅ WriterBase 输出器抽象基类
+│   │   ├── solution_writer.py   # ✅ SolutionWriter rtklib 风格 .pos 输出
+│   │   ├── aligned_writer.py    # ✅ AlignedWriter 对齐块状 CSV 输出
+│   │   └── aligner.py           # ✅ Aligner IMU 积攒 + GNSS 收割的匹配器
+│   │
+│   └── utility/                 # ✅ 工具
+│       ├── config_loader.py     # ✅ 配置解析（data/config.yaml）
+│       └── rinex_simplifier.py  # ✅ RINEX 简化器
 │
-├── estimate/                  # 估计融合层
-│   ├── __init__.py
-│   ├── estimator_base.py      # 估计器基类
-│   ├── spp_estimator.py       # SPP 估计器 (占位)
-│   ├── initializer.py         # GNSS/IMU 初始化器 (占位)
-│   ├── ins_gnss_estimator.py  # INS/GNSS 融合估计器 (占位)
-│   └── estimator_thread.py    # 估计线程
-│
-├── log/                       # 日志层
-│   ├── __init__.py
-│   └── logger.py              # 日志记录器
-│
-├── utility/                   # 工具
-│   ├── __init__.py
-│   ├── data_types.py          # 核心数据类型定义
-│   ├── thread_control.py      # 线程控制
-│   └── config.py              # 配置解析
-│
-└── formators/                 # 用户自定义 Formator 实现
-    ├── __init__.py
-    ├── my_imu_formator.py     # 示例: 用户自定义 IMU 格式
-    ├── my_rover_formator.py   # 示例: 用户自定义流动站 GNSS 格式
-    ├── my_eph_formator.py     # 示例: 用户自定义星历格式
-    ├── my_ref_formator.py     # 示例: 用户自定义基准站 GNSS 格式
-    ├── rinex_obs_formator.py  # RINEX 3.x 观测值流式解码器 (参考 rtklib-py)
-    └── rinex_nav_formator.py  # RINEX 3.x 广播星历流式解码器 (参考 rtklib-py)
+└── tests/                       # 测试
+    └── test_gnss/               # ✅ GNSS 模块测试
 ```
+
+**与早期设计的差异**：
+- `formators/` 目录已合并为单文件 `formators.py`（含 `FormatorBase` + `ImuFormator` (GPST) + `EuRoCImuFormator` (EuRoC) + `PosSolFormator`）
+- `base_sensor.py` + `streamer_base.py` 已合并为 `base.py`（`BaseSensor` + `StreamerBase`）
+- `sensor_factory.py` 实际为 `factory.py`
+- `imu_streamer.py` / `gnss_sol_streamer.py` 实际为 `imu_sensor.py` / `gnss_sol_sensor.py`
+- `integration/` 目录当前未实现（无 Scheduler，传感器直接推入 queue 由 Logger 消费）
+- `estimate/` 目录当前未实现（INS 启用后才会引入）
 
 ---
 

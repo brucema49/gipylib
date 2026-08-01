@@ -3,17 +3,35 @@
 > 基于 rtklib-py 算法参考 + GREAT-MSF 架构模式，设计 GInsStream 流式 GNSS 处理框架。
 > 实现 SPP 和 RTK（含 RTD 退化模式）功能，采用 ABC 抽象类继承体系。
 >
-> **时间系统约定**：全框架统一使用 GPS 秒（GPST，since 1980-01-06），不使用 Unix epoch 或本地时间。
+> **时间系统约定**：全框架内部统一使用 **Unix 时间戳（float 秒，与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）**。
+> rtklib-py 的 `gtime_t.time` 即 Unix 整数秒，`gtime_t.sec` 为不足秒的小数部分；
+> 本项目 `GnssSolution.timestamp = sol.t.time + sol.t.sec`，`week` 由 `unix_to_gpst(timestamp)` 派生。
+> 时间转换工具：`src/core/time_utils.py`（`gpst_to_unix` / `unix_to_gpst`，`GPST_EPOCH_UNIX = 315964800`）。
+>
+> **当前实现状态**：
+> - ✅ 已实现：rtklib-py 已吸收到 `src/core/gnss/rtklib/`（7 个核心模块：`config.py` / `ephemeris.py` / `mlambda.py` / `pntpos.py` / `postpos.py` / `rinex.py` / `rtkcmn.py` / `rtkpos.py`）
+> - ✅ 已实现：`src/core/gnss/gnss_processor.py::GnssProcessor(ABC)` 抽象基类
+> - ✅ 已实现：`src/core/gnss/spp_processor.py::SppProcessor`（薄封装 rtklib-py `pntpos`）
+> - ✅ 已实现：`src/core/gnss/rtk_processor.py::RtkProcessor`（薄封装 rtklib-py `relpos`）
+> - ✅ 已实现：`src/core/gnss/solution_converter.py::sol_to_gnss_solution`（rtklib-py `Sol` → `GnssSolution`）
+> - ✅ 已实现：`src/core/gnss/rtklib_config_adapter.py::RtklibEnv` + `build_params`（YAML → rtklib-py 配置注入）
+> - ✅ 已实现：`src/stream/internal_gnss_sensor.py::InternalGnssSensor`（内部模式传感器线程，逐历元调用 pntpos/relpos）
+> - ✅ 已实现：`src/stream/gnss_sol_sensor.py::GnssSolSensor`（外部模式传感器线程，读取 .pos 文件）
+> - 🚧 预留：`GnssSolutionProvider` / `GnssInternalProvider` / `GnssExternalProvider` / `CombDD` / `GnssPositioningStrategy` 等（INS 启用后需要）
+>
+> **rtklib-py 吸收架构**：
+> rtklib-py 原为外部 `library/rtklib-py`，已吸收为 `src/core/gnss/rtklib/` 子包，
+> 通过 `config.py` 的 `_CfgProxy` 单例管理配置（由 `RtklibEnv.setup()` 调用 `config.set_params()` 注入），
+> 不再修改 `sys.path` 或 `sys.modules`。子包内模块使用相对导入（如 `from .rtkcmn import ...`）。
 >
 > 在框架中，GNSS 解算承担两种角色：
-> - **前端策略（仅 IMU 不可用降级时启用）**：作为 `GnssPositioningStrategy(OdometryStrategy)`，
+> - **前端策略（仅 IMU 不可用降级时启用，当前未实现）**：作为 `GnssPositioningStrategy(OdometryStrategy)`，
 >   当无 IMU 或 IMU 不可用时，直接用 SPP/RTK/RTD 产生里程计（位置/速度），与 `ImuMechStrategy` 可互换
 > - **后端量测源**：松组合后端 EKF 的量测输入（GnssSolution），由 GnssSolutionProvider 统一提供，
->   仅作用于主滤波 P1（NHC 子滤波 P2 不直接使用 GNSS 量测）
+>   作用于单滤波 P 矩阵（StateIndex 参数块）
 >
-> GNSS 传感器通过 `GnssRoverSensor(BaseSensor)` 读取原始观测值，`GnssSolSensor(BaseSensor)` 读取外部结果，
-> 均实现 `get_data()` 接口，由 `SensorFactory` 动态创建。**采用纯队列流水线**：数据通过 `queue.put()` 推入
-> sensor_queue → Scheduler 转发到 estimate_queue → `LcIntegration.process_epoch()` 处理，**无观察者模式、无 notify()**。
+> 当前内部模式下，`InternalGnssSensor` 直接调用 `SppProcessor` / `RtkProcessor`，把 `GnssSolution` 通过 `gnss_queue` 推入下游 `SolutionLogger` 输出 `.pos` 文件。
+> 外部模式下，`GnssSolSensor` 通过 `PosSolFormator` 解析 `.pos` 文件得到 `GnssSolution`。
 
 ---
 
@@ -320,54 +338,79 @@ timestamp,pos_e,pos_n,pos_u,vel_e,vel_n,vel_u,status,num_sat
 
 ## 3. 数据结构适配（rtklib-py 映射）
 
-### 3.1 观测值映射
+> rtklib-py 已吸收到 `src/core/gnss/rtklib/`，本项目不重新定义观测值/星历数据结构，
+> 直接复用 rtklib-py 的 `Obs` / `Eph` / `Nav` / `Sol` / `gtime_t` 对象。
+> 仅在边界处通过 `solution_converter.py::sol_to_gnss_solution` 把 `Sol` 转换为本项目 `GnssSolution`。
 
-| rtklib-py | 本项目 | 转换说明 |
+### 3.1 观测值/星历映射（直接复用 rtklib-py 对象）
+
+| rtklib-py | 本项目使用方式 | 转换说明 |
+|-----------|---------------|---------|
+| `Obs` (obsr/obsb) | 直接传入 `SppProcessor.process_epoch(obsr)` / `RtkProcessor.process_epoch(obsr, obsb)` | 不转换，rtklib-py 原生对象 |
+| `Eph` / `Nav` | 由 `RtklibEnv.init_nav()` 创建，存于 `nav` 对象，处理器持有 `nav` 引用 | 不转换，rtklib-py 原生对象 |
+| `gtime_t` | `gtime_t.time`（Unix 整数秒）+ `gtime_t.sec`（小数秒） | 直接用 `sol.t.time + sol.t.sec` 得到 Unix 时间戳 |
+
+### 3.2 解算结果映射（Sol → GnssSolution）
+
+`src/core/gnss/solution_converter.py::sol_to_gnss_solution` 完成转换：
+
+| rtklib-py `Sol` 字段 | 本项目 `GnssSolution` 字段 | 转换说明 |
 |-----------|--------|---------|
-| `Obs.time` = [tows, week] | `GnssMeasurement.timestamp` (float) | `tows + week * 604800` |
-| `Obs.sat[i]` (int PRN) | `GnssObservation.satellite_id` (str "G01") | `f"{sys_char}{prn:02d}"` |
-| `Obs.P[i]` | `GnssObservation.pseudorange` | 直接映射 |
-| `Obs.L[i]` | `GnssObservation.phaserange` | 直接映射（周 → 米需乘波长） |
-| `Obs.S[i]` | `GnssObservation.snr` | 直接映射 |
-| `Obs.D[i]` | `GnssObservation.doppler` | 直接映射 |
+| `Sol.t.time + Sol.t.sec` | `timestamp` (float) | Unix 时间戳（= gtime_t.time + gtime_t.sec） |
+| `unix_to_gpst(timestamp)[0]` | `week` (int) | GPS 周号（由 timestamp 派生） |
+| `Sol.rr[0:3]` | `position` (np.ndarray [3]) | ECEF 位置 |
+| `Sol.rr[3:6]` | `velocity` (np.ndarray [3]) | ECEF 速度（由 `pntpos::estvel` 多普勒测速或 `relpos` 卡尔曼滤波速度填入） |
+| `Sol.stat` | `quality` (int) | 1=SPP, 2=RTD, 4=浮点解, 5=LC（与 rtklib `SOLQ_*` 一致） |
+| `Sol.ns` | `num_sv` (int) | 使用卫星数（rtklib-py `pntpos`/`relpos` 不写 `sol.ns`，由处理器回填） |
+| `sqrt(diag(Sol.qr[0:3,0:3]))` | `sd` (np.ndarray [3]) | ECEF 位置标准差 (sdx, sdy, sdz) |
+| `sqrt(diag(Sol.qv[0:3,0:3]))`（若可用） | `vel_sd` (np.ndarray [3], 可选) | ECEF 速度标准差 |
+| `Sol.qr[0:3, 0:3]` | `cov` (np.ndarray [3,3], 可选) | ECEF 协方差矩阵（含非对角项） |
 
-### 3.2 星历映射
-
-| rtklib-py | 本项目 | 转换说明 |
-|-----------|--------|---------|
-| `Eph.sat` (int) | `EphemerisData` + satellite_id | `prn + sys_offset[sys_char]` |
-| `Eph.sqrtA, e, i0, OMG0, omg` | `EphemerisData.orbit_params` dict | 按键名映射 |
-| `Eph.M0, deln, OMGd, idot` | `EphemerisData.orbit_params` dict | 按键名映射 |
-| `Eph.cuc, cus, crc, crs, cic, cis` | `EphemerisData.orbit_params` dict | 按键名映射 |
-| `Eph.toe` = [tows, week] | `EphemerisData.toe_seconds` + `week` | 拆分映射 |
-| `Eph.clk` = [a0, a1, a2] | `EphemerisData.clock_bias` | 直接映射 |
-| `Eph.tgd` | `EphemerisData.orbit_params['tgd']` | 按键名映射 |
-| `Geph` (GLONASS) | `EphemerisData` (GLONASS 类型) | pos/vel/acc 字段映射 |
-| `Nav` (全局容器) | `EphemerisBuffer` (流式管理) | 按卫星ID+时间查询 |
-
-### 3.3 解算结果映射
-
-| rtklib-py | 本项目 | 转换说明 |
-|-----------|--------|---------|
-| `Sol.rr[0:3]` | `GnssSolution.position` | ECEF 位置 |
-| `Sol.dtr` | `GnssSolution.clock_bias` | 接收机钟差 |
-| `Sol.qr` | `GnssSolution.pos_covariance` | 协方差矩阵 |
-| `Sol.ns` | `GnssSolution.num_satellites` | 使用卫星数 |
-| `Sol.stat` | `GnssSolution.status` | 解算状态 |
+> 解算状态常量（`src/core/gnss/solution_converter.py`）：
+> `SOLQ_NONE=0`, `SOLQ_FIX=1`, `SOLQ_FLOAT=2`, `SOLQ_DGPS=4`, `SOLQ_SINGLE=5`。
+>
+> **速度字段说明**：
+> - SPP 模式下，`pntpos()` 内部调用 `estvel()`（基于多普勒观测值的最小二乘测速）将速度填入 `sol.rr[3:6]`
+> - RTK 模式下，`relpos()` 卡尔曼滤波状态向量含速度分量，直接填入 `sol.rr[3:6]`
+> - 速度用于 INS 动态初始化（速度矢量法，详见 [初始化.md 第 8 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#8-动态初始化---速度矢量初始化)）
 
 ---
 
 ## 4. SPP 算法流程
 
-### 4.1 SppProcessor.process_epoch() 流程
+> **实现说明**：本项目 `SppProcessor` 是 rtklib-py `pntpos` 的薄封装（参考 `src/core/gnss/spp_processor.py`），
+> 不重新实现 SPP 算法。以下流程描述 rtklib-py `pntpos` 内部逻辑，供参考。
+
+### 4.1 SppProcessor.process_epoch() 流程（实际实现）
+
+```python
+# src/core/gnss/spp_processor.py
+class SppProcessor(GnssProcessor):
+    def __init__(self, nav):
+        self.nav = nav
+        from .rtklib.pntpos import pntpos
+        self._pntpos = pntpos
+
+    def process_epoch(self, obsr, obsb=None) -> Optional[GnssSolution]:
+        """调用 pntpos 解算单历元 SPP。"""
+        sol = self._pntpos(obsr, self.nav)
+        # rtklib-py 的 pntpos 不写 sol.ns，用本历元观测卫星数近似
+        if sol.stat != SOLQ_NONE and sol.ns == 0:
+            sol.ns = len(obsr.sat)
+        return sol_to_gnss_solution(sol)
+```
+
+**调用链**：`InternalGnssSensor._run_spp_loop` → 遍历 `rov.obslist` → `SppProcessor.process_epoch(obsr)` → `pntpos(obsr, nav)` → `sol_to_gnss_solution(sol)` → 推入 `gnss_queue`。
+
+### 4.2 rtklib-py pntpos 内部算法（参考）
 
 ```
-SppProcessor.process_epoch(gnss_meas, eph_buffer, options)
+pntpos(obs, nav)  # rtklib-py 内部实现
   │
   ├── 1. 卫星位置计算
   │     对每颗卫星:
-  │       ├── 从 eph_buffer 选择星历（参考 rtklib-py seleph）
-  │       ├── eph2pos() 计算卫星位置（参考 rtklib-py eph2pos）
+  │       ├── 从 nav 选择星历（seleph）
+  │       ├── eph2pos() 计算卫星位置
   │       └── 卫星钟差改正
   │
   ├── 2. 初始位置
@@ -378,10 +421,10 @@ SppProcessor.process_epoch(gnss_meas, eph_buffer, options)
   ├── 3. 迭代最小二乘（最多 max_iter 次）
   │     │
   │     ├── 3a. 构建观测方程（对每颗合格卫星）
-  │     │     ├── 计算仰角/方位角（参考 rtklib-py satazel）
+  │     │     ├── 计算仰角/方位角（satazel）
   │     │     ├── 仰角/信噪比筛选
-  │     │     ├── 对流层改正（参考 rtklib-py tropmodel）
-  │     │     ├── 电离层改正 Klobuchar（参考 rtklib-py ionmodel）
+  │     │     ├── 对流层改正（tropmodel）
+  │     │     ├── 电离层改正 Klobuchar（ionmodel）
   │     │     ├── 卫星钟差改正
   │     │     ├── 地球自转改正（Sagnac 效应）
   │     │     ├── 计算几何距离
@@ -398,15 +441,49 @@ SppProcessor.process_epoch(gnss_meas, eph_buffer, options)
   │     │
   │     └── 3d. 收敛判断: ‖dx[:3]‖ < 1e-4 → 退出迭代
   │
-  └── 4. 构建解算结果
-        ├── 位置 (ECEF)
-        ├── 钟差
-        ├── DOP 值
-        ├── 协方差 = (H^T W H)^{-1}
-        └── 精度估计
+  └── 4. 构建解算结果 Sol
+        ├── Sol.rr[0:3] = 位置 (ECEF)
+        ├── Sol.rr[3:6] = 速度 (ECEF) ← estvel() 多普勒测速填入
+        ├── Sol.dtr = 钟差
+        ├── Sol.qr = 位置协方差 = (H^T W H)^{-1}
+        ├── Sol.qv = 速度协方差（若 estvel 计算）
+        ├── Sol.stat = SOLQ_SINGLE (5)
+        └── Sol.t = obs.t (gtime_t, Unix 时间戳)
 ```
 
-### 4.2 SPP 观测方程要点
+### 4.2.1 多普勒测速（estvel / resdop）
+
+> **实现说明**：本项目在 `src/core/gnss/rtklib/pntpos.py` 中实现了 `estvel()` 和 `resdop()`，
+> 由 `pntpos()` 在位置解算完成后调用，将 ECEF 速度填入 `sol.rr[3:6]`。
+> 速度用于 INS 动态初始化（速度矢量法，详见 [初始化.md 第 8 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#8-动态初始化---速度矢量初始化)）。
+
+```
+estvel(obs, nav, rs, dts, svh, rr)   # 多普勒测速主函数
+  │
+  ├── 1. 调用 resdop() 构建多普勒观测方程
+  │     对每颗卫星（有有效多普勒观测 obs.D[i,0] != 0）:
+  │       ├── 卫星速度 rs[i, 3:6]（来自星历）
+  │       ├── 视线向量 e = (rs[i, 0:3] - rr) / |·|
+  │       ├── 多普勒残差 v = -λ * D + (v_sat - v_rcv) · e + 钟漂项
+  │       └── 设计矩阵 H[i, 0:3] = -e, H[i, 3] = 1（钟漂）
+  │
+  ├── 2. 加权最小二乘求解
+  │     dx = (H^T W H)^{-1} H^T W v
+  │     其中 W 由 varerr() 仰角加权
+  │
+  └── 3. 填入 Sol
+        ├── sol.rr[3:6] = vel (ECEF 速度)
+        └── sol.dtr[1]  = 钟漂（如有）
+```
+
+**多普勒测速要点**：
+- 观测值：多普勒观测 `obs.D[i, 0]`（L1 频点）
+- 待估参数：`[vx, vy, vz, c·dt_r_dot]`（3 速度 + 1 钟漂）
+- 最小卫星数：4 颗（与位置解算一致）
+- 载波波长：`λ = c / f`（由 `nav.freq[0]` 计算）
+- 卫星速度：由星历计算，存于 `rs[i, 3:6]`
+
+### 4.3 SPP 观测方程要点
 
 - **观测值**：仅伪距（码观测值）
 - **待估参数**：[x, y, z, c·dt_r]（3 位置 + 1 钟差）
@@ -418,97 +495,137 @@ SppProcessor.process_epoch(gnss_meas, eph_buffer, options)
 
 ## 5. RTK/RTD 算法流程
 
-### 5.1 RTK 与 RTD 的关系
+> **实现说明**：本项目 `RtkProcessor` 是 rtklib-py `relpos` 的薄封装（参考 `src/core/gnss/rtk_processor.py`），
+> 不重新实现 RTK 算法。RTD 不是独立模块，而是 rtklib-py `relpos` 内部的退化分支
+> （`armode=0` 或 ratio 检验失败时返回 `SOLQ_DGPS=4` 即 RTD 浮点解）。
+> 以下流程描述 rtklib-py `relpos` 内部逻辑，供参考。
+
+### 5.1 RTK 与 RTD 的关系（rtklib-py 内部）
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                  RtkProcessor                        │
-│                                                     │
-│  ┌─────────────────────────────────────────────┐   │
-│  │           双差框架（CombDD）                  │   │
-│  │                                             │   │
-│  │  RTK 模式:                                   │   │
-│  │    观测值 = 码双差 + 载波双差                 │   │
-│  │    待估参数 = 位置 + 模糊度                   │   │
-│  │    模糊度解算 = LAMBDA / 部分 AR              │   │
-│  │                                             │   │
-│  │  RTD 模式（退化）:                            │   │
-│  │    观测值 = 码双差（仅码）                    │   │
-│  │    待估参数 = 位置（无模糊度）                 │   │
-│  │    模糊度解算 = 跳过                          │   │
-│  │                                             │   │
-│  └─────────────────────────────────────────────┘   │
-│                                                     │
-│  退化条件:                                          │
-│    1. 载波相位质量不足                              │
-│    2. 模糊度 ratio 检验失败                         │
-│    3. 周跳检测后模糊度重置期间                       │
-│    4. 配置强制 RTD 模式                             │
-└─────────────────────────────────────────────────────┘
+rtklib-py relpos(nav, obsr, obsb, sol)   # 单历元相对定位
+  │
+  ├── 默认尝试 RTK（载波双差 + 模糊度解算）
+  │     观测值 = 码双差 + 载波双差
+  │     待估参数 = 位置 + 速度 + 模糊度
+  │     模糊度解算 = LAMBDA（受 armode / thresar 控制）
+  │
+  └── 退化分支（自动）：
+        载波质量不足 / ratio 检验失败 / 周跳重置 / armode=0
+        → 返回 SOLQ_DGPS (4) 即 RTD 浮点解（仅码双差）
 ```
 
-### 5.2 RtkProcessor.process_epoch() 流程
-
-```
-RtkProcessor.process_epoch(rover_meas, ref_meas, eph_buffer, options)
-  │
-  ├── 1. 卫星位置计算（同 SPP，参考 rtklib-py satposs）
-  │
-  ├── 2. Rover-Ref 时间匹配
-  │     ├── 找到时间戳最接近的 Ref 历元
-  │     └── 差分龄期 > max_differential_age → 降级为 SPP 或放弃
-  │
-  ├── 3. 共视卫星筛选
-  │     ├── Rover 与 Ref 的卫星交集
-  │     ├── 仰角/信噪比筛选
-  │     └── 选择参考卫星（最高仰角）
-  │
-  ├── 4. 构建双差观测方程（CombDD.cmb_equ()）
-  │     │
-  │     ├── 4a. 码双差（RTD/RTK 共用）
-  │     │     Δ∇P = P_rover,i - P_rover,j - P_ref,i + P_ref,j
-  │     │
-  │     ├── 4b. 载波双差（仅 RTK）
-  │     │     Δ∇L = L_rover,i - L_rover,j - L_ref,i + L_ref,j
-  │     │
-  │     └── 4c. 线性化观测方程
-  │           ├── 码双差: Z_code = Δ∇P - Δ∇ρ,  H_code = [-Δ∇e^T]
-  │           └── 载波双差: Z_phase = Δ∇L - Δ∇ρ + λ·N,  H_phase = [-Δ∇e^T, λ·I]
-  │
-  ├── 5. 模糊度处理
-  │     ├── 检查载波质量 → 质量不足 → 跳到步骤6（RTD 退化）
-  │     ├── 已有固定模糊度 → 使用固定解
-  │     ├── 尝试模糊度解算（LAMBDA）
-  │     │   ├── ratio 检验通过 → 固定解
-  │     │   └── ratio 检验失败 → 浮点解 / 退化 RTD
-  │     └── 周跳检测 → 重置相关模糊度 → 退化 RTD
-  │
-  ├── 6. 最小二乘 / Kalman 滤波求解
-  │     ├── RTK: 位置 + 模糊度（Kalman 滤波）
-  │     └── RTD: 仅位置（最小二乘，无模糊度参数）
-  │
-  └── 7. 构建解算结果
-        ├── 位置 (ECEF)
-        ├── 模式标记: "RTK-Fixed" / "RTK-Float" / "RTD"
-        ├── 模糊度状态
-        └── 精度估计
-```
-
-### 5.3 RTD 退化详解
-
-RTD 不是独立模块，而是 RTK 框架内的退化模式：
-
-| 维度 | RTK 模式 | RTD 退化模式 |
+| 维度 | RTK 模式（`SOLQ_FIX=1` / `SOLQ_FLOAT=2`） | RTD 退化（`SOLQ_DGPS=4`） |
 |------|---------|-------------|
 | 双差类型 | 码双差 + 载波双差 | 仅码双差 |
 | 观测值 | 伪距 + 载波相位 | 仅伪距 |
 | 待估参数 | 位置 + 模糊度向量 | 仅位置 |
-| 模糊度解算 | LAMBDA / 部分 AR | 跳过 |
-| 解算方法 | Kalman 滤波（状态含模糊度） | 最小二乘（无模糊度状态） |
+| 模糊度解算 | LAMBDA / fix-and-hold | 跳过 |
 | 精度 | 厘米~分米级 | 分米~米级 |
-| 退化触发 | — | 载波质量差 / ratio 失败 / 周跳重置 / 配置强制 |
+| 退化触发 | — | 载波质量差 / ratio 失败 / 周跳重置 / `armode=0` |
 
-**退化机制**：RtkProcessor 在每个历元处理时，先尝试 RTK（载波双差 + 模糊度解算），若条件不满足则自动退化为 RTD（仅码双差）。退化是动态的——当载波条件恢复时，可重新初始化模糊度回到 RTK 模式。
+> **退化由 rtklib-py 内部自动处理**，本项目 `RtkProcessor` 不实现退化逻辑，
+> 仅通过 `sol.stat` 字段透传解算类型（`SOLQ_FIX`/`SOLQ_FLOAT`/`SOLQ_DGPS`）。
+
+### 5.2 RtkProcessor.process_epoch() 流程（实际实现）
+
+```python
+# src/core/gnss/rtk_processor.py
+class RtkProcessor(GnssProcessor):
+    def __init__(self, nav):
+        self.nav = nav
+        from .rtklib.pntpos import pntpos
+        from .rtklib.rtkpos import relpos, timediff
+        from .rtklib.rtkcmn import Sol, gtime_t
+        self._pntpos = pntpos
+        self._relpos = relpos
+        self._timediff = timediff
+        self._Sol = Sol
+        self._gtime_t = gtime_t
+        self.sol = self._Sol()              # 初始 sol，rr[0]==0 触发首历元 pntpos
+        self._prev_t = self._gtime_t()      # 初始为 0，首历元不计算 nav.tt
+
+    def process_epoch(self, obsr, obsb=None) -> Optional[GnssSolution]:
+        """调用 relpos 解算单历元 RTK。"""
+        # 1. 首历元或 sol.rr[0]==0 时先 pntpos 取初值
+        if self.nav.use_sing_pos or self.sol.stat == SOLQ_NONE or self.sol.rr[0] == 0.0:
+            self.sol = self._pntpos(obsr, self.nav)
+            # 用 SPP 解初始化 nav.x，供 relpos 的 zdres 计算流动站位置
+            self.nav.x[0:6] = self.sol.rr[0:6]
+            self.nav.x[6:9] = 1e-6  # match RTKLIB
+        else:
+            self.sol = self._Sol()
+
+        # 2. 确保时间戳正确
+        if self.sol.t.time == 0:
+            self.sol.t = obsr.t
+
+        # 3. 计算 nav.tt（当前历元与上历元的时间差），对应 rtkpos.py:1106-1107
+        # relpos 内的 udpos/udbias 依赖 nav.tt 做状态传播与过程噪声注入
+        if self._prev_t.time != 0:
+            self.nav.tt = self._timediff(self.sol.t, self._prev_t)
+
+        # 4. 相对定位（修改 self.sol 与 self.nav 状态）
+        self._relpos(self.nav, obsr, obsb, self.sol)
+
+        # 5. 记录本历元时间，供下一历元计算 nav.tt
+        self._prev_t.time = self.sol.t.time
+        self._prev_t.sec = self.sol.t.sec
+
+        # 6. rtklib-py 的 relpos 不写 sol.ns，用 nav.ns 回退
+        if self.sol.stat != SOLQ_NONE and self.sol.ns == 0:
+            self.sol.ns = self.nav.ns if self.nav.ns > 0 else len(obsr.sat)
+
+        return sol_to_gnss_solution(self.sol)
+```
+
+**调用链**：`InternalGnssSensor._run_rtk_loop` → `first_obs`/`next_obs` 时间同步 → `RtkProcessor.process_epoch(obsr, obsb)` → `relpos(nav, obsr, obsb, sol)` → `sol_to_gnss_solution(sol)` → 推入 `gnss_queue`。
+
+**跨历元状态管理**：
+- `self.sol`: 上历元解算结果（用于判断是否需要重新 SPP 取初值）
+- `self._prev_t`: 上历元解算时间（用于计算 `nav.tt`，TimeDiff）
+- `nav`: 由调用方管理，持有 `x`/`P`/`azel`/`lock` 等状态
+
+### 5.3 rtklib-py relpos 内部算法（参考）
+
+```
+relpos(nav, obsr, obsb, sol)  # rtklib-py 内部实现
+  │
+  ├── 1. 卫星位置计算（satposs）
+  │
+  ├── 2. Rover-Ref 时间匹配（首历元 first_obs，后续 next_obs）
+  │     ├── rnx_decodefirst_obs(nav, rov, base, dir) 做初始时间对齐
+  │     └── rnx_decodenext_obs(nav, rov, base, dir) 推进到下一历元
+  │
+  ├── 3. 共视卫星筛选 + 参考卫星选择（最高仰角）
+  │
+  ├── 4. 构建双差观测方程（zdres + ddres）
+  │     ├── 码双差（RTD/RTK 共用）
+  │     │     Δ∇P = P_rover,i - P_rover,j - P_ref,i + P_ref,j
+  │     └── 载波双差（仅 RTK）
+  │           Δ∇L = L_rover,i - L_rover,j - L_ref,i + L_ref,j
+  │
+  ├── 5. 状态更新（udpos / udion / udbias）
+  │     ├── 位置/速度预测（Kalman 状态传播，依赖 nav.tt）
+  │     ├── 电离层状态传播
+  │     └── 模糊度状态传播（周跳检测 → 重置）
+  │
+  ├── 6. Kalman 滤波量测更新（holdamb / relpos_filter）
+  │     ├── 待估参数 = 位置 + 速度 + 电离层 + 模糊度
+  │     └── 状态协方差更新
+  │
+  ├── 7. 模糊度解算（resamb_LAMBDA）
+  │     ├── armode != 0 → 尝试 LAMBDA
+  │     ├── ratio 检验通过 → SOLQ_FIX (1)
+  │     ├── ratio 检验失败 → SOLQ_FLOAT (2)
+  │     └── armode == 0 或载波不足 → SOLQ_DGPS (4) 即 RTD 退化
+  │
+  └── 8. 构建解算结果 Sol
+        ├── Sol.rr[0:3] = 位置 (ECEF)
+        ├── Sol.stat = SOLQ_FIX / SOLQ_FLOAT / SOLQ_DGPS
+        ├── Sol.qr = 协方差矩阵
+        └── Sol.t = obsr.t (gtime_t, Unix 时间戳)
+```
 
 ---
 
@@ -626,32 +743,55 @@ class CmbEquation:
 
 ---
 
-## 7. 坐标变换工具提取计划
+## 7. 坐标变换与时间工具
 
-### 7.1 提取来源
+### 7.1 实际实现策略
 
-从 rtklib-py `rtkcmn.py` 提取坐标变换函数，独立为 `coord_transform.py` 模块。
+**坐标变换函数不独立提取**：rtklib-py 已吸收到 `src/core/gnss/rtklib/`，
+本项目 `SppProcessor` / `RtkProcessor` 直接调用 rtklib-py `rtkcmn.py` 中的
+`ecef2pos` / `pos2ecef` / `ecef2enu` / `enu2ecef` 等函数，无需重复实现。
 
-### 7.2 函数清单
+仅在边界处（如 `solution_writer.py` 输出 LLH/ENU 时）通过 rtklib-py 函数完成坐标变换。
 
-| rtklib-py 函数 | 本项目函数 | 说明 |
-|---------------|-----------|------|
-| `ecef2pos()` | `ecef2pos()` | ECEF → LLH [lat, lon, h] (rad, rad, m) |
-| `pos2ecef()` | `pos2ecef()` | LLH → ECEF |
-| `ecef2enu()` | `ecef2enu()` | ECEF 差值 → ENU |
-| `enu2ecef()` | `enu2ecef()` | ENU → ECEF 差值 |
-| — | `xyz2enu_mat()` | ECEF→ENU 旋转矩阵 |
-| — | `enu2xyz_mat()` | ENU→ECEF 旋转矩阵 |
-| `gpst2time()` | `gpst2time()` | GPS 周+周内秒 → 时间戳 |
-| `time2gpst()` | `time2gpst()` | 时间戳 → (week, tow) |
-| `epoch2time()` | `epoch2time()` | [y,m,d,h,min,sec] → 时间戳 |
+**时间转换工具已独立提取**：`src/core/time_utils.py` 提供 Unix ↔ GPST 转换，
+供 `formators.py`（输入解码）/ `solution_writer.py` / `aligned_writer.py`（输出）使用。
 
-### 7.3 改造要点
+### 7.2 时间工具（src/core/time_utils.py）
 
-- rtklib-py 使用列表传参 → 改为 numpy 数组
-- 去除全局状态依赖
-- 确保纯函数化（无副作用）
-- 所有函数无状态，可直接被 SppProcessor / RtkProcessor 调用
+| 函数 | 签名 | 说明 |
+|------|------|------|
+| `gpst_to_unix` | `(week: int, sow: float) -> float` | GPS 周+周内秒 → Unix 时间戳 |
+| `unix_to_gpst` | `(unix_ts: float) -> Tuple[int, float]` | Unix 时间戳 → (GPS 周, 周内秒) |
+
+**常量**：
+- `GPST_EPOCH_UNIX = 315964800`（1980-01-06 00:00:00 UTC 的 Unix 时间戳）
+- `SECONDS_PER_WEEK = 604800`
+
+### 7.3 rtklib-py 坐标变换函数（直接复用）
+
+| rtklib-py 函数 | 说明 | 调用位置 |
+|---------------|------|---------|
+| `ecef2pos()` | ECEF → LLH [lat, lon, h] (rad, rad, m) | `solution_writer.py` 输出 |
+| `pos2ecef()` | LLH → ECEF | 外部结果输入解析 |
+| `ecef2enu()` | ECEF 差值 → ENU | `solution_writer.py` 协方差旋转 |
+| `enu2ecef()` | ENU → ECEF 差值 | 外部结果输入 |
+| `xyz2enu()` | ECEF→ENU 旋转矩阵 | `solution_writer.py` 协方差旋转 |
+
+### 7.4 调用示例
+
+```python
+# 输入端：formators.py 把 GPS 周+周内秒转为 Unix 时间戳
+from src.core.time_utils import gpst_to_unix
+timestamp = gpst_to_unix(week, sow)
+
+# 解算端：直接复用 rtklib-py 函数，无需转换
+from src.core.gnss.rtklib.rtkcmn import ecef2pos, ecef2enu
+lat, lon, h = ecef2pos(sol.rr[0:3])
+
+# 输出端：solution_writer.py 把 Unix 时间戳转回 (week, sow) 写文件
+from src.core.time_utils import unix_to_gpst
+week, sow = unix_to_gpst(sol.timestamp)
+```
 
 ---
 
@@ -702,200 +842,199 @@ class CmbEquation:
 
 GNSS 解算在 GInsStream 框架中承担两种角色：
 
-| 角色 | 集成方式 | 实现类 | 触发场景 |
-|------|---------|--------|---------|
-| **前端里程计（仅 IMU 不可用降级时）** | 策略模式（仅前端） | `GnssPositioningStrategy(OdometryStrategy)` | 无 IMU 或 IMU 故障时，直接用 SPP/RTK/RTD 产生里程计 |
-| **后端量测源（仅作用于主滤波 P1）** | 纯队列流水线 | `GnssRoverSensor(BaseSensor)` / `GnssSolSensor(BaseSensor)` | 正常松组合模式下，GNSS 结果作为主滤波 P1 的 EKF 量测输入 |
+| 角色 | 集成方式 | 实现类 | 触发场景 | 实现状态 |
+|------|---------|--------|---------|---------|
+| **后端量测源（作用于单滤波 P）** | 纯队列流水线 | `InternalGnssSensor` / `GnssSolSensor` | 当前实现：internal/external 两种模式 | ✅ 已实现 |
+| **前端里程计（仅 IMU 不可用降级时）** | 策略模式（仅前端） | `GnssPositioningStrategy(OdometryStrategy)` | IMU 不可用时，直接用 SPP/RTK 产生里程计 | 🚧 预留 |
 
 > **不使用观察者模式**：GNSS 传感器不持有观察者列表，无 `attach/detach/notify`，无 `on_data()` 回调。
-> 数据通过 `queue.put()` 推入 sensor_queue → Scheduler 转发到 estimate_queue → `LcIntegration.process_epoch()` 处理。
+> 数据通过 `queue.put()` 推入 gnss_queue → Scheduler 转发到 estimate_queue → `LcIntegration.process_epoch()` 处理。
 > **不使用 FusionStrategy 层**：后端融合由 `LcIntegration` 直接承担，无 `LcFusionStrategy` 类。
 
-### 9.2 前端策略类 — GnssPositioningStrategy
+### 9.2 实际传感器实现
+
+#### 9.2.1 InternalGnssSensor（内部解算模式，✅ 已实现）
+
+`src/stream/internal_gnss_sensor.py::InternalGnssSensor` 是一个 `Thread` 子类，
+根据 `positioning_mode` 创建 `SppProcessor` 或 `RtkProcessor`，逐历元解算并推入 `gnss_queue`：
+
+```python
+# src/stream/internal_gnss_sensor.py
+class InternalGnssSensor(Thread):
+    """内部 GNSS 解算传感器线程。"""
+
+    def __init__(self, config: dict, output_queue: Queue, control: ThreadControl):
+        Thread.__init__(self, name="InternalGnssSensor", daemon=True)
+        self.gnss_cfg = config["gnss"]
+        self.output_queue = output_queue
+        self.control = control
+
+    def _run_impl(self):
+        # 1. 初始化 rtklib 环境 + nav
+        env = RtklibEnv(self.gnss_cfg)
+        env.setup()
+        nav = env.init_nav()
+
+        # 2. 准备 RINEX 文件（必要时简化）
+        rover_path = self._prepare_rinex(self.gnss_cfg["rover_path"])
+
+        # 3. 加载流动站观测值 + 星历
+        from src.core.gnss.rtklib import rinex as rn
+        rov = rn.rnx_decode(env.get_cfg())
+        rov.decode_obsfile(nav, rover_path, None)
+        rov.decode_nav(self.gnss_cfg["eph_path"], nav)
+
+        # 4. RTK 模式加载基站
+        #    rb_format 配置项指定基站坐标格式：
+        #      "xyz"（默认，ECEF 米）或 "llh"（lat_deg, lon_deg, h_m）
+        base = None
+        if self.gnss_cfg.get("positioning_mode") == "rtk":
+            base_path = self._prepare_rinex(self.gnss_cfg["base_path"])
+            base = rn.rnx_decode(env.get_cfg())
+            base.decode_obsfile(nav, base_path, None)
+            if nav.rb[0] == 0:
+                nav_rb = base.pos
+
+        # 5. 创建处理器并运行
+        mode = self.gnss_cfg["positioning_mode"]
+        if mode == "spp":
+            processor = SppProcessor(nav)
+            self._run_spp_loop(processor, rov)
+        elif mode == "rtk":
+            processor = RtkProcessor(nav)
+            self._run_rtk_loop(processor, rov, base, nav, rn)
+
+    def _run_spp_loop(self, processor, rov):
+        """SPP 模式: 直接遍历 rover.obslist。"""
+        for obsr in rov.obslist:
+            if not self.control.is_running():
+                break
+            sol = processor.process_epoch(obsr)
+            if sol is not None:
+                self.output_queue.put(SensorData(tag="gnss_solution", gnss_solution=sol))
+
+    def _run_rtk_loop(self, processor, rov, base, nav, rn):
+        """RTK 模式: 用 first_obs/next_obs 做时间同步。"""
+        dir = 1  # forward
+        obsr, obsb = rn.first_obs(nav, rov, base, dir)
+        while True:
+            if not self.control.is_running():
+                break
+            if obsr == []:
+                break
+            sol = processor.process_epoch(obsr, obsb)
+            if sol is not None:
+                self.output_queue.put(SensorData(tag="gnss_solution", gnss_solution=sol))
+            obsr, obsb = rn.next_obs(nav, rov, base, dir)
+```
+
+**关键点**：
+- 文件读完后推入 `None` 作为 EOF sentinel（在 `run()` 的 `finally` 块中）
+- 支持临时简化 RINEX 文件（`_prepare_rinex`），处理完成后自动清理
+- SPP 模式直接遍历 `rov.obslist`，RTK 模式用 `first_obs`/`next_obs` 做时间同步
+
+#### 9.2.2 GnssSolSensor（外部结果模式，✅ 已实现）
+
+`src/stream/gnss_sol_sensor.py::GnssSolSensor` 是一个 `Thread` 子类，
+通过 `PosSolFormator` 解析 `.pos` 文件得到 `GnssSolution`，推入 `gnss_queue`：
+
+```python
+# src/stream/gnss_sol_sensor.py（简化示意）
+class GnssSolSensor(Thread):
+    """外部 GNSS 结果传感器线程。"""
+
+    def __init__(self, config: dict, output_queue: Queue, control: ThreadControl):
+        Thread.__init__(self, name="GnssSolSensor", daemon=True)
+        self.gnss_cfg = config["gnss"]
+        self.output_queue = output_queue
+        self.control = control
+
+    def run(self):
+        try:
+            formator = PosSolFormator(self.gnss_cfg)
+            for line in open(self.gnss_cfg["external_sol_path"]):
+                if not self.control.is_running():
+                    break
+                sol = formator.decode(line)
+                if sol is not None:
+                    self.output_queue.put(SensorData(tag="gnss_solution", gnss_solution=sol))
+        finally:
+            self.output_queue.put(None)  # EOF sentinel
+```
+
+### 9.3 前端策略类 — GnssPositioningStrategy（🚧 预留）
+
+> **当前未实现**：以下设计为 IMU 不可用降级时的预留方案。
+> 当前三种运行模式（`ins.enabled`：`off`/`on`/`tc`）中，`off` 模式下 `InternalGnssSensor` 直接产出 `GnssSolution` 推入队列，由 `SolutionLogger` 输出 `.pos` 文件；`on`/`tc` 模式下由 `LcStream`/`TcStream` 处理后经 `RSLTWriter` 输出 `.rslt`（100Hz）。
 
 将 GNSS 处理器封装为前端里程计策略（仅 IMU 不可用降级时启用），与 `ImuMechStrategy` 实现相同接口，可热切换：
 
 ```python
-from abc import ABC, abstractmethod
-
 class OdometryStrategy(ABC):
     """前端里程计算法策略基类（定义于 estimator.md）"""
-
     @abstractmethod
-    def execute(self, measurement) -> 'InsState':
-        """执行前端里程计解算，返回当前 INS 状态"""
-        ...
+    def execute(self, measurement) -> 'InsState': ...
 
 
 class GnssPositioningStrategy(OdometryStrategy):
-    """GNSS 纯解算前端策略（IMU 不可用降级时启用）
-
-    当无 IMU 或 IMU 不可用时，直接用 GNSS 解算结果产生里程计。
-    内部组合 GnssSolutionProvider，委托具体解算。
-    与 ImuMechStrategy 实现相同接口，框架可热切换。
-    """
-
+    """GNSS 纯解算前端策略（IMU 不可用降级时启用）"""
     def __init__(self, gnss_provider: 'GnssSolutionProvider'):
-        self._provider = gnss_provider  # 依赖注入
+        self._provider = gnss_provider
 
     def execute(self, measurement) -> 'InsState':
-        """执行 GNSS 纯解算，将定位结果转为 INS 状态"""
         solution = self._provider.get_solution(measurement.timestamp)
         return self._solution_to_state(solution)
-
-
-class SppStrategy(GnssPositioningStrategy):
-    """SPP 单点定位前端策略
-
-    封装 SppProcessor，适用于无基站、低成本场景。
-    精度：米级（~10m）
-    """
-
-    def __init__(self, options: dict):
-        super().__init__(GnssInternalProvider(SppProcessor(options), options))
-
-
-class RtkStrategy(GnssPositioningStrategy):
-    """RTK/RTD 差分定位前端策略
-
-    封装 RtkProcessor，RTD 为其退化模式。
-    精度：RTK 厘米级（~0.02m），RTD 分米级（~1m）
-    """
-
-    def __init__(self, options: dict):
-        super().__init__(GnssInternalProvider(RtkProcessor(options), options))
 ```
 
-### 9.3 前端策略热切换示例
+### 9.4 数据流与队列流水线时序
 
-```python
-# 正常模式：IMU 机械编排前端（后端融合由 LcIntegration 直接承担）
-odometry = ImuMechStrategy(ins_core, preprocessor)
-
-# IMU 故障：热切换为 GNSS 纯解算前端
-odometry = SppStrategy(options)
-# 或差分模式
-odometry = RtkStrategy(options)
-
-# 框架持有 OdometryStrategy 抽象引用，切换无需改动 LcIntegration
-integration._odometry_strategy = odometry
-```
-
-### 9.4 纯队列流水线 — GNSS 传感器（无 Subject 角色）
-
-GNSS 传感器继承 `BaseSensor`（**无 Subject 角色**），实现 `get_data()` 接口。
-**不持有观察者列表，无 attach/notify**；数据通过 `output_queue.put()` 推入下一级队列：
-
-```python
-class BaseSensor(ABC):
-    """传感器抽象基类（无 Subject 角色，定义于 StreamDesign.md）
-
-    仅强制 get_data() 接口，不维护观察者列表。
-    数据通过 output_queue.put() 推入下一级队列。
-    """
-
-    def __init__(self, name: str = ""):
-        self._name = name               # 传感器标识
-        # 注：不持有 _observers 列表，无 attach/detach/notify 方法
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    @abstractmethod
-    def get_data(self) -> 'SensorData':
-        """强制实现的传感器数据读取接口"""
-        ...
-
-
-class GnssRoverSensor(BaseSensor):
-    """GNSS 流动站原始观测值传感器（内部解算模式）
-
-    读取 Rover 原始观测值（伪距/载波/多普勒），
-    由 SensorFactory 动态创建，实现 get_data() 接口。
-    数据通过 output_queue.put() 推入 rover_queue。
-    """
-
-    def get_data(self) -> 'SensorData':
-        """读取一历元 GNSS 原始观测值，推入 output_queue"""
-        raw_obs = self._reader.read_epoch()
-        data = SensorData(tag="gnss_raw", gnss_meas=raw_obs)
-        self.output_queue.put(data)   # 推入队列，无 notify
-        return data
-
-
-class GnssSolSensor(BaseSensor):
-    """GNSS 外部结果传感器（外部结果模式）
-
-    读取外部 GNSS 定位结果文件（POS/NMEA/CSV），
-    由 SensorFactory 动态创建，实现 get_data() 接口。
-    数据通过 output_queue.put() 推入 gnss_sol_queue。
-    """
-
-    def get_data(self) -> 'SensorData':
-        """读取一条外部 GNSS 定位结果，推入 output_queue"""
-        sol = self._reader.read_solution()
-        data = SensorData(tag="gnss_solution", gnss_solution=sol)
-        self.output_queue.put(data)   # 推入队列，无 notify
-        return data
-```
-
-### 9.5 工厂模式创建 GNSS 传感器
-
-`SensorFactory` 根据配置动态创建 GNSS 传感器实例（参考 StreamDesign.md）：
-
-```python
-class SensorFactory:
-    """传感器工厂（参考 StreamDesign.md）"""
-
-    @staticmethod
-    def create(sensor_type: str, config: dict) -> BaseSensor:
-        if sensor_type == "gnss":
-            if config.get("gnss_source") == "external":
-                return GnssSolSensor(config)   # 外部结果模式
-            else:
-                return GnssRoverSensor(config) # 内部解算模式
-        elif sensor_type == "imu":
-            return ImuSensor(config)
-        # ...
-```
-
-### 9.6 数据流与队列流水线时序
+三种运行模式由 `ins.enabled` 配置项决定（`coupling_mode` 字段已移除）：
 
 ```
-内部解算模式:
-  GnssRoverSensor.run() 线程
-    → 读取原始观测值
-    → output_queue.put(SensorData(tag="gnss_raw"))   (推入 rover_queue)
-    → Scheduler 从 rover_queue 取数据
-    → estimate_queue.put(SensorData)                  (仅转发，不做时间对齐)
-    → LcIntegration.process_epoch(epoch_data)
-        → GnssInternalProvider.get_solution()        (SPP/RTD/RTK 解算)
-        → _gnss_update()                             (EKF 量测更新，仅作用 P1)
-        → 双滤波独立反馈
+模式 1：纯 GNSS (ins.enabled=off, 当前实现):
+  InternalGnssSensor.run() 线程
+    → RtklibEnv.setup() + init_nav()
+    → rnx_decode().decode_obsfile() / decode_nav()
+    → SppProcessor / RtkProcessor 逐历元 process_epoch()
+    → sol_to_gnss_solution(sol)
+    → output_queue.put(SensorData(tag="gnss_solution"))   (推入 gnss_queue)
+    → SolutionLogger 从 gnss_queue 取数据
+    → SolutionWriter.write(sol)                            (写 .pos 文件)
+    → 文件结束推入 None sentinel
 
-外部结果模式:
-  GnssSolSensor.run() 线程
-    → 读取外部定位结果
-    → output_queue.put(SensorData(tag="gnss_solution"))   (推入 gnss_sol_queue)
-    → Scheduler 从 gnss_sol_queue 取数据
-    → estimate_queue.put(SensorData)                      (仅转发，不做时间对齐)
-    → LcIntegration.process_epoch(epoch_data)
-        → GnssExternalProvider 直接返回外部结果
-        → _gnss_update()                                  (EKF 量测更新，仅作用 P1)
-        → 双滤波独立反馈
+模式 2：松组合 LC (ins.enabled=on, 当前实现):
+  InternalGnssSensor.run() 线程
+    → ... 同纯 GNSS 模式的解算流程 ...
+    → output_queue.put(SensorData(tag="gnss_solution"))   (推入 gnss_queue)
+  ImuSensor.run() 线程
+    → ImuFormator 逐行解析 IMU CSV
+    → output_queue.put(SensorData(tag="imu"))              (推入 imu_queue)
+  LcStream 处理流
+    → 时间对齐 + 单滤波 EKF (P)
+    → RSLTWriter.write()                                   (写 .rslt 文件, 100Hz)
+
+模式 3：紧组合 TC (ins.enabled=tc, 当前实现):
+  InternalGnssSensor.run() 线程
+    → ... 同纯 GNSS 模式的解算流程 ...
+    → output_queue.put(SensorData(tag="gnss_solution"))   (推入 gnss_queue)
+  ImuSensor.run() 线程
+    → ImuFormator 逐行解析 IMU CSV
+    → output_queue.put(SensorData(tag="imu"))              (推入 imu_queue)
+  TcStream 处理流
+    → 时间对齐 + 单滤波 EKF (P)
+    → RSLTWriter.write()                                   (写 .rslt 文件, 100Hz)
 ```
 
 **关键点**：
 - GNSS 数据通过 `queue.put()` 流转，**无 `notify()` 调用**
 - `LcIntegration` 从 `estimate_queue` 取数据，**无 `on_data()` 回调**
 - 后端融合（EKF + NHC + ZUPT）由 `LcIntegration` 直接承担，**无 `LcFusionStrategy` 中间层**
-- GNSS 量测仅作用于主滤波 P1，NHC 子滤波 P2 不直接使用 GNSS 量测
+- GNSS 量测作用于单滤波 P 矩阵
 
-### 9.7 OOP 三大特性体现
+### 9.5 OOP 三大特性体现
 
 | 特性 | 体现 |
 |------|------|
-| **封装** | GNSS 解算细节封装在 `GnssProcessor` 子类内部，外部仅通过策略接口或队列接口访问 |
-| **继承** | `GnssProcessor(ABC)` → `SppProcessor` / `RtkProcessor`；`GnssPositioningStrategy` → `SppStrategy` / `RtkStrategy`；`BaseModel(ABC)` → `CombDD` |
-| **多态** | 框架持有 `OdometryStrategy` 抽象引用，运行时调用 `SppStrategy` / `RtkStrategy` / `ImuMechStrategy` |
+| **封装** | GNSS 解算细节封装在 `GnssProcessor` 子类内部，外部仅通过队列接口访问；`InternalGnssSensor` 封装 RINEX 加载、简化、解算全流程 |
+| **继承** | `GnssProcessor(ABC)` → `SppProcessor` / `RtkProcessor`；`InternalGnssSensor` / `GnssSolSensor` 继承 `Thread` |
+| **多态** | `InternalGnssSensor` 根据 `positioning_mode` 动态创建 `SppProcessor` 或 `RtkProcessor`，调用统一的 `process_epoch()` 接口 |

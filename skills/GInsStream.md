@@ -1,8 +1,37 @@
 # GInsStream 整体代码框架
 
 > GNSS/INS 松/紧组合流式导航项目，基于纯 threading + 队列流水线流式读取架构，实现 SPP+RTK/NHC/ZUPT 松组合融合导航。
-> 矩阵运算使用 numpy，框架参考 gnss_ins_lc_nhc、GINav、GREAT-MSF，采用面向对象三大特性（封装/继承/多态）+ ABC 类继承体系设计，保留紧组合扩展接口。
-> **时间系统约定**：全框架统一使用 GPS 秒（GPST，since 1980-01-06），不使用 Unix epoch 或本地时间。所有时间戳字段（IMU/GNSS/Eph/Solution）均以 GPST 秒表示。
+> 矩阵运算使用 numpy，框架参考 GINav、GREAT-MSF。
+>
+> **⚠️ 架构更新说明（2026-07）**：
+> - 滤波器已从双滤波（P1/P2）迁移到**单滤波**架构，统一使用 `P`（维度 = `StateIndex.dim`，15~24 维）
+> - 不再使用 `InsKf(ABC)` 基类和 `OdometryStrategy`/`FusionStrategy` 策略层（YAGNI）
+> - `LcEstimator` / `LcIntegration` / `Nhc` 为普通类，不继承 ABC
+> - 状态索引由 `StateIndex` dataclass 管理（替代 `MainStateIndex`/`NhcSubStateIndex`）
+> - 已放弃比例因子误差估计
+> - 详见 [estimator.md](file:///home/mxl/workplace/gipylib/skills/estimator.md) 获取当前实现的权威描述
+> - 本文档中涉及 InsKf/P1/P2/OdometryStrategy 的描述为早期设计，仅供参考
+>
+> **时间系统约定**：全框架内部统一使用 **Unix 时间戳（float 秒，与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）**。
+> rtklib-py 的 `gtime_t.time` 即 Unix 整数秒，`gtime_t.sec` 为不足秒的小数部分。
+> 输入端（`formators.py`）通过 `gpst_to_unix(week, sow)` 把 GPS 周+周内秒转为 Unix 时间戳；
+> 输出端（`solution_writer.py` / `aligned_writer.py`）通过 `unix_to_gpst()` 转回 (week, sow) 写文件。
+> 时间转换工具：`src/core/time_utils.py`（`gpst_to_unix` / `unix_to_gpst`，`GPST_EPOCH_UNIX = 315964800`）。
+>
+> **当前实现状态**：
+> - ✅ 已实现：rtklib-py 已吸收到 `src/core/gnss/rtklib/`（7 个核心模块），通过 `_CfgProxy` 单例管理配置
+> - ✅ 已实现：`SppProcessor` / `RtkProcessor` 薄封装 rtklib-py 的 `pntpos` / `relpos`（SPP 含多普勒测速 `estvel` / `resdop`）
+> - ✅ 已实现：`InternalGnssSensor`（内部模式传感器线程）/ `GnssSolSensor`（外部模式传感器线程）
+> - ✅ 已实现：`ImuSensor` + `ImuFormator`（GPST 格式）/ `EuRoCImuFormator`（EuRoC 格式）双解码器（IMU CSV 流式读取，含 RFU→FRD 坐标系自动转换）+ `Aligner`（IMU 积攒 + GNSS 收割匹配）
+> - ✅ 已实现：`SolutionWriter` / `AlignedWriter` / `Logger` / `SolutionLogger`
+> - ✅ 已实现：三种运行模式——internal+off（纯 GNSS，输出 .pos）/ external+on（外部对齐 CSV）/ internal+on（内部对齐 CSV，实时解算+IMU 对齐）
+> - ✅ 已实现：`src/core/ins/initializer.py::InsInitializer`（INS 初始化，三种模式：静态 / 速度矢量 / 位置差分，三阈值检验，详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
+> - ✅ 已实现：`src/core/ins/` 下 `interpolator.py` / `earth_param.py` / `attitude.py`（初始化支撑模块）
+> - ✅ 已实现：单滤波 EKF `LcEstimator` / `LcIntegration`（StateIndex 参数块，最近邻时间对齐，详见 [estimator.md](file:///home/mxl/workplace/gipylib/skills/estimator.md)）
+> - ✅ 已实现：`src/core/ins/constraints.py::Constraints`（NHC/ZUPT/ZARU 约束，独立模块，参考 ignav 分离架构）
+> - ✅ 已实现：`src/core/ins/lc_runner.py::LcRunner`（松组合批处理运行器，路径 C 下由 `Logger` 在流式结束后调用，输出松组合 .pos）
+> - ✅ 已验证：路径 C 三文件输出（RTK.pos + aligned_internal_rtk.csv + RTKLC.pos），松组合结果与纯 GNSS 一致（planar <0.5m, elev <1m）
+> - 🚧 预留：紧组合接口 `TcEstimator` / `TcIntegration`（下一阶段实现）
 
 ### 设计模式总览
 
@@ -88,20 +117,20 @@ RTD 是 RTK 的退化模式（RTK 不进行模糊度固定，仅使用码双差�
 | **GNSS 模式** | SPP（初始化/单点）+ RTK（载波差分/码差分退化）+ 外部结果流 |
 | **NHC 约束** | v 系（车体坐标系）下侧向+垂向速度=0（2 维观测），需安装角旋转矩阵 R_b^v，由 NHC 子滤波估计 |
 | **ZUPT 约束** | 零速更新：检测车辆静止时将 3 维速度误差作为量测约束（与 NHC 互斥：静止用 ZUPT，运动用 NHC） |
-| **机械编排** | E 系（ECEF）下进行，参考 gnss_ins_lc_nhc |
+| **机械编排** | E 系（ECEF）下进行 |
 | **IMU 数据格式** | 增量式（Δθ/Δv）和速率式（ω/f）均支持 |
 | **时间对齐** | 增量切分（参考 KF-GINS `imuInterpolate`），4 种时间对齐情况处理；**时间对齐是重中之重**；无时间同步状态参数 |
-| **时间系统** | 全框架统一使用 GPS 秒（GPST，since 1980-01-06） |
+| **时间系统** | 全框架内部统一使用 Unix 时间戳（float 秒，与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）；输入端 `gpst_to_unix(week, sow)`，输出端 `unix_to_gpst()` |
 | **矩阵运算** | numpy |
 | **坐标系** | e 系：ECEF；b 系：IMU 本体 FRD；v 系：车体 FRD；n 系：导航系 ENU（仅输出用） |
-| **参考框架** | gnss_ins_lc_nhc（C++松组合+NHC+安装角）、GINav（MATLAB组合导航）、GREAT-MSF（C++类继承体系）、KF-GINS（增量切分时间对齐） |
+| **参考框架** | GINav（MATLAB组合导航）、GREAT-MSF（C++类继承体系）、KF-GINS（增量切分时间对齐） |
 | **设计模式** | 工厂模式（SensorFactory 创建传感器）、策略模式（前端里程计算法切换）、依赖注入（构造函数接收具体实例） |
 | **并发模型** | 纯 threading + `queue.Queue`（不使用 asyncio，不使用 shared_memory） |
 | **流式架构** | 参考 StreamDesign.md |
 
 ### 2.1 双滤波架构
 
-> 参考 gnss_ins_lc_nhc 的滤波架构设计。本项目采用**真正双滤波架构**，主滤波与 NHC 子滤波完全独立，各自维护状态向量、协方差矩阵、F/H/Q/R 矩阵和反馈机制。
+> 本项目采用**真正双滤波架构**，主滤波与 NHC 子滤波完全独立，各自维护状态向量、协方差矩阵、F/H/Q/R 矩阵和反馈机制。
 
 #### 2.1.1 主滤波（E 系，P1 矩阵）
 
@@ -167,7 +196,7 @@ P1 反馈：修正 δr^e, δv^e,          P2 反馈：修正 δθ_imu, δl_imu
 - `estimate_imu_leverarm: true` → 启用 NHC 子滤波的 IMU 杆臂估计（3维）
 - `estimate_gnss_leverarm: false` → 主滤波估计 GNSS 杆臂（3维，默认关闭）
 - 当 `estimate_imu_angle=false` 且 `estimate_imu_leverarm=false` 时，NHC 子滤波不运行，NHC 直接使用固定安装角和杆臂
-- 安装角只有 2 维（pitch, yaw），roll 假设为 0（参考 gnss_ins_lc_nhc）
+- 安装角只有 2 维（pitch, yaw），roll 假设为 0
 - **不包含时间同步参数**：本项目通过 KF-GINS 增量切分方案精确对齐 IMU/GNSS 时间
 
 #### 2.1.5 安装角与 NHC 的关系
@@ -196,11 +225,11 @@ NHC 约束（v 系下）：
   v_right_v  = 0  →  侧向速度约束
   v_down_v   = 0  →  垂向速度约束
 
-观测方程（参考 gnss_ins_lc_nhc odo.md）：
+观测方程：
   Z_nhc = [v_right_v; v_down_v] = [0; 0]
 ```
 
-**双滤波下的 H 矩阵分离**（参考 gnss_ins_lc_nhc navstate.cc:343-353）：
+**双滤波下的 H 矩阵分离**：
 
 NHC 量测同时依赖主滤波状态（δv^e、δφ^e、δb_g）和 NHC 子滤波状态（δθ_imu、δl_imu）。
 为保持两套 P 矩阵独立，将 H 矩阵拆分为两部分：
@@ -325,120 +354,125 @@ NHC 子滤波贡献 H2（作用到 P2，仅更新 P2 中安装角/杆臂部分�
 
 ## 4. 目录结构
 
+> **说明**：以下为实际实现的目录结构。✅ 标记已实现，🚧 标记预留（当前未实现）。
+
 ```
-GInsStream/
+gipylib/
 ├── skills/                        # 指导文档
 │   ├── GInsStream.md              # 本文件：整体代码框架
-│   ├── StreamDesign.md            # 流式读取框架设计（已完成）
-│   ├── gnss.md                    # GNSS 二次修改指导
+│   ├── StreamDesign.md            # 流式读取框架设计
+│   ├── gnss.md                    # GNSS 算法架构设计
 │   ├── imu.md                     # IMU 机械编排方案
 │   ├── estimator.md               # 融合估计指导方案
-│   └── logANDoutput.md            # 日志流和输出结果流方案
+│   ├── logANDoutput.md            # 日志流和输出结果流方案
+│   └── conf.md                    # 配置文件说明
 │
-├── library/                       # 参考代码库（不修改）
-│   ├── rtklib-py/                 # GNSS 解算参考
+├── library/                       # 参考代码库（不修改，不导入）
+│   ├── rtklib-py/                 # GNSS 解算参考（已吸收到 src/core/gnss/rtklib/）
 │   └── pyrinex/                   # RINEX 解码参考
 │
-├── tools/                         # 组合导航参考代码（不修改）
+├── tools/                         # 组合导航参考代码（不修改，不导入）
 │   ├── GINav/                     # MATLAB 组合导航
-│   ├── gnss_ins_lc_nhc/          # C++ 松组合+NHC（主要参考）
 │   └── GREAT-MSF-main/           # C++ 类继承体系参考（ABC模式）
+│
+├── data/                          # 测试数据 + 配置
+│   ├── config.yaml                # 统一配置文件
+│   ├── cpt0870.19o                # 流动站 RINEX 观测文件
+│   ├── cpt0870_base.19o           # 基站 RINEX 观测文件
+│   ├── brdm0870.19p               # 星历文件
+│   ├── cpt_imu.csv                # IMU 数据文件
+│   └── spp.pos                    # 外部 GNSS 结果文件（示例）
+│
+├── output/                        # 输出目录
+│   ├── test_spp.pos               # SPP 解算结果（internal+spp+off 模式）
+│   ├── test_rtk.pos               # RTK 解算结果（internal+rtk+off 模式）
+│   ├── aligned.csv                # 对齐块状输出（external+on 模式）
+│   └── aligned_internal_rtk.csv   # 对齐块状输出（internal+on 模式，实时 RTK+IMU）
 │
 ├── src/                           # 具体代码实现
 │   ├── __init__.py
-│   ├── main.py                    # 主入口
+│   ├── main.py                    # ✅ 主入口（三种运行模式装配：路径 A/B/C）
 │   │
-│   ├── stream/                    # 传感器抽象层 + 流式读取（参考 StreamDesign.md）
+│   ├── stream/                    # ✅ 传感器抽象层 + 流式读取
 │   │   ├── __init__.py
-│   │   ├── base_sensor.py         # BaseSensor 传感器抽象基类（强制 get_data）
-│   │   ├── sensor_factory.py      # SensorFactory 工厂模式动态创建传感器
-│   │   ├── streamer_base.py       # StreamerBase 文件流读取基类（继承 BaseSensor，仅 queue.put）
-│   │   ├── formator_base.py       # FormatorBase 自定义解码接口
-│   │   ├── imu_sensor.py          # ImuSensor IMU 传感器
-│   │   ├── rover_sensor.py        # GnssRoverSensor 流动站传感器（内部模式）
-│   │   ├── eph_sensor.py          # EphSensor 星历传感器（内部模式）
-│   │   ├── ref_sensor.py          # GnssRefSensor 基准站传感器（内部模式）
-│   │   ├── gnss_sol_sensor.py     # GnssSolSensor 外部 GNSS 结果传感器（外部模式）
-│   │   └── formators/             # Formator 实现
-│   │       ├── __init__.py
-│   │       ├── my_imu_formator.py
-│   │       ├── my_rover_formator.py
-│   │       ├── my_eph_formator.py
-│   │       ├── my_ref_formator.py
-│   │       ├── my_gnss_sol_formator.py  # 外部GNSS结果解码（外部模式）
-│   │       ├── rinex_obs_formator.py
-│   │       └── rinex_nav_formator.py
-│   │
-│   ├── integration/               # 数据集成层（参考 StreamDesign.md）
-│   │   ├── __init__.py
-│   │   ├── scheduler.py           # 调度器（仅转发到 estimate_queue，不做时间对齐）
-│   │   ├── ephemeris_buffer.py    # 星历缓冲区
-│   │   └── init_state.py          # 初始化状态枚举
+│   │   ├── base.py                # ✅ BaseSensor 传感器抽象基类（强制 get_data）
+│   │   ├── factory.py             # ✅ SensorFactory 工厂模式动态创建传感器
+│   │   ├── formators.py           # ✅ ImuFormator (GPST) / EuRoCImuFormator (EuRoC) / PosSolFormator (rtklib POS) 解码器
+│   │   ├── imu_sensor.py          # ✅ ImuSensor IMU 传感器线程
+│   │   ├── gnss_sol_sensor.py     # ✅ GnssSolSensor 外部 GNSS 结果传感器线程
+│   │   └── internal_gnss_sensor.py # ✅ InternalGnssSensor 内部 GNSS 解算传感器线程
 │   │
 │   ├── core/                      # 核心解算相关代码
 │   │   ├── __init__.py
+│   │   ├── thread_control.py      # ✅ ThreadControl 线程控制
+│   │   ├── time_utils.py          # ✅ 时间转换（gpst_to_unix / unix_to_gpst）
+│   │   ├── data_types.py          # ✅ 核心数据类型（ImuMeasurement / GnssSolution / SensorData / AlignedBlock）
 │   │   │
-│   │   ├── strategy/              # 策略模式（仅前端里程计算法切换）
+│   │   ├── gnss/                  # ✅ GNSS 解算模块
 │   │   │   ├── __init__.py
-│   │   │   ├── odometry_strategy.py  # OdometryStrategy 前端策略基类
-│   │   │   └── imu_mech_strategy.py  # ImuMechStrategy IMU 机械编排前端
+│   │   │   ├── gnss_processor.py  # ✅ GnssProcessor(ABC) 抽象基类
+│   │   │   ├── spp_processor.py   # ✅ SppProcessor 薄封装 rtklib-py pntpos
+│   │   │   ├── rtk_processor.py   # ✅ RtkProcessor 薄封装 rtklib-py relpos
+│   │   │   ├── solution_converter.py # ✅ sol_to_gnss_solution（rtklib-py Sol → GnssSolution）
+│   │   │   ├── rtklib_config_adapter.py # ✅ RtklibEnv + build_params（YAML → rtklib-py 配置注入）
+│   │   │   └── rtklib/            # ✅ rtklib-py 已吸收的子包（相对导入 + _CfgProxy 单例）
+│   │   │       ├── __init__.py
+│   │   │       ├── config.py      # ✅ _CfgProxy 单例配置管理
+│   │   │       ├── ephemeris.py   # ✅ 星历计算
+│   │   │       ├── mlambda.py     # ✅ MLAMBDA 模糊度解算
+│   │   │       ├── pntpos.py      # ✅ SPP 单点定位
+│   │   │       ├── postpos.py     # ✅ 后处理驱动
+│   │   │       ├── rinex.py       # ✅ RINEX 解码
+│   │   │       ├── rtkcmn.py      # ✅ 通用工具（坐标变换、时间等）
+│   │   │       └── rtkpos.py      # ✅ RTK 相对定位
 │   │   │
-│   │   ├── gnss/                  # GNSS 解算模块
-│   │   │   ├── __init__.py
-│   │   │   ├── base_model.py      # BaseModel 抽象基类（参考 t_gbasemodel）
-│   │   │   ├── comb_model.py      # CombModel → CombDD 组合观测模型（参考 t_gcombmodel/t_gcombDD）
-│   │   │   ├── satpos.py          # 卫星位置/速度计算
-│   │   │   ├── spp.py             # SppProcessor（参考 t_gspp）
-│   │   │   ├── rtk.py             # RtkProcessor（参考 t_gpvtflt，含RTD退化模式）
-│   │   │   ├── ephemeris.py       # 星历管理（选择/插值）
-│   │   │   ├── troposphere.py     # 对流层改正
-│   │   │   ├── ionosphere.py      # 电离层改正
-│   │   │   ├── sat_az_el.py       # 卫星方位角/仰角
-│   │   │   └── coord_transform.py # 坐标变换工具
+│   │   ├── ins/                   # ✅ IMU/INS 模块（已实现，单滤波架构）
+│   │   │   ├── initializer.py     # ✅ InsInitializer INS 初始化（三种模式 + 三阈值检验）
+│   │   │   ├── interpolator.py    # ✅ IMU/GNSS 时间对齐插值
+│   │   │   ├── earth_param.py     # ✅ 地球参数（重力、自转角速度等）
+│   │   │   ├── attitude.py        # ✅ 姿态表示与转换（四元数/欧拉角/DCM）
+│   │   │   ├── state_index.py     # ✅ StateIndex 状态参数块管理（15~24 维）
+│   │   │   ├── transfer_matrix.py # ✅ TransferMatrix 状态转移矩阵 Φ + 过程噪声 Q
+│   │   │   ├── ins_propagate.py   # ✅ INS 机械编排（姿态/速度/位置递推）
+│   │   │   ├── ins_update.py      # ✅ 量测更新逻辑
+│   │   │   ├── lc_estimator.py    # ✅ LcEstimator 单滤波松组合 EKF（StateIndex 参数块）
+│   │   │   ├── lc_integration.py  # ✅ LcIntegration 松组合集成（逐 IMU 触发 + 抽取）
+│   │   │   ├── lc_runner.py       # ✅ LcRunner 松组合批处理运行器（路径 C 输出 RTKLC.pos）
+│   │   │   ├── constraints.py     # ✅ Constraints NHC/ZUPT/ZARU 约束（独立模块，参考 ignav）
+│   │   │   └── static_detect.py   # ✅ 静态检测（GLRT/MV/MAG/ARE/ALL + 滑动窗口）
 │   │   │
-│   │   ├── imu/                   # IMU/INS 模块
-│   │   │   ├── __init__.py
-│   │   │   ├── ins_core.py        # InsCore INS核心（参考 t_gsins）
-│   │   │   ├── ins_kf.py          # InsKf 卡尔曼滤波基类（参考 t_gsinskf）
-│   │   │   ├── imu_preprocess.py  # ImuPreprocessor 预处理基类
-│   │   │   ├── interpolator.py    # Interpolator 插值基类（参考 t_ginterp）
-│   │   │   ├── ins_init.py        # INS 初始化（粗对准+精对准）
-│   │   │   ├── earth_param.py     # 地球参数（重力、自转角速度等）
-│   │   │   └── attitude.py        # 姿态表示与转换（四元数/欧拉角/DCM）
-│   │   │
-│   │   └── estimator/             # 融合估计模块
-│   │       ├── __init__.py
-│   │       ├── integration.py     # Integration 组合导航集成基类（参考 t_gintegration）
-│   │       ├── ekf.py             # EKF 滤波器核心（预测+更新，双滤波）
-│   │       ├── lc_estimator.py    # LcEstimator 松组合估计器（持有 P1/P2 双矩阵）
-│   │       ├── lc_measurement.py  # 松组合量测更新（GNSS位置/速度、NHC、ZUPT）
-│   │       ├── lc_feedback.py     # 松组合反馈（主滤波反馈+子滤波反馈独立）
-│   │       ├── nhc.py             # NHC 约束实现（H1/H2 拆分）
-│   │       ├── zupt.py            # ZUPT 零速更新实现（零速检测+速度约束，仅作用 P1）
-│   │       ├── state_vector.py    # 双滤波状态索引 MainStateIndex / NhcSubStateIndex
-│   │       └── tc_interface.py    # 紧组合预留接口
+│   │   └── estimator/             # 🚧 融合估计模块（历史设计，实际已并入 src/core/ins/）
+│   │       ├── integration.py     # 🚧 （已实现为 ins/lc_integration.py）
+│   │       ├── lc_estimator.py    # 🚧 （已实现为 ins/lc_estimator.py）
+│   │       ├── nhc.py             # 🚧 （已合并入 ins/constraints.py）
+│   │       ├── zupt.py            # 🚧 （已合并入 ins/constraints.py）
+│   │       └── tc_interface.py    # 🚧 紧组合预留接口
 │   │
-│   ├── log/                       # 日志输出流
+│   ├── log/                       # ✅ 日志输出流
 │   │   ├── __init__.py
-│   │   ├── logger.py              # 日志记录器（消费 solution_queue）
-│   │   ├── writer_base.py         # WriterBase 输出器抽象基类
-│   │   ├── solution_writer.py     # SolutionWriter 解算结果输出
-│   │   ├── trace_writer.py        # TraceWriter 运行轨迹/调试输出
-│   │   └── raw_data_writer.py     # RawDataWriter 原始数据记录
+│   │   ├── logger.py              # ✅ Logger（external+on 模式，消费 imu_queue + gnss_queue）
+│   │   ├── solution_logger.py     # ✅ SolutionLogger（internal+off 模式，消费 gnss_queue）
+│   │   ├── writer_base.py         # ✅ WriterBase 输出器抽象基类
+│   │   ├── solution_writer.py     # ✅ SolutionWriter rtklib 风格 .pos 输出
+│   │   ├── aligned_writer.py      # ✅ AlignedWriter 对齐块状 CSV 输出
+│   │   ├── aligner.py             # ✅ Aligner IMU 积攒 + GNSS 收割的匹配器
+│   │   ├── trace_writer.py        # 🚧 TraceWriter 运行轨迹/调试输出（预留）
+│   │   └── raw_data_writer.py     # 🚧 RawDataWriter 原始数据记录（预留）
 │   │
-│   └── utility/                   # 工具
+│   ├── tools/                     # ✅ 辅助工具
+│   │   ├── __init__.py
+│   │   ├── verify_rtklib_py.py    # ✅ 直接运行 rtklib-py 出参考结果
+│   │   └── compare_pos.py         # ✅ 逐历元 .pos 文件比对
+│   │
+│   └── utility/                   # ✅ 工具
 │       ├── __init__.py
-│       ├── data_types.py          # 核心数据类型定义
-│       ├── thread_control.py      # 线程控制
-│       └── config.py              # 配置解析
-│
-├── config/                        # 配置文件
-│   └── default.yaml               # 默认配置
+│       ├── config_loader.py       # ✅ 配置解析（data/config.yaml）
+│       └── rinex_simplifier.py    # ✅ RINEX 简化器
 │
 └── tests/                         # 测试
-    ├── test_gnss/
-    ├── test_imu/
-    └── test_estimator/
+    ├── test_gnss/                 # ✅ GNSS 模块测试
+    ├── test_imu/                  # 🚧 IMU 模块测试（预留）
+    └── test_estimator/            # 🚧 Estimator 模块测试（预留）
 ```
 
 ---
@@ -1268,11 +1302,11 @@ class RawDataWriter(WriterBase):
 ```python
 @dataclass
 class InsState:
-    """主滤波 INS 导航状态（E 系下，参考 gnss_ins_lc_nhc NavInfo）
+    """主滤波 INS 导航状态（E 系下)
 
     对应主滤波 P1 矩阵，状态向量 x1 = [δr^e, δv^e, δφ^e, δb_g, δb_a, (δl_gnss)]
     """
-    timestamp: float                     # 当前时间戳 (s, GPST)
+    timestamp: float                     # 当前时间戳 (s, Unix 时间戳，与 rtklib-py gtime_t 一致)
     position: np.ndarray                 # [3] 位置 (ECEF, m)
     velocity: np.ndarray                 # [3] 速度 (ECEF, m/s)
     attitude: np.ndarray                 # [4] 姿态四元数 q_be (b系到e系)
@@ -1295,7 +1329,7 @@ class NhcSubState:
     对应 NHC 子滤波 P2 矩阵，状态向量 x2 = [δθ_imu(2), δl_imu(3)]
     与主滤波 P1 矩阵完全独立，互不耦合。
     """
-    timestamp: float                     # 当前时间戳 (s, GPST，与主滤波同步)
+    timestamp: float                     # 当前时间戳 (s, Unix 时间戳，与主滤波同步)
     imu_angle: np.ndarray                # [2] IMU安装角 (pitch, yaw) (rad)
     imu_leverarm: np.ndarray             # [3] IMU杆臂 (b系) (m)
     imu_angle_rotation: np.ndarray       # [3,3] R_b^v 安装角旋转矩阵
@@ -1308,11 +1342,28 @@ class NhcSubState:
 
 ### 6.2 GNSS 解算结果
 
+> **实际实现**（参考 `src/core/data_types.py`）：
+
 ```python
 @dataclass
 class GnssSolution:
-    """GNSS 解算结果（松组合量测输入）"""
-    timestamp: float                     # 解算时间戳 (s)
+    """外部 GNSS 结果。"""
+    timestamp: float          # Unix 时间戳（秒，与 rtklib-py gtime_t 一致）
+    week: int                 # GPS 周号（由 timestamp 派生，便利字段）
+    position: np.ndarray      # [3] ECEF (m)
+    quality: int              # 1=SPP, 2=RTD, 5=LC（与 rtklib SOLQ_* 一致）
+    num_sv: int               # 使用卫星数
+    sd: np.ndarray            # [3] 位置标准差 (sdx, sdy, sdz)
+    cov: Optional[np.ndarray] = None  # [3,3] ECEF 协方差矩阵（可选，含非对角项）
+```
+
+> **早期设计版本**（含速度/PDOP/status 等字段，当前未实现，预留 INS 启用后扩展）：
+
+```python
+@dataclass
+class GnssSolution_Ext:
+    """GNSS 解算结果（松组合量测输入，预留扩展）"""
+    timestamp: float                     # Unix 时间戳 (s)
     position: np.ndarray                 # [3] 位置 (ECEF m)
     velocity: Optional[np.ndarray]       # [3] 速度 (ECEF m/s, 可选)
     pos_covariance: Optional[np.ndarray] # [3,3] 位置协方差
@@ -1356,18 +1407,29 @@ class EkfMeasurement:
 
 ### 7.3 core/gnss/ — GNSS 解算模块
 
-| 文件 | 职责 | 主要类/接口 |
-|------|------|------------|
-| `base_model.py` | 观测模型抽象基类 | `BaseModel.cmb_equ()` |
-| `comb_model.py` | 组合观测模型（单一分支） | `CombDD` |
-| `satpos.py` | 卫星位置/速度计算 | `satpos(time, eph) -> (pos, vel, clk)` |
-| `spp.py` | SPP 处理器 | `SppProcessor.process_epoch()` |
-| `rtk.py` | RTK 处理器（含RTD退化） | `RtkProcessor.process_epoch()` |
-| `ephemeris.py` | 星历管理 | `select_eph(time, sat, eph_buffer) -> Eph` |
-| `troposphere.py` | 对流层改正 | `tropcorr(time, pos, el) -> (dry_zpd, wet_zpd, map_func)` |
-| `ionosphere.py` | 电离层改正 | `ioncorr(time, pos, sat, el) -> ion_delay` |
-| `sat_az_el.py` | 卫星方位角/仰角 | `satazel(pos, sat_pos) -> (az, el)` |
-| `coord_transform.py` | 坐标变换 | `ecef2pos(), pos2ecef(), ecef2enu(), enu2ecef()` |
+> **实际实现**（rtklib-py 已吸收，不重新实现算法）：
+
+| 文件 | 职责 | 实现状态 |
+|------|------|---------|
+| `gnss_processor.py` | `GnssProcessor(ABC)` 抽象基类，定义 `process_epoch(obsr, obsb)` 接口 | ✅ 已实现 |
+| `spp_processor.py` | `SppProcessor` 薄封装 rtklib-py `pntpos(obsr, nav)` | ✅ 已实现 |
+| `rtk_processor.py` | `RtkProcessor` 薄封装 rtklib-py `relpos(nav, obsr, obsb, sol)`，含跨历元状态管理 | ✅ 已实现 |
+| `solution_converter.py` | `sol_to_gnss_solution(sol)` 把 rtklib-py `Sol` 转为本项目 `GnssSolution` | ✅ 已实现 |
+| `rtklib_config_adapter.py` | `RtklibEnv` + `build_params()` 把 YAML 配置注入 rtklib-py `_CfgProxy` 单例 | ✅ 已实现 |
+| `rtklib/` 子包 | rtklib-py 已吸收的 7 个核心模块（`config`/`ephemeris`/`mlambda`/`pntpos`/`postpos`/`rinex`/`rtkcmn`/`rtkpos`） | ✅ 已实现 |
+
+> **早期设计版本**（含 `base_model.py`/`comb_model.py`/`satpos.py` 等，当前未实现，预留紧组合扩展）：
+>
+> | 文件 | 职责 | 状态 |
+> |------|------|------|
+> | `base_model.py` | 观测模型抽象基类 `BaseModel.cmb_equ()` | 🚧 预留 |
+> | `comb_model.py` | 组合观测模型 `CombDD` | 🚧 预留 |
+> | `satpos.py` | 卫星位置/速度计算 | 🚧 预留（当前由 rtklib-py 内部完成） |
+> | `ephemeris.py` | 星历管理 | 🚧 预留（当前由 rtklib-py 内部完成） |
+> | `troposphere.py` | 对流层改正 | 🚧 预留（当前由 rtklib-py 内部完成） |
+> | `ionosphere.py` | 电离层改正 | 🚧 预留（当前由 rtklib-py 内部完成） |
+> | `sat_az_el.py` | 卫星方位角/仰角 | 🚧 预留（当前由 rtklib-py 内部完成） |
+> | `coord_transform.py` | 坐标变换工具 | 🚧 预留（当前直接调用 rtklib-py `rtkcmn.py` 函数） |
 
 **详细指导**：见 [gnss.md](gnss.md)
 
@@ -1403,13 +1465,18 @@ class EkfMeasurement:
 
 ### 7.6 log/ — 日志输出流
 
-| 文件 | 职责 | 主要类/接口 |
-|------|------|------------|
-| `logger.py` | 日志记录器 | `Logger.run()` 线程主循环 |
-| `writer_base.py` | 输出器抽象基类 | `WriterBase.write()`, `WriterBase.write_header()` |
-| `solution_writer.py` | 解算结果输出 | `SolutionWriter` |
-| `trace_writer.py` | 运行轨迹/调试输出 | `TraceWriter` |
-| `raw_data_writer.py` | 原始数据记录 | `RawDataWriter` |
+> **实际实现**：
+
+| 文件 | 职责 | 实现状态 |
+|------|------|---------|
+| `logger.py` | `Logger` 线程（external+on 模式，消费 imu_queue + gnss_queue，调用 Aligner 匹配后写 AlignedWriter） | ✅ 已实现 |
+| `solution_logger.py` | `SolutionLogger` 线程（internal+off 模式，消费 gnss_queue，写 SolutionWriter） | ✅ 已实现 |
+| `writer_base.py` | `WriterBase` 输出器抽象基类 | ✅ 已实现 |
+| `solution_writer.py` | `SolutionWriter` rtklib 风格 .pos 输出（Unix → week/sow 转换） | ✅ 已实现 |
+| `aligned_writer.py` | `AlignedWriter` 对齐块状 CSV 输出（IMU + GNSS 对齐后写文件） | ✅ 已实现 |
+| `aligner.py` | `Aligner` IMU 积攒 + GNSS 收割的匹配器（基于 Unix 时间戳） | ✅ 已实现 |
+| `trace_writer.py` | `TraceWriter` 运行轨迹/调试输出 | 🚧 预留 |
+| `raw_data_writer.py` | `RawDataWriter` 原始数据记录 | 🚧 预留 |
 
 **详细指导**：见 [logANDoutput.md](logANDoutput.md)
 
@@ -1468,7 +1535,7 @@ gnss.pos ──→ GnssSolStreamer → gnss_sol_q┘    (时间对齐)     (EKF�
                                                          └──────────┘
 ```
 
-### 8.2 松组合处理流程（双滤波，参考 gnss_ins_lc_nhc + KF-GINS）
+### 8.2 松组合处理流程（双滤波，参考 KF-GINS）
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -1488,7 +1555,7 @@ gnss.pos ──→ GnssSolStreamer → gnss_sol_q┘    (时间对齐)     (EKF�
 │     │  增量式/速率式 → 标准化格式                                     │
 │     ▼                                                                │
 │  4. INS 机械编排（InsCore.update，E 系）                             │
-│     │  姿态→速度→位置更新（参考 gnss_ins_lc_nhc navmech.cc）          │
+│     │  姿态→速度→位置更新                                                    │
 │     ▼                                                                │
 │  5. 主滤波 EKF 时间更新（P1 矩阵）                                   │
 │     │  x1_pred = x1 + F1 * dt * dx1                                  │
@@ -1581,27 +1648,38 @@ gnss.pos ──→ GnssSolStreamer → gnss_sol_q┘    (时间对齐)     (EKF�
 
 **详细指导**：见 [gnss.md](gnss.md)
 
-### 9.2 src/core/imu/
+### 9.2 src/core/ins/
 
-**职责**：实现 INS 机械编排和初始化，支持增量式和速率式 IMU 数据，提供数据插值功能。
+**职责**：实现 INS 初始化、机械编排与松组合 EKF 融合，支持增量式和速率式 IMU 数据，提供数据插值功能。
 
-**关键实现**：
-1. InsCore：INS 核心，参考 GREAT-MSF t_gsins（姿态/速度/位置更新）
-2. InsKf：INS 卡尔曼滤波基类，参考 GREAT-MSF t_gsinskf（Ft/Hk/时间更新/量测更新/反馈）
-3. IMU 预处理：增量式↔速率式转换（ImuPreprocessor 抽象体系）
-4. 数据插值：参考 GREAT-MSF t_ginterp，实现 IMU/GNSS 时间对齐
-5. 初始化：粗对准（静态/动态）+ EKF 精对准
-6. 地球参数和姿态表示工具
+> **架构更新（2026-07）**：单滤波架构已实现，估计器模块已并入 `src/core/ins/`（不再使用独立的 `src/core/estimator/` 目录）。下文 `InsCore`/`ImuPreprocessor`/`ImuMechanizer` 为早期预留设计，实际已由 `lc_estimator.py` / `lc_integration.py` / `transfer_matrix.py` / `constraints.py` / `lc_runner.py` / `static_detect.py` 替代。详见 [estimator.md](file:///home/mxl/workplace/gipylib/skills/estimator.md)。
 
-**详细指导**：见 [imu.md](imu.md)
+**关键实现**（已实现）：
+1. ✅ `InsInitializer`：INS 初始化，三种模式（静态 / 速度矢量 / 位置差分）+ 三阈值检验（详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
+2. ✅ `interpolator.py`：IMU/GNSS 时间对齐插值（`is_to_update` / `imu_interpolate` / `find_bracket_imus`，参考 KF-GINS `imuInterpolate`）
+3. ✅ `earth_param.py`：WGS84 地球参数、`ecef2llh` / `llh2ecef` / `cal_Ce2n` / `gravity_ecef`
+4. ✅ `attitude.py`：姿态表示与转换（`euler2dcm` / `dcm2quat` / `att_caln2e` 等）
+5. ✅ `state_index.py`：StateIndex 状态参数块管理（15~24 维，替代 MainStateIndex/NhcSubStateIndex）
+6. ✅ `transfer_matrix.py`：状态转移矩阵 Φ + 过程噪声 Q 构造（读取 `pos_psd` / `gyro_psd` / `accel_psd` 等配置）
+7. ✅ `ins_propagate.py`：INS 机械编排（姿态/速度/位置递推，参考 KF-GINS/GINav）
+8. ✅ `ins_update.py`：量测更新逻辑
+9. ✅ `lc_estimator.py`：单滤波松组合 EKF（StateIndex 参数块，Joseph 更新）
+10. ✅ `lc_integration.py`：松组合集成（逐 IMU 触发 + 抽取，NHC/ZUPT/ZARU 互斥约束）
+11. ✅ `lc_runner.py`：松组合批处理运行器（路径 C 下由 Logger 在流式结束后调用，输出 RTKLC.pos）
+12. ✅ `constraints.py`：NHC/ZUPT/ZARU 约束（独立模块，参考 ignav 分离架构）
+13. ✅ `static_detect.py`：静态检测（GLRT/MV/MAG/ARE/ALL + 滑动窗口）
 
-### 9.3 src/core/estimator/
+**详细指导**：见 [imu.md](imu.md) 与 [estimator.md](estimator.md)
 
-**职责**：实现真正双滤波松组合 EKF（主滤波 P1 15/18 维 + NHC 子滤波 P2 5 维），含 NHC 约束（H1/H2 拆分），保留紧组合接口。采用 Integration 抽象体系。**时间同步与 IMU 插值逻辑由估计器内部处理**（参考 KF-GINS 增量切分方案，**时间对齐是重中之重**）。
+### 9.3 src/core/estimator/（历史设计，已并入 src/core/ins/）
+
+> **架构更新（2026-07）**：双滤波（P1/P2）已迁移为**单滤波**架构（统一使用 `P`，维度 = `StateIndex.dim`，15~24 维），估计器模块已并入 `src/core/ins/` 目录。下文双滤波/InsKf/P1/P2 描述为早期设计，仅供参考。当前实现详见 [estimator.md](file:///home/mxl/workplace/gipylib/skills/estimator.md)。
+
+**职责**：~~实现真正双滤波松组合 EKF（主滤波 P1 15/18 维 + NHC 子滤波 P2 5 维）~~ → 已实现为单滤波松组合 EKF（`LcEstimator`，StateIndex 参数块，15~24 维），含 NHC/ZUPT/ZARU 约束（独立模块 `constraints.py`），保留紧组合接口。**时间同步与 IMU 插值逻辑由估计器内部处理**（参考 KF-GINS 增量切分方案，**时间对齐是重中之重**）。
 
 **关键实现**：
 1. Integration：组合导航集成基类，参考 GREAT-MSF t_gintegration
-2. LcEstimator：松组合估计器（InsKf 子类，持有 P1/P2 双矩阵），参考 t_gsinskf + gnss_ins_lc_nhc navfilter.cc
+2. LcEstimator：松组合估计器（InsKf 子类，持有 P1/P2 双矩阵），参考 t_gsinskf
 3. 主滤波 F1/Q1 + NHC 子滤波 F2/Q2（参考 navmech.cc 中的 F 矩阵构造）
 4. 松组合量测更新：GNSS 位置/速度（更新 P1）+ NHC（H1 更新 P1，H2 更新 P2）+ ZUPT（仅更新 P1）
 5. 双滤波反馈机制：主滤波反馈（修正 δr^e/δv^e/δφ^e/δb_g/δb_a/δl_gnss）+ 子滤波反馈（修正 δθ_imu/δl_imu）
@@ -1632,8 +1710,10 @@ gnss.pos ──→ GnssSolStreamer → gnss_sol_q┘    (时间对齐)     (EKF�
 # 运行模式
 gnss_source: "internal"          # "internal" (内部GNSS解算) / "external" (外部GNSS结果文件)
 
-# 时间系统（全框架统一）
-time_system: "gpst"              # 固定 GPST (since 1980-01-06)，不接受其他值
+# 时间系统（全框架内部统一使用 Unix 时间戳）
+time_system: "unix"              # 内部统一 Unix 时间戳（与 rtklib-py gtime_t.time + gtime_t.sec 一致）
+                                 # 输入端 formators.py 通过 gpst_to_unix(week, sow) 转换
+                                 # 输出端 solution_writer.py / aligned_writer.py 通过 unix_to_gpst() 转回 (week, sow)
 
 # 前端策略（仅前端策略切换，无后端策略）
 strategy:
@@ -1701,9 +1781,9 @@ estimator:
   zupt_acc_threshold: 0.5         # 零速检测加速度阈值 (m/s²)
   zupt_gyro_threshold: 0.05       # 零速检测角速度阈值 (rad/s)
   zupt_min_static_window: 1.0     # 零速检测最小静止窗口 (s)
-  # IMU安装角初始值（参考 gnss_ins_lc_nhc 的 initial_imu_angle）
+  # IMU安装角初始值
   initial_imu_angle: [0.0, 0.0]   # IMU安装角初始值 (度, pitch/yaw)
-  # IMU杆臂初始值（参考 gnss_ins_lc_nhc 的 initial_imu_leverarm）
+  # IMU杆臂初始值
   initial_imu_leverarm: [0.0, 0.0, 0.0]  # IMU杆臂初始值 (m, b系)
   # GNSS杆臂初始值
   initial_gnss_leverarm: [0.0, 0.0, 0.0]  # GNSS天线杆臂初始值 (m, b系)
@@ -1764,28 +1844,37 @@ class TcMeasurement:
 | `LibGREAT/gins/gearth.h` | `core/imu/earth_param.py` | 地球参数 |
 | KF-GINS `GIEngine::newImuProcess` + `imuInterpolate` | `core/estimator/lc_estimator.py` 时间对齐逻辑 | 增量切分时间对齐方案，4 种时间对齐情况处理 |
 
-### 12.2 gnss_ins_lc_nhc → 本项目
+### 12.2 rtklib-py → 本项目（已吸收）
 
-| gnss_ins_lc_nhc | 本项目 | 说明 |
-|-----------------|--------|------|
-| `src/filter/navfilter.cc` | `core/estimator/ekf.py` + `InsKf.time_update()` | EKF 预测+更新 |
-| `src/imu/navmech.cc` | `core/imu/ins_core.py` + `InsKf.set_Ft()` | 机械编排+F矩阵 |
-| `src/imu/navinitalized.cc` | `core/imu/ins_init.py` | INS 初始化 |
-| `src/process/navstate.cc` | `core/estimator/lc_measurement.py` + `nhc.py` | 量测更新+NHC |
-| `src/data/navgnss.cc` | `core/gnss/spp.py` + `core/gnss/rtk.py` | GNSS 数据处理 |
-| `src/data/navimu.cc` | `core/imu/imu_preprocess.py` | IMU 数据预处理 |
+> **重要变更**：rtklib-py 原为外部 `library/rtklib-py/`，已吸收为 `src/core/gnss/rtklib/` 子包。
+> 通过 `config.py` 的 `_CfgProxy` 单例管理配置（由 `RtklibEnv.setup()` 调用 `config.set_params()` 注入），
+> 不再修改 `sys.path` 或 `sys.modules`。子包内模块使用相对导入（如 `from .rtkcmn import ...`）。
+> `library/rtklib-py/` 仅保留为参考代码，不再导入。
 
-### 12.3 rtklib-py → 本项目
+| rtklib-py 原位置 | 本项目吸收位置 | 调用方式 | 说明 |
+|-----------|--------|------|------|
+| `library/rtklib-py/src/pntpos.py` | `src/core/gnss/rtklib/pntpos.py` | `SppProcessor` 薄封装 `pntpos(obsr, nav)` | SPP 算法 |
+| `library/rtklib-py/src/rtkpos.py` | `src/core/gnss/rtklib/rtkpos.py` | `RtkProcessor` 薄封装 `relpos(nav, obsr, obsb, sol)` | RTK 相对定位 |
+| `library/rtklib-py/src/ephemeris.py` | `src/core/gnss/rtklib/ephemeris.py` | 直接调用 | 星历计算 |
+| `library/rtklib-py/src/rtkcmn.py` | `src/core/gnss/rtklib/rtkcmn.py` | 直接调用 | 通用工具（坐标变换、时间、Sol 等） |
+| `library/rtklib-py/src/mlambda.py` | `src/core/gnss/rtklib/mlambda.py` | `relpos` 内部调用 | MLAMBDA 模糊度解算 |
+| `library/rtklib-py/src/rinex.py` | `src/core/gnss/rtklib/rinex.py` | `InternalGnssSensor` 调用 `rnx_decode` / `decode_obsfile` / `decode_nav` / `first_obs` / `next_obs` | RINEX 解码 |
+| `library/rtklib-py/src/postpos.py` | `src/core/gnss/rtklib/postpos.py` | 后处理驱动（参考） | 批处理驱动 |
+| `library/rtklib-py/src/config.py` | `src/core/gnss/rtklib/config.py` | `RtklibEnv.setup()` → `config.set_params()` | `_CfgProxy` 单例配置管理 |
 
-| rtklib-py | 本项目 | 说明 |
-|-----------|--------|------|
-| `src/pntpos.py` | `core/gnss/spp.py` | SPP 算法 |
-| `src/ephemeris.py` | `core/gnss/satpos.py` + `core/gnss/ephemeris.py` | 卫星位置+星历管理 |
-| `src/rtkcmn.py` | `core/gnss/coord_transform.py` + `utility/data_types.py` | 坐标变换+数据结构 |
-| `src/mlambda.py` | `core/gnss/coord_transform.py` | MLAMBDA 坐标变换 |
-| `src/rinex.py` | `stream/formators/rinex_*.py` | RINEX 解码（流式改造） |
+**配置注入路径**：
+`data/config.yaml` (gnss 段) → `RtklibEnv(gnss_cfg)` → `build_params()` → `config.set_params()` → `_CfgProxy` 单例 → `pntpos`/`relpos` 通过 `from .config import cfg` 读取
 
-### 12.4 GINav → 本项目
+**Sol → GnssSolution 转换**（`src/core/gnss/solution_converter.py::sol_to_gnss_solution`）：
+- `Sol.t.time + Sol.t.sec` → `GnssSolution.timestamp`（Unix 时间戳）
+- `unix_to_gpst(timestamp)[0]` → `GnssSolution.week`（GPS 周号，派生字段）
+- `Sol.rr[0:3]` → `GnssSolution.position`（ECEF 位置）
+- `Sol.stat` → `GnssSolution.quality`（1=SPP, 2=RTD, 5=LC）
+- `Sol.ns` → `GnssSolution.num_sv`（使用卫星数，由处理器回填）
+- `sqrt(diag(Sol.qr[0:3,0:3]))` → `GnssSolution.sd`（ECEF 位置标准差）
+- `Sol.qr[0:3, 0:3]` → `GnssSolution.cov`（ECEF 协方差矩阵，含非对角项）
+
+### 12.3 GINav → 本项目
 
 | GINav | 本项目 | 说明 |
 |-------|--------|------|
