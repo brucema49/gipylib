@@ -89,9 +89,22 @@ class InsUpdate:
         # 记录当前历元比力/角速度 (b 系, 速率) 供 InsPropagate 使用
         self._w_b_ib = dtheta_comp / dt
         self._f_b = dvel_comp / dt
+        import os as _os
+        if _os.environ.get('TC_DBG_IMU'):
+            if 1553743709.0 <= imu.timestamp <= 1553743710.0:
+                if not hasattr(self, '_dbg_n'): self._dbg_n = 0
+                if self._dbg_n < 20:
+                    self._dbg_n += 1
+                    lat, lon, _ = ecef2llh(self.state.pos_e)
+                    C_e_n = cal_Ce2n(lat, lon)
+                    C_b_n = C_e_n @ self.state.C_b_e
+                    rpy = dcm2euler(C_b_n)
+                    print(f"[dbg imu] t={imu.timestamp:.6f} dt={dt:.6f} "
+                          f"gyro={imu.gyro[0]:+.6f},{imu.gyro[1]:+.6f},{imu.gyro[2]:+.6f} "
+                          f"yaw={np.rad2deg(rpy[2]):+.4f}")
 
         # 2. 姿态更新 (含锥补)
-        C_b_e_new = self._attitude_update(dtheta_comp)
+        C_b_e_new = self._attitude_update(dtheta_comp, dt)
 
         # 3. 速度更新 (含旋转/划桨补偿)
         vel_e_new = self._velocity_update(dtheta_comp, dvel_comp, dt)
@@ -129,7 +142,8 @@ class InsUpdate:
 
         return self.state
 
-    def _attitude_update(self, dtheta_comp: np.ndarray) -> np.ndarray:
+    def _attitude_update(self, dtheta_comp: np.ndarray,
+                         dt: float) -> np.ndarray:
         """姿态更新 (E 系, 含锥补)。
 
           phi_b = dtheta + skew(dtheta_prev) * dtheta / 12  (锥补)
@@ -143,7 +157,6 @@ class InsUpdate:
         C_bb = rodrigues(phi_b)
 
         # 地球自转补偿 (E 系下 ECEF 随地球自转)
-        dt = self.state.timestamp - self._prev_timestamp if self._prev_timestamp else 0.0
         zeta = np.array([0.0, 0.0, EARTH_ROTATION_RATE], dtype=np.float64) * dt
         C_ee = rodrigues(-zeta)
 
@@ -156,7 +169,7 @@ class InsUpdate:
           v_rot  = 0.5 * cross(dtheta, dvel)            (旋转补偿)
           v_scul = (cross(dtheta_prev, dvel) + cross(dvel_prev, dtheta)) / 12  (划桨)
           delta_v_cor = (g_e - 2*cross(ω_ie, vel)) * dt  (重力+科氏)
-          C_ee_v = I - skew(ω_ie * 0.5 * dt)
+          C_ee_v = R(-ω_ie * dt)
           delta_v = C_ee_v @ C_b_e @ (dvel + v_rot + v_scul)
           vel_new = vel + delta_v_cor + delta_v
         """
@@ -180,8 +193,9 @@ class InsUpdate:
         w_ie_e = np.array([0.0, 0.0, EARTH_ROTATION_RATE], dtype=np.float64)
         delta_v_cor = (g_e - 2.0 * np.cross(w_ie_e, self.state.vel_e)) * dt
 
-        # C_ee_v = I - skew(ω_ie * 0.5 * dt)
-        C_ee_v = np.eye(3, dtype=np.float64) - skew(w_ie_e * 0.5 * dt)
+        # ignav updateins(): dvfk = dCe @ Ck_1 @ dvbk, where dCe is
+        # the full ECEF rotation over this IMU interval.
+        C_ee_v = rodrigues(-w_ie_e * dt)
 
         delta_v = C_ee_v @ self.state.C_b_e @ (dvel_comp + v_rot + v_scul)
         return self.state.vel_e + delta_v_cor + delta_v

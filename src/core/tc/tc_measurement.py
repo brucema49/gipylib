@@ -15,6 +15,7 @@
     - GNSS 直接状态: effective_x = stored + x, feedback stored += x (加修正)
 """
 import math
+import os
 import numpy as np
 
 from src.core.data_types import InsState
@@ -360,6 +361,9 @@ class _DdBase(TcMeasurement):
                     thresadj = 10 if (not code and self._has_amb(si) and P_diag is not None
                                       and (P_diag[self._amb_idx(sat[ref_i], frq, si)] >= sig_n0_sq
                                            or P_diag[self._amb_idx(sat[j], frq, si)] >= sig_n0_sq)) else 1
+                    if not code and os.environ.get('TC_DUMP_PHASE'):
+                        with open(os.environ['TC_DUMP_PHASE'], 'a') as _f:
+                            _f.write(f"{state.timestamp:.3f} phase ref={int(sat[ref_i])} j={int(sat[j])} v={v_nv:.4f} thresh={nav.maxinno[code] * thresadj:.4f} rejected={'Y' if abs(v_nv) > nav.maxinno[code] * thresadj else 'N'} xr={x[ii_amb]:.4f} xj={x[jj_amb]:.4f}\n")
                     if abs(v_nv) > nav.maxinno[code] * thresadj:
                         continue
                     # 单差方差
@@ -433,8 +437,13 @@ class RtkTcMeas(_DdBase):
     def _has_amb(self, si):
         return si.has_ambiguity()
 
-    def build(self, state, obsr, nav, si, x=None, obsb=None, P=None):
-        """构造 RTK 双差量测。"""
+    def build(self, state, obsr, nav, si, x=None, obsb=None, P=None,
+             amb_init_target=None):
+        """构造 RTK 双差量测。
+
+        amb_init_target: 可选估计器引用, 用于把未初始化的模糊度槽位用
+        单差相位-单差伪距初始化 (与 ignav udbias 等价)。
+        """
         if obsb is None:
             return np.array([]), np.zeros((0, si.dim)), np.zeros((0, 0)), {}
         # 1. 卫星位置 / 钟差
@@ -469,9 +478,61 @@ class RtkTcMeas(_DdBase):
         # 8. EKF 状态向量 x (含 amb)
         if x is None:
             x = np.zeros(si.dim)
+        # 8.5 初始化未初始化的模糊度 (与 ignav udbias 等价):
+        #     未初始化的 N=0 使相位双差 innovation 偏离 λ·N_true 数米至数十米,
+        #     被 outlier 检验拒绝后该星相位量测永远无法进入 KF (模糊度不收敛)。
+        #     用单差相位-单差伪距初始化后, 首个历元 innovation ≈ 伪距噪声,
+        #     相位量测正常参与更新, 位置/速度可被相位精度约束。
+        if amb_init_target is not None:
+            self._init_ambiguities(nav, x, yr, yu, sats, si, amb_init_target)
         # P 用于 ref sat 选择 (选择非刚 reset 的卫星作参考)
         # 9. 构造双差
         return self._build_dd(nav, x, P, yr, er, yu, eu, sats, els, dt, obsr, si, state)
+
+    def _init_ambiguities(self, nav, x, yr, yu, sats, si, est):
+        """用单差相位-单差伪距初始化 N=0 的模糊度槽位。
+
+        等价于 ignav rtkpos.udbias() 的 phase-code 初始化:
+          N_meters = (L_u - L_b)·λ - (P_u - P_b)  (ρ 在单差中消去)
+        仅初始化 x[ii]==0 的槽位; 初始方差设为 sig_n0² (30m, 与 ignav
+        stats-stdbias=30 一致), 远小于 TcEstimator 默认的 100²。
+        """
+        nf = nav.nf
+        n_stored = est._N_stored
+        _dbg = os.environ.get('TC_DEBUG_AMB')
+        if _dbg and est.state.timestamp < 1553743710.0:
+            print(f"[ambinit dbg] t={est.state.timestamp:.3f} nav.sig_n0={nav.sig_n0} "
+                  f"n_sats={len(sats)} nf={nf} n_amb_slots={len(n_stored)}")
+        for f in range(nf):
+            for k, sat in enumerate(sats):
+                ii = self._amb_idx(sat, f, si)
+                if ii < 0:
+                    continue
+                if x[ii] != 0.0:
+                    continue  # 已初始化
+                if yr[k, f] == 0.0 or yu[k, f] == 0.0:
+                    continue  # 无相位单差
+                if yr[k, f + nf] == 0.0 or yu[k, f + nf] == 0.0:
+                    continue  # 无伪距单差
+                n_m = (yu[k, f] - yr[k, f]) - (yu[k, f + nf] - yr[k, f + nf])
+                if n_m == 0.0:
+                    continue
+                # _N_stored 是紧凑数组 (相对 amb_start), 而 ii 是绝对索引
+                kk = ii - est.si.amb_start
+                if kk < 0 or kk >= len(n_stored):
+                    continue
+                # zdres 残差单位为米; amb 状态单位为周 (v -= λ·x, H=λ,
+                # 与 rtklib ddres/udbias 的 bias=cp-pr 一致), 需除以 λ。
+                lam = rCST.CLIGHT / sat2freq(sat, f, nav)
+                n_cyc = n_m / lam
+                n_stored[kk] = n_cyc   # 紧凑索引, feedback 只读紧凑索引 → 初始化持久
+                x[ii] = n_cyc  # 绝对索引 effective_x, 本历元 innovation 立即使用
+                est.P[:, ii] = 0.0
+                est.P[ii, :] = 0.0
+                est.P[ii, ii] = nav.sig_n0 ** 2
+                if _dbg and est.state.timestamp < 1553743710.0:
+                    print(f"   init sat={sat} f={f} ii={ii} n_m={n_m:.4f} lam={lam:.6f} "
+                          f"n_cyc={n_cyc:.4f} -> Pii={est.P[ii, ii]:.4f}")
 
 
 class RtdTcMeas(_DdBase):

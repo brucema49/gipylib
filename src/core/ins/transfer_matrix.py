@@ -216,6 +216,11 @@ class TransferMatrix:
 
         Q = G @ Q_diag @ G.T
 
+        # Keep the TC block propagation consistent with build_Q(): the
+        # configured velocity random walk is a direct ECEF velocity noise.
+        if self.vel_psd > 0.0:
+            Q[3:6, 3:6] += np.diag([self.vel_psd * dt] * 3)
+
         # 可选块 Q (仅在 n_ins 范围内)
         if si.has_lever_arm() and self.lever_arm_psd > 0.0:
             i = si.lever_arm

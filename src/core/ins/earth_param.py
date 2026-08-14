@@ -14,6 +14,7 @@ EARTH_ECCENTRICITY_SQ = 1.0 - (EARTH_SEMI_MINOR / EARTH_SEMI_MAJOR) ** 2  # 第�
 EARTH_GRAVITY_EQUATOR = 9.7803253359   # 赤道重力 (m/s²)
 EARTH_GRAVITY_POLE = 9.8321849378      # 极点重力 (m/s²)
 EARTH_GRAVITY_CONST = 3.986004418e14   # 地球引力常数 GM (m³/s²)
+EARTH_J2 = 1.082627e-3                 # 地球第二带谐系数
 EARTH_ROTATION_RATE = 7.2921151467e-5  # 地球自转角速度 ωie (rad/s)
 EARTH_FLATTENING = 1.0 / 298.257223563
 
@@ -70,30 +71,28 @@ def cal_Cn2e(lat: float, lon: float) -> np.ndarray:
 
 
 def gravity_ecef(pos_e: np.ndarray) -> np.ndarray:
-    """ECEF 位置处的重力 (含离心力)。
+    """ECEF 位置处的重力加速度 (m/s²)。
 
-    参考 KF-GINS Winearth.hpp computeGravity。
-    返回 ECEF 系下的重力加速度向量 (m/s²)。
+    与 ignav ``pregrav()`` 一致，对地球中心引力加入 J2 摄动和离心
+    加速度。这里不能把 Somigliana 正常重力再沿 ECEF 半径投影后叠加
+    离心项，否则会把已包含在正常重力中的旋转效应重复处理。
     """
-    x, y, z = pos_e
-    r2 = x * x + y * y + z * z
-    r = math.sqrt(r2)
-    if r < 1.0:
-        return np.zeros(3, dtype=np.float64)
-    # 正常重力 (Somigliana 公式简化)
-    lat, _, _ = ecef2llh(pos_e)
-    sin_lat = math.sin(lat)
-    # 重力大小 (WGS84 正常重力公式)
-    g = EARTH_GRAVITY_EQUATOR * (1.0 +
-        1.931852652458e-3 * sin_lat * sin_lat) / math.sqrt(
-        1.0 - 6.694379990141e-3 * sin_lat * sin_lat)
-    # ECEF 系重力方向 (指向地心)
-    gamma_e = -g * pos_e / r
-    # 加上离心力 (地球自转)
-    omega2 = EARTH_ROTATION_RATE ** 2
-    gamma_e[0] += omega2 * x
-    gamma_e[1] += omega2 * y
-    return gamma_e
+    pos_e = np.asarray(pos_e, dtype=np.float64)
+    r = float(np.linalg.norm(pos_e))
+    if r < EARTH_SEMI_MAJOR / 2.0:
+        return np.array([0.0, 0.0, 9.81], dtype=np.float64)
+
+    zeta = -EARTH_GRAVITY_CONST / (r ** 3)
+    gamma = 1.5 * EARTH_J2 * EARTH_SEMI_MAJOR ** 2 / (r ** 2)
+    z_ratio_sq = (pos_e[2] / r) ** 2
+    gravity = np.empty(3, dtype=np.float64)
+    equatorial_factor = gamma * (1.0 - 5.0 * z_ratio_sq)
+    gravity[0] = zeta * (pos_e[0] + equatorial_factor * pos_e[0])
+    gravity[1] = zeta * (pos_e[1] + equatorial_factor * pos_e[1])
+    polar_factor = gamma * (3.0 - 5.0 * z_ratio_sq)
+    gravity[2] = zeta * (pos_e[2] + polar_factor * pos_e[2])
+    gravity[0:2] += EARTH_ROTATION_RATE ** 2 * pos_e[0:2]
+    return gravity
 
 
 def georadi(lat: float) -> float:

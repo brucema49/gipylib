@@ -193,9 +193,11 @@ class TcEstimator(LcEstimator):
     def tc_meas_update(self, v, H, R, source: str = ""):
         """GNSS 量测更新 (调 joseph_update + feedback)。"""
         if len(v) == 0:
-            return
+            return None
         self.joseph_update(v, H, R)
+        feedback_x = self.x.copy()
         self.feedback()
+        return feedback_x
 
     def feedback(self) -> None:
         """反馈校正: INS 误差减, GNSS 直接状态累积到 stored。

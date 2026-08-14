@@ -22,8 +22,11 @@
   3. 约束更新: NHC/ZUPT/ZARU (per-IMU, decimation 控制, 互斥)
 """
 import collections
+import csv
 import logging
 import math
+import os
+from pathlib import Path
 from typing import Optional, List
 
 import numpy as np
@@ -119,6 +122,10 @@ class TcIntegration:
         # 量测连续失败计数 (用于发散恢复: 连续失败超阈值时尝试 SPP 重初始化)
         self._consecutive_failures: int = 0
         self._recovery_threshold: int = 10  # 连续失败 10 个历元后尝试恢复
+        # Optional, explicit-only measurement boundary diagnostics.  Keeping
+        # this disabled by default prevents normal runs from creating files.
+        self._diagnostics_path = str(
+            config.get("tc", {}).get("diagnostics_path", ""))
 
     @property
     def initialized(self) -> bool:
@@ -497,7 +504,8 @@ class TcIntegration:
                     self._est.state, obsr, nav, si, x=x)
             else:   # rtk / rtd
                 v, H, R, info = self._meas_builder.build(
-                    self._est.state, obsr, nav, si, x=x, obsb=obsb)
+                    self._est.state, obsr, nav, si, x=x, obsb=obsb,
+                    P=self._est.P, amb_init_target=self._est)
         except Exception as e:
             logger.warning(f"TC meas build 异常 (mode={mode}): {e}")
             self._degrade.on_fail(self._est, "build_error")
@@ -547,14 +555,85 @@ class TcIntegration:
         # false fix 通过正确协方差矩阵和模糊度管理预防, 而非事后拒绝
 
         # RTK 模糊度管理
-        if mode == "rtk" and si.has_ambiguity():
+        if self._ambiguity_enabled(mode, si.has_ambiguity()):
             self._handle_ambiguity(info, obsr, nav)
 
         # 记录量测更新前位置 (用于跳变检测)
         pre_update_pos = self._est.state.pos_e.copy()
 
-        # 量测更新 + 反馈 (钟差已在 _trigger_meas 开头重置)
-        self._est.tc_meas_update(v, H, R, source=mode)
+        # Capture the exact feedback boundary.  The nominal state changes in
+        # feedback(), so all pre-update values must be copied before this call.
+        pre_velocity = self._est.state.vel_e.copy()
+        pre_p = self._est.P.copy()
+        # 量测更新前的 S / K 结构 (诊断): S = H·P·Hᵀ + R, K = P·Hᵀ·S⁻¹
+        s_diag_median = float(np.median(np.diag(H @ pre_p @ H.T + R)))
+        s_inv = np.linalg.inv(H @ pre_p @ H.T + R)
+        K_gain = pre_p @ H.T @ s_inv
+        k_pos_norm = float(np.linalg.norm(K_gain[si.pos:si.pos + 3], axis=1).max())
+        k_vel_norm = float(np.linalg.norm(K_gain[si.vel:si.vel + 3], axis=1).max())
+        k_att_norm = float(np.linalg.norm(K_gain[si.att:si.att + 3], axis=1).max())
+        k_ba_norm = float(np.linalg.norm(K_gain[si.accel_bias:si.accel_bias + 3], axis=1).max())
+        k_bg_norm = float(np.linalg.norm(K_gain[si.gyro_bias:si.gyro_bias + 3], axis=1).max())
+        pre_pos_var_median = float(np.median(np.diag(pre_p[si.pos:si.pos + 3, si.pos:si.pos + 3])))
+        if si.has_ambiguity():
+            amb = slice(si.amb_start, si.amb_start + si.n_amb)
+            pre_amb_var_median = float(np.median(np.diag(pre_p[amb, amb])))
+            pre_pos_amb_cov_norm = float(np.linalg.norm(pre_p[si.pos:si.pos + 3, amb]))
+            h_amb_max = float(np.abs(H[:, amb]).max()) if H.shape[1] > si.amb_start else 0.0
+            if os.environ.get('TC_DEBUG_AMB') and float(t_gnss) < 1553743710.0:
+                print(f"[tc dbg] t={t_gnss:.3f} amb_start={si.amb_start} n_amb={si.n_amb} "
+                      f"Pshape={pre_p.shape} amb_diag min={np.diag(pre_p[amb, amb]).min():.4g} "
+                      f"max={np.diag(pre_p[amb, amb]).max():.4g}")
+            k_amb_norm = float(np.linalg.norm(K_gain[amb, :], axis=1).max())
+            post_amb_var_median = -1.0  # 由 post_p 在诊断里计算
+        else:
+            pre_amb_var_median = -1.0
+            pre_pos_amb_cov_norm = -1.0
+            h_amb_max = 0.0
+            k_amb_norm = -1.0
+            post_amb_var_median = -1.0
+        if os.environ.get('TC_DUMP_KF'):
+            import pickle as _pk
+            _rec = {'t': float(t_gnss), 'v': v.copy(), 'H': H.copy(), 'R': R.copy(),
+                    'x_pre': self._est.x.copy(), 'P_pre': pre_p.copy(),
+                    'N_stored': self._est._N_stored.copy(),
+                    'amb_start': si.amb_start, 'n_amb': si.n_amb}
+            _path = os.environ['TC_DUMP_KF']
+            _all = []
+            if os.path.exists(_path):
+                with open(_path, 'rb') as _f:
+                    _all = _pk.load(_f)
+            _all.append(_rec)
+            with open(_path, 'wb') as _f:
+                _pk.dump(_all, _f)
+        feedback_x = self._est.tc_meas_update(v, H, R, source=mode)
+        if si.has_ambiguity():
+            post_amb_var_median = float(np.median(np.diag(self._est.P[amb, amb])))
+        self._record_measurement_diagnostic(
+            timestamp=t_gnss,
+            mode=mode,
+            n_meas=n_meas,
+            innovation=v,
+            pre_velocity=pre_velocity,
+            velocity_correction=feedback_x[si.vel:si.vel + 3],
+            attitude_correction=feedback_x[si.att:si.att + 3],
+            gyro_bias_correction=feedback_x[si.gyro_bias:si.gyro_bias + 3],
+            accel_bias_correction=feedback_x[si.accel_bias:si.accel_bias + 3],
+            pre_p=pre_p,
+            post_p=self._est.P,
+            s_diag_median=s_diag_median,
+            k_pos_norm=k_pos_norm,
+            k_vel_norm=k_vel_norm,
+            k_att_norm=k_att_norm,
+            k_ba_norm=k_ba_norm,
+            k_bg_norm=k_bg_norm,
+            pre_pos_var_median=pre_pos_var_median,
+            pre_amb_var_median=pre_amb_var_median,
+            pre_pos_amb_cov_norm=pre_pos_amb_cov_norm,
+            post_amb_var_median=post_amb_var_median,
+            h_amb_max=h_amb_max,
+            k_amb_norm=k_amb_norm,
+        )
         self._degrade.on_success(self._est)
         self.last_qins = 3  # TC 量测更新完成
         self._meas_count += 1
@@ -587,6 +666,116 @@ class TcIntegration:
                 return
 
         self._last_meas_pos = self._est.state.pos_e.copy()
+
+    def _ambiguity_enabled(self, mode: str, has_ambiguity: bool) -> bool:
+        """判断当前 TC 配置是否允许执行模糊度固定/保持。
+
+        ignav 的 ``pos2-armode=off`` 不仅禁止输出整数解，也禁止
+        LAMBDA 和 holdamb 约束；TC 必须保持相同的配置语义。
+        """
+        armode = int(self._cfg.get("gnss", {}).get("armode", 0))
+        return mode == "rtk" and armode > 0 and has_ambiguity
+
+    def _record_measurement_diagnostic(self, timestamp: float, mode: str,
+                                       n_meas: int, innovation: np.ndarray,
+                                       pre_velocity: np.ndarray,
+                                       velocity_correction: np.ndarray,
+                                       attitude_correction: np.ndarray,
+                                       gyro_bias_correction: np.ndarray,
+                                       accel_bias_correction: np.ndarray,
+                                       pre_p: np.ndarray,
+                                       post_p: np.ndarray,
+                                       s_diag_median: float = -1.0,
+                                       k_pos_norm: float = -1.0,
+                                       k_vel_norm: float = -1.0,
+                                       k_att_norm: float = -1.0,
+                                       k_ba_norm: float = -1.0,
+                                       k_bg_norm: float = -1.0,
+                                       pre_pos_var_median: float = -1.0,
+                                       pre_amb_var_median: float = -1.0,
+                                       pre_pos_amb_cov_norm: float = -1.0,
+                                       post_amb_var_median: float = -1.0,
+                                       h_amb_max: float = -1.0,
+                                       k_amb_norm: float = -1.0) -> None:
+        """Append one explicit measurement-boundary diagnostic CSV record."""
+        if not self._diagnostics_path:
+            return
+
+        path = Path(self._diagnostics_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = [
+            "timestamp", "mode", "n_meas", "innovation_norm",
+            "pre_velocity_norm", "velocity_feedback_x",
+            "velocity_feedback_y", "velocity_feedback_z",
+            "velocity_feedback_norm", "pre_vel_var_x", "pre_vel_var_y",
+            "pre_vel_var_z", "post_vel_var_x", "post_vel_var_y",
+            "post_vel_var_z", "pre_pos_vel_cov_norm",
+            "post_pos_vel_cov_norm", "pre_pos_att_cov_norm",
+            "post_pos_att_cov_norm", "pre_vel_att_cov_norm",
+            "post_vel_att_cov_norm", "pre_pos_gbias_cov_norm",
+            "post_pos_gbias_cov_norm", "pre_vel_gbias_cov_norm",
+            "post_vel_gbias_cov_norm", "attitude_feedback_norm",
+            "gyro_bias_feedback_x", "gyro_bias_feedback_y",
+            "gyro_bias_feedback_z", "gyro_bias_feedback_norm",
+            "accel_bias_feedback_norm",
+            "s_diag_median", "k_pos_norm", "k_vel_norm", "k_att_norm",
+            "k_ba_norm", "k_bg_norm", "pre_pos_var_median",
+            "pre_amb_var_median", "pre_pos_amb_cov_norm",
+            "post_amb_var_median", "h_amb_max", "k_amb_norm",
+        ]
+        pre_vel_var = np.diag(pre_p[3:6, 3:6])
+        post_vel_var = np.diag(post_p[3:6, 3:6])
+        row = {
+            "timestamp": float(timestamp),
+            "mode": mode,
+            "n_meas": int(n_meas),
+            "innovation_norm": float(np.linalg.norm(innovation)),
+            "pre_velocity_norm": float(np.linalg.norm(pre_velocity)),
+            "velocity_feedback_x": float(velocity_correction[0]),
+            "velocity_feedback_y": float(velocity_correction[1]),
+            "velocity_feedback_z": float(velocity_correction[2]),
+            "velocity_feedback_norm": float(np.linalg.norm(velocity_correction)),
+            "pre_vel_var_x": float(pre_vel_var[0]),
+            "pre_vel_var_y": float(pre_vel_var[1]),
+            "pre_vel_var_z": float(pre_vel_var[2]),
+            "post_vel_var_x": float(post_vel_var[0]),
+            "post_vel_var_y": float(post_vel_var[1]),
+            "post_vel_var_z": float(post_vel_var[2]),
+            "pre_pos_vel_cov_norm": float(np.linalg.norm(pre_p[0:3, 3:6])),
+            "post_pos_vel_cov_norm": float(np.linalg.norm(post_p[0:3, 3:6])),
+            "pre_pos_att_cov_norm": float(np.linalg.norm(pre_p[0:3, 6:9])),
+            "post_pos_att_cov_norm": float(np.linalg.norm(post_p[0:3, 6:9])),
+            "pre_vel_att_cov_norm": float(np.linalg.norm(pre_p[3:6, 6:9])),
+            "post_vel_att_cov_norm": float(np.linalg.norm(post_p[3:6, 6:9])),
+            "pre_pos_gbias_cov_norm": float(np.linalg.norm(pre_p[0:3, 9:12])),
+            "post_pos_gbias_cov_norm": float(np.linalg.norm(post_p[0:3, 9:12])),
+            "pre_vel_gbias_cov_norm": float(np.linalg.norm(pre_p[3:6, 9:12])),
+            "post_vel_gbias_cov_norm": float(np.linalg.norm(post_p[3:6, 9:12])),
+            "attitude_feedback_norm": float(np.linalg.norm(attitude_correction)),
+            "gyro_bias_feedback_x": float(gyro_bias_correction[0]),
+            "gyro_bias_feedback_y": float(gyro_bias_correction[1]),
+            "gyro_bias_feedback_z": float(gyro_bias_correction[2]),
+            "gyro_bias_feedback_norm": float(np.linalg.norm(gyro_bias_correction)),
+            "accel_bias_feedback_norm": float(np.linalg.norm(accel_bias_correction)),
+            "s_diag_median": float(s_diag_median),
+            "k_pos_norm": float(k_pos_norm),
+            "k_vel_norm": float(k_vel_norm),
+            "k_att_norm": float(k_att_norm),
+            "k_ba_norm": float(k_ba_norm),
+            "k_bg_norm": float(k_bg_norm),
+            "pre_pos_var_median": float(pre_pos_var_median),
+            "pre_amb_var_median": float(pre_amb_var_median),
+            "pre_pos_amb_cov_norm": float(pre_pos_amb_cov_norm),
+            "post_amb_var_median": float(post_amb_var_median),
+            "h_amb_max": float(h_amb_max),
+            "k_amb_norm": float(k_amb_norm),
+        }
+        write_header = not path.exists() or path.stat().st_size == 0
+        with path.open("a", encoding="utf-8", newline="") as fp:
+            writer = csv.DictWriter(fp, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
 
     def _spp_fallback_update(self, obsr, obsb, nav, t_gnss: float) -> bool:
         """SPP 3D 位置 fallback: 当 TC 量测失败时用 SPP 位置约束 INS。

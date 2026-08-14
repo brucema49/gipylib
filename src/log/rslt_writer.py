@@ -123,7 +123,6 @@ class RSLTWriter(WriterBase):
         time_str = self._format_time(state.timestamp)
         D2R = np.pi / 180.0
         att_deg = state.att_rpy / D2R  # rad → deg
-
         # 位置: ECEF → LLH (用于 sd 旋转, 也可能直接输出)
         llh = ecef2llh(state.pos_e)
 
