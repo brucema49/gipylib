@@ -19,6 +19,7 @@ import numpy as np
 from src.core.ins.lc_estimator import LcEstimator
 from src.core.ins.state_index import StateIndex
 from src.core.tc.tc_state_index import TcStateIndex
+from src.core.tc.tc_measurement import validate_tc_postfit
 
 
 def _expm_small(A: np.ndarray, order: int = 10) -> np.ndarray:
@@ -194,7 +195,19 @@ class TcEstimator(LcEstimator):
         """GNSS 量测更新 (调 joseph_update + feedback)。"""
         if len(v) == 0:
             return None
+        P_before = self.P.copy()
+        x_before = self.x.copy()
         self.joseph_update(v, H, R)
+        # The TC path bypasses rtklib's relpos()/valpos() wrapper.  Validate
+        # the linearized post-fit residual before closing the INS loop, and
+        # make rejection transactional so a bad float epoch cannot corrupt
+        # the nominal state or its cross-covariances.
+        if source == "rtk":
+            postfit = np.asarray(v) - H @ self.x
+            if not validate_tc_postfit(postfit, R, n_parameters=3):
+                self.P = P_before
+                self.x = x_before
+                return None
         feedback_x = self.x.copy()
         self.feedback()
         return feedback_x

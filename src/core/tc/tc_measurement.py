@@ -15,7 +15,7 @@
     - GNSS 直接状态: effective_x = stored + x, feedback stored += x (加修正)
 """
 import math
-import os
+from copy import copy
 import numpy as np
 
 from src.core.data_types import InsState
@@ -27,8 +27,132 @@ from src.core.gnss.rtklib.rtkcmn import (geodist, satazel, ecef2pos,
                                           sat2prn, timediff)
 from src.core.gnss.rtklib.ephemeris import satposs
 from src.core.gnss.rtklib.pntpos import varerr as spp_varerr, prange, gettgd, REL_HUMI
-from src.core.gnss.rtklib.rtkpos import zdres, selsat, ddcov, varerr as rtk_varerr
+from src.core.gnss.rtklib.rtkpos import (
+    zdres, selsat, ddcov, IB, udbias, varerr as rtk_varerr,
+)
 from src.core.gnss.rtklib import rCST
+
+
+# Same alpha=0.001 critical values used by ignav's rtkcmn::chisqr.
+_CHI_SQR_001 = (
+    10.8, 13.8, 16.3, 18.5, 20.5, 22.5, 24.3, 26.1, 27.9, 29.6,
+    31.3, 32.9, 34.5, 36.1, 37.7, 39.3, 40.8, 42.3, 43.8, 45.3,
+    46.8, 48.3, 49.7, 51.2, 52.6, 54.1, 55.5, 56.9, 58.3, 59.7,
+    61.1, 62.5, 63.9, 65.2, 66.6, 68.0, 69.3, 70.7, 72.1, 73.4,
+    74.7, 76.0, 77.3, 78.6, 80.0, 81.3, 82.6, 84.0, 85.4, 86.7,
+    88.0, 89.3, 90.6, 91.9, 93.3, 94.7, 96.0, 97.4, 98.7, 100.0,
+    101.0, 102.0, 103.0, 104.0, 105.0, 107.0, 108.0, 109.0, 110.0, 112.0,
+    113.0, 114.0, 115.0, 116.0, 118.0, 119.0, 120.0, 122.0, 123.0, 125.0,
+    126.0, 127.0, 128.0, 129.0, 131.0, 132.0, 133.0, 134.0, 135.0, 137.0,
+    138.0, 139.0, 140.0, 142.0, 143.0, 144.0, 145.0, 147.0, 148.0, 149.0,
+)
+
+
+def validate_tc_postfit(residual: np.ndarray, covariance: np.ndarray,
+                        n_parameters: int, sigma_limit: float = 4.0) -> bool:
+    """Validate TC post-fit residuals using ignav's ``valpos`` rules.
+
+    The TC path bypasses rtklib-py's ``relpos`` wrapper, so it must perform
+    this check after the EKF correction and before feeding the correction back
+    into the nominal INS state.  As in ignav, the diagonal of ``R`` is used
+    for the per-residual and chi-square checks.
+    """
+    residual = np.asarray(residual, dtype=np.float64).reshape(-1)
+    covariance = np.asarray(covariance, dtype=np.float64)
+    if residual.size == 0:
+        return False
+    variances = np.diag(covariance)
+    if variances.size != residual.size or np.any(variances <= 0.0):
+        return False
+    if np.any(residual * residual > (sigma_limit ** 2) * variances):
+        return False
+    dof = residual.size - int(n_parameters)
+    if dof <= 0:
+        return True
+    critical = _CHI_SQR_001[min(dof, len(_CHI_SQR_001)) - 1]
+    statistic = float(np.sum(residual * residual / variances))
+    return statistic <= critical
+
+
+def sync_tc_ambiguities_with_rtklib(nav, obsb, obsr, iu, ir, estimator,
+                                    previous_obs_t=None):
+    """Run rtklib's ambiguity temporal update (``udbias``) on the TC block.
+
+    rtklib stores ambiguities as ``IB(sat, freq)`` (frequency-major) while
+    ``TcStateIndex`` stores them satellite-major. Both cover ``MAXSAT * nf``
+    slots, so the exchange is a permutation over *all* slots (not just the
+    current common-view sats) — this lets ``udbias``'s outage counter and
+    phase-code coherency offset operate on a complete state vector.
+
+    Returns the rover observation time (a ``gtime_t`` copy) to pass back as
+    ``previous_obs_t`` on the next call.
+    """
+    si = estimator.si
+    if not si.has_ambiguity():
+        return copy(obsr.t)
+
+    amb_pairs = [
+        (si.amb_idx(s, f), IB(s, f, nav.na))
+        for f in range(nav.nf)
+        for s in range(1, uGNSS.MAXSAT + 1)
+    ]
+    # 1. TC -> rtklib: effective ambiguity (stored + error) and covariance.
+    effective = estimator.effective_x()
+    for tc_idx, rtk_idx in amb_pairs:
+        nav.x[rtk_idx] = effective[tc_idx]
+    for tc_i, rtk_i in amb_pairs:
+        for tc_j, rtk_j in amb_pairs:
+            nav.P[rtk_i, rtk_j] = estimator.P[tc_i, tc_j]
+
+    # 2. Temporal update: cycle-slip detection + re-init + random walk.
+    if previous_obs_t is not None:
+        nav.tt = timediff(obsr.t, previous_obs_t)
+    else:
+        nav.tt = 0.0
+    udbias(nav, obsb, obsr, iu, ir)
+
+    # 3. rtklib -> TC.  ``udbias`` may have reset the state to 0 (cycle slip /
+    #    outage), in which case the TC slot is cleared and re-seeded from
+    #    ``nav.P``; otherwise only the stored value and diagonal are updated.
+    for tc_idx, rtk_idx in amb_pairs:
+        compact = tc_idx - si.amb_start
+        if nav.x[rtk_idx] == 0.0:
+            estimator._N_stored[compact] = 0.0
+            estimator.x[tc_idx] = 0.0
+            estimator.P[tc_idx, :] = 0.0
+            estimator.P[:, tc_idx] = 0.0
+            estimator.P[tc_idx, tc_idx] = nav.P[rtk_idx, rtk_idx]
+        else:
+            estimator._N_stored[compact] = nav.x[rtk_idx] - estimator.x[tc_idx]
+            estimator.P[tc_idx, tc_idx] = nav.P[rtk_idx, rtk_idx]
+
+    return copy(obsr.t)
+
+
+def save_tc_phase_state(nav, obsb, obsr, iu, ir):
+    """Record phase / LLI state for the next epoch's cycle-slip detection.
+
+    Mirrors the tail of ``relpos()`` (rtkpos.py lines 1064-1079): ``nav.ph``
+    / ``nav.pt`` hold the current epoch's phase and time per receiver, and
+    ``nav.prev_lli`` holds the current LLI flags, so ``detslp_dop`` /
+    ``detslp_ll`` can compare consecutive epochs. ``nav.slip`` is reset here
+    after ``udbias``/``_build_dd`` have consumed it.
+    """
+    sats = obsr.sat[iu]
+    for i, sat in enumerate(sats):
+        for f in range(nav.nf):
+            if obsb.L[ir[i], f] != 0:
+                nav.pt[0, sat - 1, f] = obsb.t
+                nav.ph[0, sat - 1, f] = obsb.L[ir[i], f]
+            if obsr.L[iu[i], f] != 0:
+                nav.pt[1, sat - 1, f] = obsr.t
+                nav.ph[1, sat - 1, f] = obsr.L[iu[i], f]
+    nav.slip[:, :] = 0
+    for f in range(nav.nf):
+        ix0 = np.where((obsb.L[:, f] != 0) | (obsb.lli[:, f] != 0))[0]
+        ix1 = np.where((obsr.L[:, f] != 0) | (obsr.lli[:, f] != 0))[0]
+        nav.prev_lli[obsb.sat[ix0] - 1, f, 0] = obsb.lli[ix0, f]
+        nav.prev_lli[obsr.sat[ix1] - 1, f, 1] = obsr.lli[ix1, f]
 
 
 class TcMeasurement:
@@ -287,6 +411,7 @@ class _DdBase(TcMeasurement):
         Ri_list, Rj_list = [], []
         nb_per_block = []   # ddcov 用
         used_pairs = []     # (i, j, freq, code) 供 info
+        n_phase_att = n_phase_acc = n_code_att = n_code_acc = 0
         P_diag = np.diag(P) if P is not None else None
         sig_n0_sq = self._sig_n0 ** 2
 
@@ -316,6 +441,10 @@ class _DdBase(TcMeasurement):
                 for j in idx:
                     if j == ref_i:
                         continue
+                    if code:
+                        n_code_att += 1
+                    else:
+                        n_phase_att += 1
                     # 双差残差 (innovation: v = y - h(x_est) = observed - predicted)
                     # 与 GINav ddres_rtkins / GREAT-MSF gsppflt 一致
                     # rtklib zdres 返回 y = P - rho (observed - predicted),
@@ -361,10 +490,10 @@ class _DdBase(TcMeasurement):
                     thresadj = 10 if (not code and self._has_amb(si) and P_diag is not None
                                       and (P_diag[self._amb_idx(sat[ref_i], frq, si)] >= sig_n0_sq
                                            or P_diag[self._amb_idx(sat[j], frq, si)] >= sig_n0_sq)) else 1
-                    if not code and os.environ.get('TC_DUMP_PHASE'):
-                        with open(os.environ['TC_DUMP_PHASE'], 'a') as _f:
-                            _f.write(f"{state.timestamp:.3f} phase ref={int(sat[ref_i])} j={int(sat[j])} v={v_nv:.4f} thresh={nav.maxinno[code] * thresadj:.4f} rejected={'Y' if abs(v_nv) > nav.maxinno[code] * thresadj else 'N'} xr={x[ii_amb]:.4f} xj={x[jj_amb]:.4f}\n")
                     if abs(v_nv) > nav.maxinno[code] * thresadj:
+                        # 维护 vsat/rejc, 供 udbias 的失锁计数 (outc) 使用 (与 ddres 一致)
+                        nav.vsat[sat[j] - 1, frq] = 0
+                        nav.rejc[sat[j] - 1, frq] += 1
                         continue
                     # 单差方差
                     si_idx = sat[ref_i] - 1
@@ -377,6 +506,14 @@ class _DdBase(TcMeasurement):
                                     nav.rcvstd[sj_idx, f],
                                     nav.SNR_rover[sj_idx, frq],
                                     nav.SNR_base[sj_idx, frq])
+                    if (not code) and self.use_phase:
+                        # 通过 outlier 检验的相位量测标记 vsat=1 (与 ddres 一致)
+                        nav.vsat[si_idx, frq] = 1
+                        nav.vsat[sj_idx, frq] = 1
+                    if code:
+                        n_code_acc += 1
+                    else:
+                        n_phase_acc += 1
                     v_list.append(v_nv)
                     H_rows.append(H_row)
                     Ri_list.append(Ri)
@@ -394,7 +531,9 @@ class _DdBase(TcMeasurement):
         R = ddcov(np.array(nb_per_block), len(nb_per_block),
                   np.array(Ri_list), np.array(Rj_list), len(v_list))
         info = {"pairs": used_pairs, "n": len(v),
-                "ref_sats": sorted({p[0] for p in used_pairs})}
+                "ref_sats": sorted({p[0] for p in used_pairs}),
+                "n_phase_att": n_phase_att, "n_phase_acc": n_phase_acc,
+                "n_code_att": n_code_att, "n_code_acc": n_code_acc}
         return v, H, R, info
 
     @staticmethod
@@ -438,11 +577,13 @@ class RtkTcMeas(_DdBase):
         return si.has_ambiguity()
 
     def build(self, state, obsr, nav, si, x=None, obsb=None, P=None,
-             amb_init_target=None):
+             amb_init_target=None, previous_obs_t=None):
         """构造 RTK 双差量测。
 
-        amb_init_target: 可选估计器引用, 用于把未初始化的模糊度槽位用
-        单差相位-单差伪距初始化 (与 ignav udbias 等价)。
+        amb_init_target: 可选估计器引用, 通过 rtklib ``udbias`` 做模糊度
+        时域更新 (周跳探测/失锁重置/相位-伪距重初始化/随机游走)。
+        previous_obs_t: 上一 GNSS 历元时刻 (``gtime_t``), 供 ``udbias``
+        计算历元间隔 (随机游走步长 + 失锁计时)。
         """
         if obsb is None:
             return np.array([]), np.zeros((0, si.dim)), np.zeros((0, 0)), {}
@@ -454,6 +595,13 @@ class RtkTcMeas(_DdBase):
         yr, er, azelr = zdres(nav, obsb, rsb, dtsb, svhb, varb, nav.rb, 0)
         # 3. 共视卫星
         ns, iu, ir = selsat(nav, obsr, obsb, azelr[:, 1])
+        # 模糊度时域更新 (与 ignav udbias 等价): 周跳探测/失锁重置/
+        # 相位-伪距重初始化/随机游走。每个历元都执行 (即使 ns<=0),
+        # 以维护 outc/slip/随机游走状态, 与 rtklib relpos 在 selsat 前
+        # 调 udstate 一致。
+        if amb_init_target is not None:
+            sync_tc_ambiguities_with_rtklib(
+                nav, obsb, obsr, iu, ir, amb_init_target, previous_obs_t)
         if ns <= 0:
             return np.array([]), np.zeros((0, si.dim)), np.zeros((0, 0)), {}
         # 4. rover zdres (使用 INS 位置)
@@ -478,61 +626,20 @@ class RtkTcMeas(_DdBase):
         # 8. EKF 状态向量 x (含 amb)
         if x is None:
             x = np.zeros(si.dim)
-        # 8.5 初始化未初始化的模糊度 (与 ignav udbias 等价):
-        #     未初始化的 N=0 使相位双差 innovation 偏离 λ·N_true 数米至数十米,
-        #     被 outlier 检验拒绝后该星相位量测永远无法进入 KF (模糊度不收敛)。
-        #     用单差相位-单差伪距初始化后, 首个历元 innovation ≈ 伪距噪声,
-        #     相位量测正常参与更新, 位置/速度可被相位精度约束。
+        # 8.5 udbias 已在上方 (selsat 后) 执行, 这里重算 effective_x
+        #     (stored 可能已被 udbias 周期滑/重初始化更新)
         if amb_init_target is not None:
-            self._init_ambiguities(nav, x, yr, yu, sats, si, amb_init_target)
+            x = amb_init_target.effective_x()
         # P 用于 ref sat 选择 (选择非刚 reset 的卫星作参考)
         # 9. 构造双差
-        return self._build_dd(nav, x, P, yr, er, yu, eu, sats, els, dt, obsr, si, state)
-
-    def _init_ambiguities(self, nav, x, yr, yu, sats, si, est):
-        """用单差相位-单差伪距初始化 N=0 的模糊度槽位。
-
-        等价于 ignav rtkpos.udbias() 的 phase-code 初始化:
-          N_meters = (L_u - L_b)·λ - (P_u - P_b)  (ρ 在单差中消去)
-        仅初始化 x[ii]==0 的槽位; 初始方差设为 sig_n0² (30m, 与 ignav
-        stats-stdbias=30 一致), 远小于 TcEstimator 默认的 100²。
-        """
-        nf = nav.nf
-        n_stored = est._N_stored
-        _dbg = os.environ.get('TC_DEBUG_AMB')
-        if _dbg and est.state.timestamp < 1553743710.0:
-            print(f"[ambinit dbg] t={est.state.timestamp:.3f} nav.sig_n0={nav.sig_n0} "
-                  f"n_sats={len(sats)} nf={nf} n_amb_slots={len(n_stored)}")
-        for f in range(nf):
-            for k, sat in enumerate(sats):
-                ii = self._amb_idx(sat, f, si)
-                if ii < 0:
-                    continue
-                if x[ii] != 0.0:
-                    continue  # 已初始化
-                if yr[k, f] == 0.0 or yu[k, f] == 0.0:
-                    continue  # 无相位单差
-                if yr[k, f + nf] == 0.0 or yu[k, f + nf] == 0.0:
-                    continue  # 无伪距单差
-                n_m = (yu[k, f] - yr[k, f]) - (yu[k, f + nf] - yr[k, f + nf])
-                if n_m == 0.0:
-                    continue
-                # _N_stored 是紧凑数组 (相对 amb_start), 而 ii 是绝对索引
-                kk = ii - est.si.amb_start
-                if kk < 0 or kk >= len(n_stored):
-                    continue
-                # zdres 残差单位为米; amb 状态单位为周 (v -= λ·x, H=λ,
-                # 与 rtklib ddres/udbias 的 bias=cp-pr 一致), 需除以 λ。
-                lam = rCST.CLIGHT / sat2freq(sat, f, nav)
-                n_cyc = n_m / lam
-                n_stored[kk] = n_cyc   # 紧凑索引, feedback 只读紧凑索引 → 初始化持久
-                x[ii] = n_cyc  # 绝对索引 effective_x, 本历元 innovation 立即使用
-                est.P[:, ii] = 0.0
-                est.P[ii, :] = 0.0
-                est.P[ii, ii] = nav.sig_n0 ** 2
-                if _dbg and est.state.timestamp < 1553743710.0:
-                    print(f"   init sat={sat} f={f} ii={ii} n_m={n_m:.4f} lam={lam:.6f} "
-                          f"n_cyc={n_cyc:.4f} -> Pii={est.P[ii, ii]:.4f}")
+        v, H, R, info = self._build_dd(
+            nav, x, P, yr, er, yu, eu, sats, els, dt, obsr, si, state)
+        # 10. 失锁计数重置 + 相位/LLI 状态保存 (与 relpos 尾部一致)
+        for f in range(nav.nf):
+            ix = np.where(nav.vsat[:, f] > 0)[0]
+            nav.outc[ix, f] = 0
+        save_tc_phase_state(nav, obsb, obsr, iu, ir)
+        return v, H, R, info
 
 
 class RtdTcMeas(_DdBase):

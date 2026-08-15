@@ -89,19 +89,6 @@ class InsUpdate:
         # 记录当前历元比力/角速度 (b 系, 速率) 供 InsPropagate 使用
         self._w_b_ib = dtheta_comp / dt
         self._f_b = dvel_comp / dt
-        import os as _os
-        if _os.environ.get('TC_DBG_IMU'):
-            if 1553743709.0 <= imu.timestamp <= 1553743710.0:
-                if not hasattr(self, '_dbg_n'): self._dbg_n = 0
-                if self._dbg_n < 20:
-                    self._dbg_n += 1
-                    lat, lon, _ = ecef2llh(self.state.pos_e)
-                    C_e_n = cal_Ce2n(lat, lon)
-                    C_b_n = C_e_n @ self.state.C_b_e
-                    rpy = dcm2euler(C_b_n)
-                    print(f"[dbg imu] t={imu.timestamp:.6f} dt={dt:.6f} "
-                          f"gyro={imu.gyro[0]:+.6f},{imu.gyro[1]:+.6f},{imu.gyro[2]:+.6f} "
-                          f"yaw={np.rad2deg(rpy[2]):+.4f}")
 
         # 2. 姿态更新 (含锥补)
         C_b_e_new = self._attitude_update(dtheta_comp, dt)

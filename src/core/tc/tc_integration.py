@@ -25,7 +25,7 @@ import collections
 import csv
 import logging
 import math
-import os
+from copy import copy
 from pathlib import Path
 from typing import Optional, List
 
@@ -122,6 +122,8 @@ class TcIntegration:
         # 量测连续失败计数 (用于发散恢复: 连续失败超阈值时尝试 SPP 重初始化)
         self._consecutive_failures: int = 0
         self._recovery_threshold: int = 10  # 连续失败 10 个历元后尝试恢复
+        # 上一 GNSS 历元时刻 (gtime_t), 供 udbias 计算历元间隔 (随机游走/失锁计时)
+        self._prev_obs_t = None
         # Optional, explicit-only measurement boundary diagnostics.  Keeping
         # this disabled by default prevents normal runs from creating files.
         self._diagnostics_path = str(
@@ -496,6 +498,7 @@ class TcIntegration:
         # 此时 clk_stored=0, x[clk]=0, 故 effective clk=0
         x = self._est.effective_x()
         mode = self._degrade.current_mode
+        previous_obs_t = self._prev_obs_t
 
         # 按当前模式构造量测
         try:
@@ -505,11 +508,15 @@ class TcIntegration:
             else:   # rtk / rtd
                 v, H, R, info = self._meas_builder.build(
                     self._est.state, obsr, nav, si, x=x, obsb=obsb,
-                    P=self._est.P, amb_init_target=self._est)
+                    P=self._est.P, amb_init_target=self._est,
+                    previous_obs_t=previous_obs_t)
         except Exception as e:
             logger.warning(f"TC meas build 异常 (mode={mode}): {e}")
             self._degrade.on_fail(self._est, "build_error")
             return
+
+        # udbias 已在 build 内执行 (rtk 模式), 更新上一历元时刻供下一历元
+        self._prev_obs_t = copy(obsr.t)
 
         if len(v) == 0:
             # 量测构建返回空 (卫星被 outlier 拒绝/共视卫星不足):
@@ -542,7 +549,7 @@ class TcIntegration:
                          f"obsr={len(obsr.sat)}, obsb={len(obsb.sat) if obsb is not None else 0}")
             if self._spp_fallback_update(obsr, obsb, nav, t_gnss):
                 return
-            self._on_meas_failure(obsr, obsb, nav, t_gnss)
+            self._on_meas_failure(obsr, obsb, nav, t_gnss, recover=False)
             return
 
         # 收敛期保护: 前 _convergence_warmup 个历元禁用跳变检验
@@ -580,10 +587,6 @@ class TcIntegration:
             pre_amb_var_median = float(np.median(np.diag(pre_p[amb, amb])))
             pre_pos_amb_cov_norm = float(np.linalg.norm(pre_p[si.pos:si.pos + 3, amb]))
             h_amb_max = float(np.abs(H[:, amb]).max()) if H.shape[1] > si.amb_start else 0.0
-            if os.environ.get('TC_DEBUG_AMB') and float(t_gnss) < 1553743710.0:
-                print(f"[tc dbg] t={t_gnss:.3f} amb_start={si.amb_start} n_amb={si.n_amb} "
-                      f"Pshape={pre_p.shape} amb_diag min={np.diag(pre_p[amb, amb]).min():.4g} "
-                      f"max={np.diag(pre_p[amb, amb]).max():.4g}")
             k_amb_norm = float(np.linalg.norm(K_gain[amb, :], axis=1).max())
             post_amb_var_median = -1.0  # 由 post_p 在诊断里计算
         else:
@@ -592,21 +595,17 @@ class TcIntegration:
             h_amb_max = 0.0
             k_amb_norm = -1.0
             post_amb_var_median = -1.0
-        if os.environ.get('TC_DUMP_KF'):
-            import pickle as _pk
-            _rec = {'t': float(t_gnss), 'v': v.copy(), 'H': H.copy(), 'R': R.copy(),
-                    'x_pre': self._est.x.copy(), 'P_pre': pre_p.copy(),
-                    'N_stored': self._est._N_stored.copy(),
-                    'amb_start': si.amb_start, 'n_amb': si.n_amb}
-            _path = os.environ['TC_DUMP_KF']
-            _all = []
-            if os.path.exists(_path):
-                with open(_path, 'rb') as _f:
-                    _all = _pk.load(_f)
-            _all.append(_rec)
-            with open(_path, 'wb') as _f:
-                _pk.dump(_all, _f)
         feedback_x = self._est.tc_meas_update(v, H, R, source=mode)
+        if feedback_x is None:
+            logger.debug(
+                "TC postfit_reject (mode=%s, t=%.3f): discard measurement epoch",
+                mode, t_gnss)
+            # ignav valpos() keeps the previous INS state when an RTK float
+            # solution fails validation.  A coarse SPP feedback here would
+            # overwrite it with a 20-30 m position correction and defeat the
+            # post-fit gate.
+            self._on_meas_failure(obsr, obsb, nav, t_gnss)
+            return
         if si.has_ambiguity():
             post_amb_var_median = float(np.median(np.diag(self._est.P[amb, amb])))
         self._record_measurement_diagnostic(
@@ -633,6 +632,10 @@ class TcIntegration:
             post_amb_var_median=post_amb_var_median,
             h_amb_max=h_amb_max,
             k_amb_norm=k_amb_norm,
+            n_phase_att=int(info.get("n_phase_att", 0)),
+            n_phase_acc=int(info.get("n_phase_acc", 0)),
+            n_code_att=int(info.get("n_code_att", 0)),
+            n_code_acc=int(info.get("n_code_acc", 0)),
         )
         self._degrade.on_success(self._est)
         self.last_qins = 3  # TC 量测更新完成
@@ -696,7 +699,11 @@ class TcIntegration:
                                        pre_pos_amb_cov_norm: float = -1.0,
                                        post_amb_var_median: float = -1.0,
                                        h_amb_max: float = -1.0,
-                                       k_amb_norm: float = -1.0) -> None:
+                                       k_amb_norm: float = -1.0,
+                                       n_phase_att: int = 0,
+                                       n_phase_acc: int = 0,
+                                       n_code_att: int = 0,
+                                       n_code_acc: int = 0) -> None:
         """Append one explicit measurement-boundary diagnostic CSV record."""
         if not self._diagnostics_path:
             return
@@ -722,6 +729,7 @@ class TcIntegration:
             "k_ba_norm", "k_bg_norm", "pre_pos_var_median",
             "pre_amb_var_median", "pre_pos_amb_cov_norm",
             "post_amb_var_median", "h_amb_max", "k_amb_norm",
+            "n_phase_att", "n_phase_acc", "n_code_att", "n_code_acc",
         ]
         pre_vel_var = np.diag(pre_p[3:6, 3:6])
         post_vel_var = np.diag(post_p[3:6, 3:6])
@@ -769,6 +777,10 @@ class TcIntegration:
             "post_amb_var_median": float(post_amb_var_median),
             "h_amb_max": float(h_amb_max),
             "k_amb_norm": float(k_amb_norm),
+            "n_phase_att": int(n_phase_att),
+            "n_phase_acc": int(n_phase_acc),
+            "n_code_att": int(n_code_att),
+            "n_code_acc": int(n_code_acc),
         }
         write_header = not path.exists() or path.stat().st_size == 0
         with path.open("a", encoding="utf-8", newline="") as fp:
@@ -838,13 +850,16 @@ class TcIntegration:
             f"pos_innov={float(np.linalg.norm(Z)):.2f}m, sigma={sigma_spp}")
         return True
 
-    def _on_meas_failure(self, obsr, obsb, nav, t_gnss: float) -> None:
+    def _on_meas_failure(self, obsr, obsb, nav, t_gnss: float,
+                         recover: bool = True) -> None:
         """量测失败处理: 累计失败次数, 超阈值时尝试 SPP 恢复。
 
         当连续失败超 _recovery_threshold 个历元且 GNSS 观测可用时,
         尝试用 SPP 重新初始化位置, 使系统能从发散中恢复。
         """
         self._consecutive_failures += 1
+        if not recover:
+            return
         if self._consecutive_failures < self._recovery_threshold:
             return
         # 避免频繁尝试: 每次失败后才尝试, 成功后计数清零
