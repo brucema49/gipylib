@@ -268,3 +268,64 @@ LcIntegration.add_gnss(gnss):
 时间对齐误差（最大半个 IMU 采样周期 ≈ 5ms @100Hz）：
 - `estimate_time_sync=1` 时作为状态 δt 在线估计
 - 未启用时由 R 矩阵吸收（speed × dt_offset 项）
+
+---
+
+## 7. TC 估计器的实测约束与实现边界（2026-08-17）
+
+### 7.1 TC 与 LC 必须使用不同的过程噪声策略
+
+TC 量测直接作用于紧组合状态，RTK 双差相位/伪距或 SPP 伪距+Doppler 对状态提供的几何约束与 LC 不同。根据 `issue/8-11机械编排bug.md` 的同数据对照：
+
+- TC 的 `pos_psd` 应配置为 `0.0`，否则位置协方差被人为持续放大，并经 `P[pos, vel]` 交叉项传递为约 `1 m/s` 的更新后速度常值偏差。
+- TC 的 `vel_psd=0.5` 当前应保留；`pos_psd=0, vel_psd=0` 会使 P 过度收缩并可能触发恢复。
+- LC 不得照搬 TC 的 `pos_psd=0`。高精度 LC 位置更新可能令 `P_pos` 坍缩，导致速度状态失去合理过程不确定性；LC 应保留配置文件中经过验证的非零值。
+
+TC 时间更新仍使用：
+
+```text
+P = Phi @ (P + 0.5 * Q) @ Phi.T + 0.5 * Q
+```
+
+分块实现必须与完整矩阵传播数值等价，尤其不能丢失 `P[vel, accel_bias]`、`P[pos, vel]` 等交叉协方差。
+
+### 7.2 RTK TC ambiguity 状态生命周期
+
+`RtkTcMeas` 的 ambiguity 状态不是一次性初始化变量，必须跨 GNSS 历元维护：
+
+- 复用 rtklib `udbias()` 的 LLI、Doppler 和 geometry-free 周跳检测；
+- 对失锁卫星维护 outage 计数并按 `maxout` 重置；
+- 每历元增加 `prnbias^2 * abs(nav.tt)` 的 ambiguity 方差；
+- 按 phase-code coherency 重新初始化或修正 ambiguity；
+- 保存 `nav.ph`、`nav.pt`、`nav.prev_lli`，并在历元结束清零 `nav.slip`；
+- 处理 TC 的卫星主序布局与 rtklib `IB(sat, freq)` 布局之间的显式映射，禁止按数组形状直接赋值。
+
+初始化值的单位必须是周：若 phase-code 差值为米，应除以对应波长后写入 ambiguity；量测模型中的相位项使用 `lambda * N`。
+
+### 7.3 RTK 后验拒绝与恢复语义
+
+TC 的 RTK 更新顺序应为：
+
+```text
+保存更新前 x/P
+    -> Joseph update
+    -> post-fit 4-sigma + chi-square 检查
+    -> 通过：feedback
+    -> 失败：恢复 x/P，丢弃本历元
+```
+
+已有 RTK 观测但 post-fit 不一致时，不应立即执行粗粒度 SPP 恢复；普通“没有有效量测”的失败才进入常规恢复计数。这样可避免一个错误的 RTK float 历元把 20--30 m 的 SPP 修正注入 INS。
+
+### 7.4 TC 结果验收指标
+
+不能只看 Qins=3 的位置 RMS。至少同时记录：
+
+- Qins=3 位置、速度误差；
+- 每个量测周期 Qins=2 的速度/位置峰值；
+- 量测反馈速度增量；
+- `k_ba_norm` 与 accel-bias feedback；
+- phase/code 尝试数与接受数；
+- `P[pos,pos]`、`P[vel,vel]` 及关键交叉协方差；
+- 与 ignav `.stat` 的坐标系、时间和输出频率一致性。
+
+当前最终验证表明：TC `pos_psd=0` 后 Q3 速度误差约 `0.0985 m/s`，接近 ignav INS `.stat` 的 `0.079 m/s`；Q2 速度误差中位约 `0.260 m/s`、峰值约 `0.552 m/s`。ignav 缺少可直接对应的 100 Hz 量测间速度金标准，因此不能声称两者逐历元完全一致。
