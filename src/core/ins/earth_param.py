@@ -95,6 +95,23 @@ def gravity_ecef(pos_e: np.ndarray) -> np.ndarray:
     return gravity
 
 
+def gravity_ecef_normal(pos_e: np.ndarray) -> np.ndarray:
+    """ignav ``gravity()`` 的 ECEF 普通重力模型 (m/s²)。
+
+    ``updateins()`` 以该模型积分名义速度；误差状态的重力梯度仍应
+    使用与 ignav ``pregrav()`` 对齐的 :func:`gravity_ecef`。
+    """
+    lat, lon, height = ecef2llh(np.asarray(pos_e, dtype=np.float64))
+    sin_lat = math.sin(lat)
+    gravity_down = (
+        EARTH_GRAVITY_EQUATOR
+        * (1.0 + 0.001931853 * sin_lat * sin_lat)
+        / math.sqrt(1.0 - EARTH_ECCENTRICITY_SQ * sin_lat * sin_lat)
+        * (1.0 - 2.0 * height / EARTH_SEMI_MAJOR)
+    )
+    return cal_Cn2e(lat, lon) @ np.array([0.0, 0.0, gravity_down])
+
+
 def georadi(lat: float) -> float:
     """地心半径 (参考 ignav georadi, ins-gnss.cc line 214-218)。
 

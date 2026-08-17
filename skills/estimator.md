@@ -154,6 +154,11 @@ class StateIndex:
 P = Φ·(P + 0.5Q)·Φ^T + 0.5Q  (GINav 中间值法)
 ```
 
+时间更新先调用 `InsUpdate.update()`。只有 `last_update_accepted=True` 时才构造
+`F/Phi/Q` 并传播 `P`；对非正 `dt`、小于 `1e-6 s` 或大于 `60 s` 的 IMU
+间隔，名义状态和协方差都不得跨越式传播。正的异常间隔仅推进 INS 的时间
+边界并清空其增量历史，使下一有效 IMU 从新的边界开始。
+
 1. IMU 误差补偿：`dtheta_comp = dtheta - gyro_bias·dt`，`dvel_comp = dvel - accel_bias·dt`
 2. INS 机械编排（E 系，参考 imu.md）
 3. 构造 F 矩阵（ψ-error, E 系, 参考 ignav getF）：

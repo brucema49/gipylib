@@ -18,12 +18,15 @@ from src.core.ins.earth_param import (
     EARTH_ROTATION_RATE,
     cal_Ce2n,
     ecef2llh,
-    gravity_ecef,
+    gravity_ecef_normal,
 )
-from src.core.ins.attitude import dcm2euler, dcm2quat
+from src.core.ins.attitude import dcm2euler, dcm2quat, quat2dcm
 from src.core.ins.transfer_matrix import rodrigues, skew
 
 logger = logging.getLogger(__name__)
+
+_MIN_IMU_INTERVAL = 1.0e-6
+_MAX_IMU_INTERVAL = 60.0
 
 
 class InsUpdate:
@@ -45,6 +48,7 @@ class InsUpdate:
         self._w_b_ib = np.zeros(3, dtype=np.float64)
         # 当前历元 ECEF 加速度 (供 time_sync H 矩阵使用)
         self._a_e = np.zeros(3, dtype=np.float64)
+        self._last_update_accepted = False
 
     @property
     def f_b(self) -> np.ndarray:
@@ -61,6 +65,11 @@ class InsUpdate:
         """当前历元 ECEF 加速度 (m/s²)。"""
         return self._a_e
 
+    @property
+    def last_update_accepted(self) -> bool:
+        """Whether the most recent IMU sample advanced the INS solution."""
+        return self._last_update_accepted
+
     def update(self, imu: ImuMeasurement) -> InsState:
         """一步 INS 递推: 姿态 → 速度 → 位置 (E 系)。
 
@@ -71,14 +80,25 @@ class InsUpdate:
             更新后的 InsState
         """
         dt = imu.timestamp - self._prev_timestamp
+        self._last_update_accepted = False
         if dt <= 0.0:
             logger.warning(
                 f"非正 dt={dt:.6f} (t_curr={imu.timestamp:.6f}, "
                 f"t_prev={self._prev_timestamp:.6f}), 跳过"
             )
             return self.state
-        if dt > 1.0:
-            logger.warning(f"异常大 dt={dt:.4f}s, 继续递推")
+        if not math.isfinite(dt) or dt < _MIN_IMU_INTERVAL or dt > _MAX_IMU_INTERVAL:
+            logger.warning(
+                "无效 IMU dt=%.6fs (有效范围 %.0e--%.0fs), 跳过机械编排与协方差传播",
+                dt, _MIN_IMU_INTERVAL, _MAX_IMU_INTERVAL,
+            )
+            # Match ignav updateins(): advance the time boundary so the next
+            # valid sample is not integrated across this invalid interval.
+            self._prev_timestamp = imu.timestamp
+            self._prev_dtheta.fill(0.0)
+            self._prev_dvel.fill(0.0)
+            self.state.timestamp = imu.timestamp
+            return self.state
 
         # 1. IMU 补偿: 速率 → 增量, 减零偏
         dtheta = imu.gyro * dt
@@ -126,6 +146,7 @@ class InsUpdate:
         self._prev_dtheta = dtheta_comp.copy()
         self._prev_dvel = dvel_comp.copy()
         self._prev_timestamp = imu.timestamp
+        self._last_update_accepted = True
 
         return self.state
 
@@ -147,7 +168,11 @@ class InsUpdate:
         zeta = np.array([0.0, 0.0, EARTH_ROTATION_RATE], dtype=np.float64) * dt
         C_ee = rodrigues(-zeta)
 
-        return C_ee @ self.state.C_b_e @ C_bb
+        C_b_e = C_ee @ self.state.C_b_e @ C_bb
+        # Match ignav updateins(): dcm2quatx -> normquat -> quat2dcmx.
+        # dcm2quat() normalizes its result; reconstructing the DCM makes the
+        # propagated state an element of SO(3), not merely a stored q_b_e copy.
+        return quat2dcm(dcm2quat(C_b_e))
 
     def _velocity_update(self, dtheta_comp: np.ndarray,
                          dvel_comp: np.ndarray, dt: float) -> np.ndarray:
@@ -165,7 +190,14 @@ class InsUpdate:
         dvk = dvel_comp
         dak_norm = float(np.linalg.norm(dak))
         if dak_norm < 1e-12:
-            v_rot = np.zeros(3, dtype=np.float64)
+            # Match ignav rotscull_corr(): evaluating the exact ratios at
+            # tiny angles loses precision, but the correction itself must
+            # not disappear.
+            dak_sq = dak_norm * dak_norm
+            a1 = 0.5 - dak_sq / 24.0 + dak_sq * dak_sq / 720.0
+            a2 = 1.0 / 6.0 - dak_sq / 120.0 + dak_sq * dak_sq / 5040.0
+            v_rot = (a1 * np.cross(dak, dvk)
+                     + a2 * np.cross(dak, np.cross(dak, dvk)))
         else:
             dak_sq = dak_norm * dak_norm
             a1 = (1.0 - math.cos(dak_norm)) / dak_sq
@@ -176,7 +208,7 @@ class InsUpdate:
                   + np.cross(self._prev_dvel, dtheta_comp)) / 12.0
 
         # 重力 + 科氏
-        g_e = gravity_ecef(self.state.pos_e)
+        g_e = gravity_ecef_normal(self.state.pos_e)
         w_ie_e = np.array([0.0, 0.0, EARTH_ROTATION_RATE], dtype=np.float64)
         delta_v_cor = (g_e - 2.0 * np.cross(w_ie_e, self.state.vel_e)) * dt
 

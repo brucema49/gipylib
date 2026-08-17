@@ -74,6 +74,9 @@ class LcEstimator:
         prev_ts = self.ins_update._prev_timestamp
         self.ins_update.update(imu)
 
+        if not self.ins_update.last_update_accepted:
+            return
+
         dt = imu.timestamp - prev_ts
         if dt <= 0.0:
             return
