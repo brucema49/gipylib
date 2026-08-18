@@ -148,7 +148,9 @@ class LcStream:
 
         # 初始化成功, 创建估计器 + 集成器
         self._est = LcEstimator(init_state, init_P, self.config)
-        self._integ = LcIntegration(self._est, self.config)
+        self._integ = LcIntegration(
+            self._est, self.config, output_callback=self._write_integration_output
+        )
         self._si = StateIndex.from_config(self.config)
         self._initialized = True
         # 初始化用 GNSS 的 quality / num_sv 作为后续 per-IMU 输出的最近 GNSS 元数据
@@ -178,6 +180,18 @@ class LcStream:
         return speed
 
     # ===== per-IMU 输出 =====
+
+    def _write_integration_output(self, state, P, qins: int) -> None:
+        """Write a state emitted at an interpolated GNSS boundary."""
+        self.writer.write(
+            state=state,
+            P=P,
+            si=self._si,
+            q=self._last_q,
+            qins=qins,
+            num_sv=self._last_gnss_ns,
+        )
+        self._output_count += 1
 
     def _write_state(self, qins: int) -> None:
         """写当前状态到 .rslt 文件 (per-IMU 100Hz)。"""

@@ -58,9 +58,10 @@ class TcIntegration:
       - 运动: NHC (需非剧烈转弯)
     """
 
-    def __init__(self, config: dict, mode: str = "spp"):
+    def __init__(self, config: dict, mode: str = "spp", output_callback=None):
         self._cfg = config
         self._mode = mode
+        self._output_callback = output_callback
         self._initializer = InsInitializer(config)
         ins_cfg = config.get("ins", {})
         # 初始化模式选择 (与 LcStream 一致)
@@ -148,6 +149,13 @@ class TcIntegration:
     def set_writer(self, writer) -> None:
         self._writer = writer
 
+    def _emit_output(self, qins: int) -> None:
+        """Emit a state at an exact fusion boundary when a stream is attached."""
+        if self._output_callback is not None:
+            self._output_callback(self._est.state, self._est.P, qins)
+        elif self._writer is not None:
+            self._write_state(qins)
+
     @staticmethod
     def _select_init_mode(config: dict) -> InitMode:
         """TC 模式初始化模式选择: 动态位置差分。
@@ -206,6 +214,9 @@ class TcIntegration:
                     f"过期 GNSS obs t={t_gnss:.6f} < cur.t={cur.timestamp:.6f}, "
                     f"直接量测更新")
                 self._trigger_meas(cur, obsr, obsb, nav, t_gnss)
+                if self.last_qins == 3:
+                    self._emit_output(3)
+                self.last_qins = 2
                 self.pending_obs.popleft()
                 continue
 
@@ -225,10 +236,12 @@ class TcIntegration:
                 self._est.time_update(interp)
                 self._static_detect.push(interp)
                 self._apply_constraints(interp)
-                self._write_state(self.last_qins)
 
             # 触发 TC 量测更新 + 反馈
             self._trigger_meas(interp, obsr, obsb, nav, t_gnss)
+            if self.last_qins == 3:
+                self._emit_output(3)
+            self.last_qins = 2
             self.pending_obs.popleft()
             cur = interp
 

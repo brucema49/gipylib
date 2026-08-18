@@ -50,7 +50,9 @@ class TcStream:
         self.config = config
         self.writer = writer
         self._tc_mode = config.get("gnss", {}).get("positioning_mode", "spp")
-        self._integ = TcIntegration(config, mode=self._tc_mode)
+        self._integ = TcIntegration(
+            config, mode=self._tc_mode, output_callback=self._write_integration_output
+        )
 
         # 初始化前缓冲
         self._init_imu: List[ImuMeasurement] = []
@@ -140,6 +142,19 @@ class TcStream:
             self._init_obs.clear()
 
     # ===== 输出 =====
+
+    def _write_integration_output(self, state, P, qins: int) -> None:
+        """Write a state emitted at an interpolated GNSS boundary."""
+        si = self._integ.si
+        if state is None or P is None or si is None:
+            return
+        self.writer.write(
+            state, P, si,
+            self._integ._last_q,
+            qins,
+            self._integ._last_ns,
+        )
+        self._output_count += 1
 
     def _write_gnss_only(self, obsr, obsb, nav, t_gnss: float) -> None:
         """未初始化时输出纯 GNSS 解 (Qins=0, 速度=0, 姿态=0)。

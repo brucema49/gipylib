@@ -60,8 +60,9 @@ class LcIntegration:
       - 运动: NHC (需非剧烈转弯)
     """
 
-    def __init__(self, estimator, config: dict):
+    def __init__(self, estimator, config: dict, output_callback=None):
         self.est = estimator
+        self._output_callback = output_callback
         ins_cfg = config.get("ins", {})
         # 使能开关
         self.nhc_enable = int(ins_cfg.get("nhc_enable", 0))
@@ -97,6 +98,11 @@ class LcIntegration:
         # (与 TcIntegration._nhc_warmup 一致, 默认 1 = 至少 1 次 GNSS 更新后启用)
         self._meas_count: int = 0
         self._nhc_warmup = int(ins_cfg.get("nhc_warmup", 1))
+
+    def _emit_output(self, qins: int) -> None:
+        """Emit a state at an exact fusion boundary when a stream is attached."""
+        if self._output_callback is not None:
+            self._output_callback(self.est.state, self.est.P, qins)
 
     def add_imu(self, imu: ImuMeasurement) -> None:
         """GVINS 风格 IMU 消费: 每条 IMU 检查 GNSS 队头时间戳。
@@ -134,6 +140,8 @@ class LcIntegration:
                     f"直接量测更新"
                 )
                 self._apply_gnss_update(gnss)
+                self._emit_output(3)
+                self.last_qins = 2
                 self.pending_gnss.popleft()
                 continue
 
@@ -157,10 +165,12 @@ class LcIntegration:
                 self._static_detect.push(interp)
                 self._apply_constraints(interp)
 
-            # 触发 GNSS 量测更新 + 反馈
-            self._apply_gnss_update(gnss)
-            self.pending_gnss.popleft()
-            cur = interp  # 后续 GNSS 从 interp 时刻继续
+                # 触发 GNSS 量测更新 + 反馈
+                self._apply_gnss_update(gnss)
+                self._emit_output(3)
+                self.last_qins = 2
+                self.pending_gnss.popleft()
+                cur = interp  # 后续 GNSS 从 interp 时刻继续
 
         # 2. 推进当前 IMU (dt = imu.t - cur.t)
         self.imupre = cur
