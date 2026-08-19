@@ -39,8 +39,8 @@ python3 src/main.py data/config.yaml
 
 输出文件生成在 `data/output/` 目录下：
 - `RTK.pos`：纯 GNSS 定位结果（1Hz）
-- `RTKLC.rslt`：松组合导航结果（100Hz，含位置/速度/姿态）
-- `RTKTC.rslt`：紧组合导航结果（100Hz）
+- `RTKLC.rslt`：松组合导航结果
+- `RTKTC.rslt`：紧组合导航结果
 
 ### 精度评估
 
@@ -109,7 +109,7 @@ gipylib/
 - [GINav](https://github.com/kaichen686/GINav)：MATLAB 组合导航
 - [GREAT-MSF](https://github.com/GREAT-WH-UAV/GREAT-MSF)：C++ 多传感器融合框架
 - [GVINS](https://github.com/HKUST-Aerial-Robotics/GVINS)：GNSS-Visual-Inertial 紧组合
-- [ignav](https://github.com/rtkgps/ignav)：C 语言 GNSS/INS 组合导航
+- [ignav](https://github.com/rtkgps/ignav)： GNSS/INS 组合导航
 - [KF-GINS](https://github.com/i2Nav-WHU/KF-GINS)：C++ 卡尔曼滤波组合导航
 - [pyrinex](https://github.com/geospace-code/pyrinex)：Python RINEX 解析
 - [rtklib-py](https://github.com/rtklib-py/rtklib-py)：Python 版 RTKLIB
@@ -118,7 +118,7 @@ gipylib/
 
 - 不支持 PPP（精密单点定位）
 - 频率选取部分简化处理，不够专业
-- 多系统 + 双频 + 紧组合的 RTK 模糊度固定解算较慢，实时性不足，仅支持后处理
+- 仅支持后处理
 - 作者水平有限（在读研究生），如有问题欢迎反馈交流
 
 ## 建议

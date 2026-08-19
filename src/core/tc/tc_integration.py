@@ -518,11 +518,14 @@ class TcIntegration:
             if mode == "spp":
                 v, H, R, info = self._meas_builder.build(
                     self._est.state, obsr, nav, si, x=x)
-            else:   # rtk / rtd
+            elif mode == "rtk":
                 v, H, R, info = self._meas_builder.build(
                     self._est.state, obsr, nav, si, x=x, obsb=obsb,
                     P=self._est.P, amb_init_target=self._est,
                     previous_obs_t=previous_obs_t)
+            else:   # rtd
+                v, H, R, info = self._meas_builder.build(
+                    self._est.state, obsr, nav, si, x=x, obsb=obsb)
         except Exception as e:
             logger.warning(f"TC meas build 异常 (mode={mode}): {e}")
             self._degrade.on_fail(self._est, "build_error")
