@@ -317,8 +317,7 @@ class TcIntegration:
         if not self._init_imu:
             return
 
-        # 保存 nav 状态: SPP+RTK 会修改 nav 内部状态, 初始化失败时需恢复
-        # 防止污染后续 _write_gnss_only 的 SPP 初始猜测
+        # 保存 nav 状态: SPP+相对定位会修改 nav 内部状态，完成后恢复。
         saved_x = nav.x.copy()
         saved_P = nav.P.copy()
         saved_fix = nav.fix.copy() if hasattr(nav, 'fix') else None
@@ -359,11 +358,10 @@ class TcIntegration:
                 relpos(nav, obsr, obsb, rtk_sol)
                 if rtk_sol.stat != SOLQ_NONE:
                     rtk_rr = rtk_sol.rr[:3].copy()
-                    # RTK-SPP 位置一致性检验: 差异 > 50m 说明 RTK false fix, 拒绝初始化
-                    # (SPP 精度 10m 级, 正常 RTK FIX 与 SPP 差异 < 30m;
-                    #  false fix 可偏差 280m+, 用此检查过滤不可靠的 RTK 解)
+                    # 仅 RTK 保留 SPP 一致性检验以拦截载波 false fix。RTD
+                    # 是码双差定位，必须使用其相对位置初始化而非被 SPP 阈值否决。
                     pos_diff = float(np.linalg.norm(rtk_rr - x_spp[:3]))
-                    if pos_diff > 50.0:
+                    if self._mode == "rtk" and pos_diff > 50.0:
                         logger.warning(
                             f"TC init reject: RTK-SPP pos diff {pos_diff:.2f}m > 50m "
                             f"(t={t_gnss:.1f}, q={rtk_sol.stat}), skip init")
@@ -371,7 +369,7 @@ class TcIntegration:
                                           saved_fix, saved_lock)
                         return
                     rr = rtk_rr
-                    quality = rtk_sol.stat
+                    quality = 4 if self._mode == "rtd" else rtk_sol.stat
                     ns = rtk_sol.ns if rtk_sol.ns > 0 else (
                         nav.ns if nav.ns > 0 else ns)
                     if quality == 1:
@@ -424,7 +422,7 @@ class TcIntegration:
         yaw = math.atan2(vel_n[1], vel_n[0])
         att_rpy = np.array([0.0, 0.0, yaw], dtype=np.float64)
 
-        # 初始化位置: RTK 模式用 RTK 解, SPP 模式用 SPP 解
+        # 初始化位置: RTK/RTD 使用 rover/base 相对解，SPP 使用单点解。
         if self._mode in ("rtk", "rtd") and obsb is not None and quality != 5:
             pos_for_state = rr.copy()
         else:

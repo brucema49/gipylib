@@ -159,15 +159,17 @@ class TcStream:
     def _write_gnss_only(self, obsr, obsb, nav, t_gnss: float) -> None:
         """未初始化时输出纯 GNSS 解 (Qins=0, 速度=0, 姿态=0)。
 
-        只用 SPP 单点定位 (不调用 relpos 避免 nav 状态污染)。
-        保存/恢复 nav.x 防止 estpos 污染后续历元的初始猜测。
-        初始化时 _try_init 会自行调用 relpos 获取 RTK 解。
+        ``positioning_mode`` 为 rtk/rtd 时使用 rover/base 相对解；SPP
+        仅作为 relpos 的数值初值，不作为相对模式的输出回退。
         输出频率为 GNSS 频率 (1Hz)。
         """
         import numpy as np
 
-        # SPP 粗定位 (GPS-only, 保存/恢复 nav.x 避免污染)
+        # 保存/恢复所有 relpos/SPP 可能修改的导航状态。
         saved_x = nav.x.copy()
+        saved_P = nav.P.copy()
+        saved_fix = nav.fix.copy() if hasattr(nav, "fix") else None
+        saved_lock = nav.lock.copy() if hasattr(nav, "lock") else None
         try:
             from src.core.gnss.rtklib.ephemeris import satposs
             from src.core.gnss.rtklib.pntpos import estpos
@@ -177,19 +179,59 @@ class TcStream:
                 nav.x[0:3] = nav.rb
             sol, x_spp = estpos(obsr, nav, rs[:, :3], dts, svh_gps)
             if not sol.stat:
-                nav.x[:] = saved_x
                 return
         except Exception as e:
             logger.debug(f"GNSS-only SPP 异常: {e}")
-            nav.x[:] = saved_x
             return
         finally:
             nav.x[:] = saved_x
+            nav.P[:] = saved_P
+            if saved_fix is not None:
+                nav.fix[:] = saved_fix
+            if saved_lock is not None:
+                nav.lock[:] = saved_lock
 
         quality = 5       # SPP
         rr = x_spp[:3].copy()
         ns = int(sol.ns)
         pos_sd = np.array([10.0, 10.0, 10.0])
+
+        if self._tc_mode in ("rtk", "rtd"):
+            if obsb is None:
+                return
+            try:
+                from src.core.gnss.rtklib.rtkpos import relpos
+                from src.core.gnss.rtklib.rtkcmn import Sol, SOLQ_NONE
+
+                nav.x[0:6] = sol.rr[0:6]
+                nav.x[6:9] = 1e-6
+                relative_sol = Sol()
+                relative_sol.t = obsr.t
+                relpos(nav, obsr, obsb, relative_sol)
+                if relative_sol.stat == SOLQ_NONE:
+                    return
+                rr = relative_sol.rr[:3].copy()
+                ns = relative_sol.ns if relative_sol.ns > 0 else ns
+                if self._tc_mode == "rtd":
+                    quality = 4
+                    pos_sd = np.array([1.0, 1.0, 1.0])
+                else:
+                    quality = relative_sol.stat
+                    pos_sd = {
+                        1: np.array([0.1, 0.1, 0.1]),
+                        2: np.array([0.3, 0.3, 0.3]),
+                        4: np.array([1.0, 1.0, 1.0]),
+                    }.get(quality, pos_sd)
+            except Exception as e:
+                logger.debug(f"GNSS-only relative positioning 异常: {e}")
+                return
+            finally:
+                nav.x[:] = saved_x
+                nav.P[:] = saved_P
+                if saved_fix is not None:
+                    nav.fix[:] = saved_fix
+                if saved_lock is not None:
+                    nav.lock[:] = saved_lock
 
         self.writer.write_gnss_only(t_gnss, rr, quality, ns, pos_sd)
         self._output_count += 1
