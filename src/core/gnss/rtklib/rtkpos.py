@@ -523,8 +523,13 @@ def resamb_lambda(nav, sats):
     tracemat(3,'N(0)=      ', y, '7.2f')
     tracemat(3, 'Qb*1000=   ', 1000 * np.diag(Qb[0:nb]), '7.4f')
 
-    # MLAMBDA ILS
-    b, s = mlambda(y, Qb)
+    # MLAMBDA ILS (Qb 数值非正定时降级为本历元 AR 跳过, 不中断解算)
+    try:
+        b, s = mlambda(y, Qb)
+    except np.linalg.LinAlgError:
+        trace(2, 'resamb_lambda: LD factorization failed, skip AR this epoch\n')
+        nav.ratio = 0
+        return -1, -1
     tracemat(3,'N(1)=      ', b[:,0], '7.2f')
     tracemat(3,'N(2)=      ', b[:,1], '7.2f')
     nav.ratio = s[1] / s[0]

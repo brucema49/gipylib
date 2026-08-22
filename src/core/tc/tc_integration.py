@@ -990,70 +990,123 @@ class TcIntegration:
         return True
 
     def _handle_ambiguity(self, info: dict, obsr, nav) -> None:
-        """RTK 模糊度固定 (LAMBDA) + ignav 风格 holdamb。
+        """RTK 模糊度固定 (LAMBDA, 仅有效星) + ignav 风格 holdamb。
 
-        1. try_fix: LAMBDA 整数搜索, 成功则 N_stored=fixed, ε_N=0
-        2. holdamb: 对实际使用的模糊度添加约束量测 (v=0, R=VAR_HOLDAMB=0.001),
+        1. 有效星筛选: 仅取本历元相位 DD 实际使用的模糊度槽位
+           (对齐 rtklib ddidx; 全量 MAXSAT*nf 槽位含大量未跟踪星,
+           协方差奇异导致 LD 失败/ratio 失真)
+        2. try_fix: LAMBDA 整数搜索, 成功则对应槽位 N_stored=fixed, ε_N=0
+           (部分固定: 未参与槽位保持浮点)
+        3. holdamb: 对实际使用的模糊度添加约束量测 (v=0, R=VAR_HOLDAMB=0.001),
            通过 joseph_update 降低 P[amb] 同时保留交叉协方差。
            参考 ignav rtkpos.cc holdamb(): filter(x,P,H,v,R) 而非直接置 P。
-
-        与旧实现的区别:
-        - 旧: P[:,amb]=0, P[amb,:]=0, P[amb,amb]=0.001 (清零交叉项, 过度自信)
-        - 新: 仅约束 info["pairs"] 中的模糊度, 保留交叉协方差, 新卫星 P 不受影响
         """
         si = self._est.si
         if not si.has_ambiguity():
             return
-        amb_slice = slice(si.amb_start, si.amb_start + si.n_amb)
-        # effective N = N_stored + ε_N (current best direct estimate)
-        N_effective = self._est._N_stored + self._est.x[amb_slice]
-        P_amb = self._est.P[amb_slice, amb_slice]
-        # 位置方差 (rtklib thresar1 逻辑): P[pos,pos] 对角均值
+        # 仅取当前历元相位双差实际使用的模糊度槽位参与 AR。
+        # 槽位按 MAXSAT*nf 全量分配, 未跟踪卫星的行列恒为 0/陈旧值,
+        # 全维 LAMBDA 会因协方差奇异而失败或 ratio 失真 (实测非正定占
+        # ~30% 历元、ratio 恒不通过); 对应 rtklib ddidx 只选有效共视星。
+        pairs = info.get("pairs", [])
+        phase_pairs_all = [p for p in pairs if p[3] == 0]
+        if len(phase_pairs_all) < 2:
+            self._amb_fixed = False
+            return
+
+        # ---- SD→DD 变换后 LAMBDA (基于 nav 侧一致协方差) ----
+        # SD 模糊度存在公共基准方向 (全体 ±1 周期): 该方向从未被 DD 观测
+        # 约束, 其方差保持初始化量级; 直接对 SD 子块做 LAMBDA 会沿该方向
+        # 自由漂移 —— 候选解全体 +1 而残差几乎不变, ratio 恒 ≈1。
+        # 对齐 rtklib resamb_LAMBDA: y = D·x, Qb = D·Q·Dᵀ; 固定后按
+        # restamb 语义写回 (基准星保持浮点, 其余槽位 = 基准浮点值 − DD 整数)。
+        from src.core.gnss.rtklib.rtkcmn import uGNSS
+
+        def _nav_ib(sat: int, freq: int) -> int:
+            return nav.na + uGNSS.MAXSAT * freq + sat - 1
+
+        P_nav_diag = np.diag(nav.P)
+        healthy = []
+        seen_sat = set()
+        for p in phase_pairs_all:
+            frq = p[2]
+            ok_var = all(
+                1e-6 < P_nav_diag[_nav_ib(s, frq)] < 5.0e3 for s in (p[0], p[1])
+            )
+            if ok_var:
+                healthy.append(p)
+                seen_sat.update((p[0], p[1]))
+        if len(healthy) < 2 or len(seen_sat) < 3:
+            self._amb_fixed = False
+            return
+
+        # 基准星 = 出现最多的 DD 首元
+        cnt = {}
+        for p in healthy:
+            cnt[p[0]] = cnt.get(p[0], 0) + 1
+        ref_sat = max(cnt, key=cnt.get)
+        ref_frq = next(p[2] for p in healthy if p[0] == ref_sat)
+
+        dds = []  # (j_sat, j_frq, sign): y = N_ref − sign*N_j
+        for p in healthy:
+            if p[0] == ref_sat and p[2] == ref_frq:
+                dds.append((p[1], p[2], 1.0))
+            elif p[1] == ref_sat and p[2] == ref_frq:
+                dds.append((p[0], p[2], -1.0))
+        nb = len(dds)
+        if nb <= 0:
+            self._amb_fixed = False
+            return
+
+        r_i = _nav_ib(ref_sat, ref_frq)
+        nb = len(dds)
+        y_dd = np.zeros(nb)
+        Q_dd = np.zeros((nb, nb))
+        for k, (ks, kf, kg) in enumerate(dds):
+            ki = _nav_ib(ks, kf)
+            y_dd[k] = nav.x[r_i] - kg * nav.x[ki]
+            # Q[k,m] = Var(N_r − N_k 与 N_r − N_m 的协方差)
+            #        = Q[r,r] − Q[r,m'] − Q[k',r] + Q[k',m']
+            for m, (ms, mf, mg) in enumerate(dds):
+                mi = _nav_ib(ms, mf)
+                Q_dd[k, m] = (nav.P[r_i, r_i] - nav.P[r_i, mi]
+                              - nav.P[ki, r_i] + nav.P[ki, mi])
+
         posvar = float(np.mean(np.diag(
             self._est.P[si.pos:si.pos + 3, si.pos:si.pos + 3])))
-        fixed, ratio, ok = self._ambiguity.try_fix(N_effective, P_amb, posvar)
+        fixed_dd, ratio, ok = self._ambiguity.try_fix(y_dd, Q_dd, posvar)
         if not ok:
             self._amb_fixed = False
             return
 
-        # 应用整数解: N_stored = fixed, ε_N = 0
-        self._est._N_stored = fixed.copy()
-        self._est.x[amb_slice] = 0.0
+        # restamb 写回: 基准星保持浮点; 其余 = 基准浮点值 − DD 整数 (TC+nav 双写)
+        n_ref = float(nav.x[r_i])
+        fixed_slots = []
+        for k, (js, jf, sg) in enumerate(dds):
+            new_n = n_ref - sg * fixed_dd[k]
+            tc_idx = si.amb_idx(js, jf)
+            compact = tc_idx - si.amb_start
+            self._est._N_stored[compact] = new_n
+            self._est.x[tc_idx] = 0.0
+            nav.x[_nav_ib(js, jf)] = new_n
+            fixed_slots.append(tc_idx)
 
-        # ignav 风格 holdamb: 对实际使用的模糊度添加约束量测
-        # v[k] = fixed[i] - N_effective[i] = 0 (已设 N_stored=fixed, ε_N=0)
-        # H[k, i] = 1, R[k,k] = VAR_HOLDAMB = 0.001
-        # joseph_update(v=0, H, R) 不改变状态 (K·v=0), 但通过 Joseph 形式降低 P[amb]
-        # 关键: 保留交叉协方差, 未使用的模糊度槽位 P 不受影响 (新卫星可正常初始化)
+        # ignav 风格 holdamb: 仅对本次实际固定的槽位添加约束量测
+        # v[k]=0 (已写回整数), joseph_update(v=0,H,R) 不改变状态但收缩 P,
+        # 保留交叉协方差; 未固定槽位不受影响
         VAR_HOLDAMB = 0.001  # cycle², 与 ignav rtkpos.cc 一致
-        pairs = info.get("pairs", [])
-        # 提取 phase 量测 (code=0) 涉及的 (sat, freq) 唯一对
-        used_amb_idx = set()
-        for sat1, sat2, frq, code in pairs:
-            if code != 0:
-                continue  # 仅 phase 涉及模糊度
-            ii = si.amb_idx(sat1, frq)
-            jj = si.amb_idx(sat2, frq)
-            if ii >= 0:
-                used_amb_idx.add(ii)
-            if jj >= 0:
-                used_amb_idx.add(jj)
-        if used_amb_idx:
-            used_idx = sorted(used_amb_idx)
-            n_const = len(used_idx)
-            v_const = np.zeros(n_const)  # v=0 (N_effective=fixed)
-            H_const = np.zeros((n_const, si.dim))
-            R_const = np.eye(n_const) * VAR_HOLDAMB
-            for k, idx in enumerate(used_idx):
-                H_const[k, idx] = 1.0
-            # joseph_update 降低 P[used_amb] 同时保留交叉协方差
-            self._est.joseph_update(v_const, H_const, R_const)
-            # 反馈 (清零 ε_N, 累积到 stored)
-            self._est.feedback()
+        n_const = len(fixed_slots)
+        v_const = np.zeros(n_const)
+        H_const = np.zeros((n_const, si.dim))
+        R_const = np.eye(n_const) * VAR_HOLDAMB
+        for k, col in enumerate(fixed_slots):
+            H_const[k, col] = 1.0
+        self._est.joseph_update(v_const, H_const, R_const)
+        self._est.feedback()
 
         logger.info(
-            f"TC amb fixed: ratio={ratio:.2f}, n={len(fixed)}, "
-            f"n_const={len(used_amb_idx)}, holdamb R={VAR_HOLDAMB}")
+            f"TC amb fixed: ratio={ratio:.2f}, nb={nb}, "
+            f"n_const={n_const}, holdamb R={VAR_HOLDAMB}")
         self._amb_fixed = True
 
     # ===== 约束 =====

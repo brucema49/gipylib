@@ -51,7 +51,18 @@ class TcAmbiguity:
         # 注: 检查位置方差而非模糊度方差, 与 rtklib manage_amb_LAMBDA 一致
         if posvar > self.thresar_var:
             return np.array([]), 0.0, False
-        afix, s = mlambda(x_amb, P_amb, m=2)
+        # 数值防护: TC 估计器的 P_amb 子块实测存在非对称/半负定 (约30%历元,
+        # 见 issue/8-22 第12节), 对称化 + 按谱下界加微扰, 保证 LD 分解可解。
+        P = np.array(P_amb, dtype=np.float64)
+        P = 0.5 * (P + P.T)
+        eig_min = float(np.min(np.linalg.eigvalsh(P)))
+        if eig_min <= 1e-9:
+            jitter = max(1e-6, 1e-9 * float(np.trace(P)) / n)
+            P += np.eye(n) * (jitter - min(eig_min, 0.0))
+        try:
+            afix, s = mlambda(x_amb, P, m=2)
+        except np.linalg.LinAlgError:
+            return np.array([]), 0.0, False
         ratio = float(s[1] / s[0]) if s[0] > 1e-12 else 0.0
         if ratio < self.thresar:
             return np.array([]), ratio, False

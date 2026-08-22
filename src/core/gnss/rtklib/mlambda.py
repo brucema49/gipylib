@@ -26,8 +26,10 @@ def LD(Q):
     for i in range(n-1, -1, -1):
         d[i] = A[i,i]
         if d[i] <= 0.0:
-            print('LD Factorization error')
-            raise SystemExit
+            # 非正定输入: 抛标准异常由调用方降级处理 (原实现 raise SystemExit
+            # 会静默杀死调用线程/进程, 见 issue/8-22 第11.5节)
+            raise np.linalg.LinAlgError(
+                'LD factorization error: Q is not positive definite')
         L[i,:i+1] = A[i,:i+1] / np.sqrt(d[i])
         for j in range(i):
             A[j,:j+1] -= L[i,:j+1] * L[i,j]

@@ -172,6 +172,20 @@ class TcEstimator(LcEstimator):
                 for k in range(3):
                     self.P[clk0 + k, clk0 + k] += q_clk
 
+            # 模糊度随机游走 (对齐 rtklib udbias: P[j,j] += prnbias²·|tt|)。
+            # GNSS 块 Q=0 会令被跟踪槽位方差过度收敛趋 0 (K→0, 误差不可观),
+            # 使 LAMBDA 的 Qb 病态、ratio 失真; 仅对已初始化的槽位注入
+            # (排除 init≈1e4 的僵尸槽位与清零槽位)。见 issue/8-22 第12节。
+            if si.has_ambiguity():
+                a0 = si.amb_start
+                a1 = a0 + si.n_amb
+                prnbias = float(self._tc_config.get("gnss", {}).get(
+                    "prnbias", 0.03))
+                q_amb = prnbias * prnbias * dt
+                d = self.P[a0:a1, a0:a1].diagonal()
+                grow = (d > 1e-9) & (d < 5.0e3)
+                self.P[a0:a1, a0:a1][grow, grow] += q_amb
+
         self.P = 0.5 * (self.P + self.P.T)
 
     def reset_clk_variance(self):

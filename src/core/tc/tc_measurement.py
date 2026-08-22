@@ -97,12 +97,21 @@ def sync_tc_ambiguities_with_rtklib(nav, obsb, obsr, iu, ir, estimator,
         for s in range(1, uGNSS.MAXSAT + 1)
     ]
     # 1. TC -> rtklib: effective ambiguity (stored + error) and covariance.
+    #    仅拷贝已初始化的健康槽位: 排除 init≈1e4 的僵尸槽位。否则其 10000
+    #    会经本步写入 nav.P, 再被步骤3当作 "nav 值" 回读到 TC 对角,
+    #    清零逻辑被自身回写值 defeat, 僵尸永生 (issue/8-22 第12节)。
     effective = estimator.effective_x()
+    ptc_diag = np.diag(estimator.P)
+    healthy = {tc_i for tc_i, _ in amb_pairs if 1e-9 < ptc_diag[tc_i] < 5.0e3}
     for tc_idx, rtk_idx in amb_pairs:
-        nav.x[rtk_idx] = effective[tc_idx]
+        if tc_idx in healthy:
+            nav.x[rtk_idx] = effective[tc_idx]
     for tc_i, rtk_i in amb_pairs:
+        if tc_i not in healthy:
+            continue
         for tc_j, rtk_j in amb_pairs:
-            nav.P[rtk_i, rtk_j] = estimator.P[tc_i, tc_j]
+            if tc_j in healthy:
+                nav.P[rtk_i, rtk_j] = estimator.P[tc_i, tc_j]
 
     # 2. Temporal update: cycle-slip detection + re-init + random walk.
     if previous_obs_t is not None:
@@ -114,6 +123,8 @@ def sync_tc_ambiguities_with_rtklib(nav, obsb, obsr, iu, ir, estimator,
     # 3. rtklib -> TC.  ``udbias`` may have reset the state to 0 (cycle slip /
     #    outage), in which case the TC slot is cleared and re-seeded from
     #    ``nav.P``; otherwise only the stored value and diagonal are updated.
+    sig_n0_sq = float(getattr(estimator, "_tc_config", {}).get(
+        "gnss", {}).get("sig_n0", 30.0)) ** 2
     for tc_idx, rtk_idx in amb_pairs:
         compact = tc_idx - si.amb_start
         if nav.x[rtk_idx] == 0.0:
@@ -121,7 +132,8 @@ def sync_tc_ambiguities_with_rtklib(nav, obsb, obsr, iu, ir, estimator,
             estimator.x[tc_idx] = 0.0
             estimator.P[tc_idx, :] = 0.0
             estimator.P[:, tc_idx] = 0.0
-            estimator.P[tc_idx, tc_idx] = nav.P[rtk_idx, rtk_idx]
+            # 重播种为初始方差 (待用状态), 而非回读被步骤1污染的 nav.P
+            estimator.P[tc_idx, tc_idx] = sig_n0_sq
         else:
             estimator._N_stored[compact] = nav.x[rtk_idx] - estimator.x[tc_idx]
             estimator.P[tc_idx, tc_idx] = nav.P[rtk_idx, rtk_idx]
