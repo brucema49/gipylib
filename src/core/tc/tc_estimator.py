@@ -186,6 +186,17 @@ class TcEstimator(LcEstimator):
                 grow = (d > 1e-9) & (d < 5.0e3)
                 self.P[a0:a1, a0:a1][grow, grow] += q_amb
 
+        # P_vel 运行点下限 (对齐 ignav propinss 自然平衡值 ~17mm):
+        # ignav 无 vel_psd 注入, 其 P_vel 由 Phi 耦合自然维持在 mm-cm 级;
+        # gipylib 在 vel_psd=0 时 P_vel 会塌缩至更低导致 K 过小、机动段
+        # 恢复缓慢 (MECH-14 长偏移)。此处直接强制相同运行点。
+        vel_floor = float(self._tc_config.get("ins", {}).get(
+            "vel_var_floor", 0.0))
+        if vel_floor > 0.0:
+            for k in range(3):
+                if self.P[3 + k, 3 + k] < vel_floor:
+                    self.P[3 + k, 3 + k] = vel_floor
+
         self.P = 0.5 * (self.P + self.P.T)
 
     def reset_clk_variance(self):
