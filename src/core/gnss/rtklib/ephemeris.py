@@ -12,6 +12,8 @@ from .rtkcmn import sat2prn, trace
 # ephemeris parameters
 MAX_ITER_KEPLER = 30
 RTOL_KEPLER = 1e-13
+_SIN_5 = np.sin(-5.0 * np.pi / 180.0)   # BDS GEO 倾角偏移 -5°
+_COS_5 = np.cos(-5.0 * np.pi / 180.0)
 TSTEP = 120 #60.0  # time step for Glonass orbital calcs
 ERREPH_GLO = 5.0
 
@@ -88,11 +90,11 @@ def eph2pos(t, eph):
 *          satellite clock includes relativity correction without code bias
 *          (tgd or bgd) """
     tk = dtadjust(t, eph.toe)
-    sys, _ = sat2prn(eph.sat)
+    sys, prn = sat2prn(eph.sat)
     if sys == uGNSS.GAL:
         mu = rCST.MU_GAL
         omge = rCST.OMGE_GAL
-    else:  # GPS,QZS
+    else:  # GPS,QZS,BDS (BDS 的 MU/OMGE 与 GPS 相同)
         mu = rCST.MU_GPS
         omge = rCST.OMGE
 
@@ -118,9 +120,23 @@ def eph2pos(t, eph):
     x = r * np.cos(u)
     y = r * np.sin(u)
     cosi = np.cos(i)
-    O = eph.OMG0 + (eph.OMGd - omge) * tk - omge * eph.toes
-    sinO, cosO = np.sin(O), np.cos(O)
-    rs = [x * cosO - y * cosi * sinO, x * sinO + y * cosi * cosO, y * np.sin(i)]
+
+    # BDS GEO 卫星旋转修正 (RTKLIB ephemeris.c ref [9] table 4-1)
+    if sys == uGNSS.BDS and (prn <= 5 or prn >= 59):
+        O = eph.OMG0 + eph.OMGd * tk - omge * eph.toes
+        sinO, cosO = np.sin(O), np.cos(O)
+        xg = x * cosO - y * cosi * sinO
+        yg = x * sinO + y * cosi * cosO
+        zg = y * np.sin(i)
+        sino = np.sin(omge * tk)
+        coso = np.cos(omge * tk)
+        rs = [xg * coso + yg * sino * _COS_5 + zg * sino * _SIN_5,
+              -xg * sino + yg * coso * _COS_5 + zg * coso * _SIN_5,
+              -yg * _SIN_5 + zg * _COS_5]
+    else:
+        O = eph.OMG0 + (eph.OMGd - omge) * tk - omge * eph.toes
+        sinO, cosO = np.sin(O), np.cos(O)
+        rs = [x * cosO - y * cosi * sinO, x * sinO + y * cosi * cosO, y * np.sin(i)]
     tk = dtadjust(t, eph.toc)
     dts = eph.f0 + eph.f1 * tk + eph.f2 * tk**2
     # relativity correction
