@@ -46,9 +46,10 @@ class TcStream:
     - 初始化由 TcIntegration._try_init 内部完成 (SPP 粗定位)
     """
 
-    def __init__(self, config: dict, writer):
+    def __init__(self, config: dict, writer, stat_writer=None):
         self.config = config
         self.writer = writer
+        self.stat_writer = stat_writer
         self._tc_mode = config.get("gnss", {}).get("positioning_mode", "spp")
         self._integ = TcIntegration(
             config, mode=self._tc_mode, output_callback=self._write_integration_output
@@ -67,8 +68,12 @@ class TcStream:
 
     def open(self) -> None:
         self.writer.open()
+        if self.stat_writer is not None:
+            self.stat_writer.open()
 
     def close(self) -> None:
+        if self.stat_writer is not None:
+            self.stat_writer.close()
         self.writer.close()
 
     def finalize(self) -> int:
@@ -154,6 +159,14 @@ class TcStream:
             qins,
             self._integ._last_ns,
         )
+        if self.stat_writer is not None:
+            self.stat_writer.write(
+                state, P, si,
+                self._integ._last_q,
+                qins,
+                self._integ._last_ns,
+                update_info=getattr(self._integ, "last_update_info", None),
+            )
         self._output_count += 1
 
     def _write_gnss_only(self, obsr, obsb, nav, t_gnss: float) -> None:
@@ -234,6 +247,8 @@ class TcStream:
                     nav.lock[:] = saved_lock
 
         self.writer.write_gnss_only(t_gnss, rr, quality, ns, pos_sd)
+        if self.stat_writer is not None:
+            self.stat_writer.write_gnss_only(t_gnss, rr, quality, ns, pos_sd)
         self._output_count += 1
 
     def _write_state(self, qins: int) -> None:
@@ -246,4 +261,9 @@ class TcStream:
         num_sv = self._integ._last_ns if hasattr(self._integ, '_last_ns') else 0
         q = self._integ._last_q if hasattr(self._integ, '_last_q') else 5
         self.writer.write(state, P, si, q, qins, num_sv)
+        if self.stat_writer is not None:
+            self.stat_writer.write(
+                state, P, si, q, qins, num_sv,
+                update_info=getattr(self._integ, "last_update_info", None),
+            )
         self._output_count += 1

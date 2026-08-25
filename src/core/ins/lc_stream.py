@@ -38,9 +38,10 @@ class LcStream:
     动态初始化 (position_diff / velocity_vector) 成功后切换增量模式。
     """
 
-    def __init__(self, config: dict, writer):
+    def __init__(self, config: dict, writer, stat_writer=None):
         self.config = config
         self.writer = writer
+        self.stat_writer = stat_writer
         self.initializer = InsInitializer(config)
         self._init_mode = self._select_init_mode(config)
 
@@ -59,8 +60,12 @@ class LcStream:
 
     def open(self) -> None:
         self.writer.open()
+        if self.stat_writer is not None:
+            self.stat_writer.open()
 
     def close(self) -> None:
+        if self.stat_writer is not None:
+            self.stat_writer.close()
         self.writer.close()
 
     @staticmethod
@@ -191,6 +196,11 @@ class LcStream:
             qins=qins,
             num_sv=self._last_gnss_ns,
         )
+        if self.stat_writer is not None:
+            self.stat_writer.write(
+                state=state, P=P, si=self._si, q=self._last_q,
+                qins=qins, num_sv=self._last_gnss_ns,
+            )
         self._output_count += 1
 
     def _write_state(self, qins: int) -> None:
@@ -203,6 +213,11 @@ class LcStream:
             qins=qins,
             num_sv=self._last_gnss_ns,
         )
+        if self.stat_writer is not None:
+            self.stat_writer.write(
+                state=self._est.state, P=self._est.P, si=self._si,
+                q=self._last_q, qins=qins, num_sv=self._last_gnss_ns,
+            )
         self._output_count += 1
 
     def _write_gnss_only(self, gnss: GnssSolution) -> None:
@@ -215,6 +230,14 @@ class LcStream:
             num_sv=gnss.num_sv,
             pos_sd=pos_sd,
         )
+        if self.stat_writer is not None:
+            self.stat_writer.write_gnss_only(
+                timestamp=gnss.timestamp,
+                rr=gnss.position,
+                quality=gnss.quality,
+                ns=gnss.num_sv,
+                pos_sd=pos_sd if gnss.sd is not None else np.full(3, 10.0),
+            )
         self._output_count += 1
 
     def finalize(self) -> int:

@@ -18,6 +18,7 @@ from src.log.aligned_writer import AlignedWriter
 from src.log.aligner import Aligner
 from src.log.logger import Logger, TcLogger
 from src.log.rslt_writer import RSLTWriter
+from src.log.stat_writer import StatWriter
 from src.log.solution_writer import SolutionWriter
 from src.log.solution_logger import SolutionLogger
 from src.log.trace_file_writer import TraceFileWriter
@@ -44,6 +45,20 @@ def main(config_path: str = "data/config.yaml"):
             trace_level=trace_level,
         )
         trace_writer.open()
+        if trace_writer.enabled:
+            import hashlib as _hashlib
+            cfg_sum = ""
+            try:
+                with open(config_path, "rb") as fh:
+                    cfg_sum = _hashlib.md5(fh.read()).hexdigest()[:12]
+            except OSError:
+                pass
+            trace_writer.write_event(
+                1, "RUN_START",
+                f"config={config_path} md5={cfg_sum} "
+                f"mode={config['ins']['enabled']} "
+                f"stat_level={int(output_cfg.get('stat_level', 0))}",
+                mode=config["ins"]["enabled"])
 
     control = ThreadControl()
     imu_queue = Queue(maxsize=200)
@@ -63,6 +78,10 @@ def main(config_path: str = "data/config.yaml"):
         s.join(timeout=2)
 
     if trace_writer is not None:
+        if trace_writer.enabled:
+            trace_writer.write_event(1, "RUN_END",
+                                     f"elapsed={elapsed:.1f}s",
+                                     mode=config["ins"]["enabled"])
         trace_writer.close()
 
     print(f"运行时长: {elapsed:.1f}s ({int(elapsed // 60)}m {elapsed % 60:.1f}s)")
@@ -75,6 +94,52 @@ def _get_output_formats(config: dict):
         output_cfg.get("position_format", "llh"),
         output_cfg.get("time_format", "gpst"),
     )
+
+
+class _GnssStatTee:
+    """off 模式复合输出器: SolutionWriter(.pos) + StatWriter(.stat) 同步写入。"""
+
+    def __init__(self, solution_writer, stat_writer):
+        self._sol = solution_writer
+        self._stat = stat_writer
+
+    def open(self):
+        self._sol.open()
+        if self._stat is not None:
+            self._stat.open()
+
+    def write(self, sol):
+        self._sol.write(sol)
+        if self._stat is not None:
+            self._stat.write_gnss(sol)
+
+    def close(self):
+        if self._stat is not None:
+            self._stat.close()
+        self._sol.close()
+
+
+def _parse_output_switches(config):
+    """解析 output: 段的 stat/trace 开关并校验。
+
+    Returns:
+        dict(stat_level, stat_rate, stat_filename, trace_enabled, trace_level)
+    """
+    out = config.get("output", {})
+    stat_level = int(out.get("stat_level", 0))
+    if stat_level not in (0, 1, 2, 3):
+        raise ValueError(f"output.stat_level 必须是 0/1/2/3, 收到 {stat_level}")
+    stat_rate = str(out.get("stat_rate", "update"))
+    if stat_rate not in ("update", "second", "imu"):
+        raise ValueError(f"output.stat_rate 必须是 update/second/imu, 收到 {stat_rate}")
+    stat_filename = str(out.get("stat_filename", ""))
+    trace_enabled = bool(out.get("trace_enabled", True))
+    trace_level = int(out.get("trace_level", 0))
+    if trace_level not in (0, 1, 2, 3):
+        raise ValueError(f"output.trace_level 必须是 0/1/2/3, 收到 {trace_level}")
+    return {"stat_level": stat_level, "stat_rate": stat_rate,
+            "stat_filename": stat_filename, "trace_enabled": trace_enabled,
+            "trace_level": trace_level}
 
 
 def _assemble_pipeline(config, control, imu_queue, gnss_queue):
@@ -99,12 +164,24 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
         # 路径 B: 纯 GNSS .pos 输出
         sensors = SensorFactory.create_sensors(config, imu_queue, gnss_queue, control)
         filename = config["output"].get("gnss_filename", "RTK.pos")
+        sw = _parse_output_switches(config)
         writer = SolutionWriter(
             output_dir=config["output"]["output_dir"],
             filename=filename,
             position_format=pos_fmt,
             time_format=time_fmt,
         )
+        stat_writer = None
+        if sw["stat_level"] > 0:
+            stat_writer = StatWriter(
+                output_dir=config["output"]["output_dir"],
+                stat_level=sw["stat_level"],
+                stat_rate=sw["stat_rate"],
+                filename=sw["stat_filename"],
+                ref_filename=filename,
+                mode="off",
+            )
+            writer = _GnssStatTee(writer, stat_writer)
         logger = SolutionLogger(gnss_queue, writer, control)
         return sensors, logger
 
@@ -133,8 +210,19 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
             position_format=pos_fmt,
             time_format=time_fmt,
         )
+        sw = _parse_output_switches(config)
+        stat_writer = None
+        if sw["stat_level"] > 0:
+            stat_writer = StatWriter(
+                output_dir=config["output"]["output_dir"],
+                stat_level=sw["stat_level"],
+                stat_rate=sw["stat_rate"],
+                filename=sw["stat_filename"],
+                ref_filename=lc_filename,
+                mode="lc",
+            )
         from src.core.ins.lc_stream import LcStream
-        lc_stream = LcStream(config, lc_writer)
+        lc_stream = LcStream(config, lc_writer, stat_writer=stat_writer)
         aligner = Aligner(imu_dt=1.0 / config["ins"]["data_rate"])
         logger = Logger(imu_queue, gnss_queue, writer, aligner, control,
                         gnss_writer=gnss_writer, lc_stream=lc_stream)
@@ -152,8 +240,19 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
             position_format=pos_fmt,
             time_format=time_fmt,
         )
+        sw = _parse_output_switches(config)
+        stat_writer = None
+        if sw["stat_level"] > 0:
+            stat_writer = StatWriter(
+                output_dir=config["output"]["output_dir"],
+                stat_level=sw["stat_level"],
+                stat_rate=sw["stat_rate"],
+                filename=sw["stat_filename"],
+                ref_filename=tc_filename,
+                mode="tc",
+            )
         from src.core.tc.tc_stream import TcStream
-        tc_stream = TcStream(config, tc_writer)
+        tc_stream = TcStream(config, tc_writer, stat_writer=stat_writer)
         # harvest_window 与 LC 一致 (1.0s), 保证 IMU 覆盖 GNSS 历元窗口
         harvest_window = 1.0
         logger = TcLogger(imu_queue, gnss_queue, tc_stream, control,

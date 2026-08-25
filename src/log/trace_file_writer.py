@@ -86,11 +86,32 @@ class TraceFileWriter:
         path = Path(self.output_dir) / self.filename
         self._fp = open(path, "w", encoding="utf-8")
         self._fp.write(
-            "# GInsStream trace file (level=%d)\n" % self.trace_level
+            "# GInsStream trace file (level=%d) schema=GIPY_TRACE_V1\n"
+            % self.trace_level
         )
-        self._fp.write("# 时间格式: GPS 周 + 周内秒 (week sow)\n\n")
+        self._fp.write("# 时间格式: GPS 周 + 周内秒 (week sow)\n")
+        self._fp.write("# 事件行格式: <level> <week> <sow> <mode> <event> <message>\n\n")
         self._closed = False
         self._patch_rtklib_trace()
+
+    def write_event(self, level: int, event: str, msg: str = "",
+                    mode: str = "-", timestamp: Optional[float] = None) -> None:
+        """写一条应用层事件行: <level> <week> <sow> <mode> <event> <message>。
+
+        trace 未启用或写入异常时不抛出 (不得阻塞解算线程)。
+        """
+        if not self.enabled or self._fp is None:
+            return
+        try:
+            if timestamp is not None:
+                week, sow = unix_to_gpst(timestamp)
+                self._fp.write("%d %d %.3f %s %s %s\n"
+                               % (level, week, sow, mode, event, msg))
+            else:
+                self._fp.write("%d - - %s %s %s\n" % (level, mode, event, msg))
+            self._fp.flush()
+        except Exception:
+            pass
 
     def _patch_rtklib_trace(self) -> None:
         """替换 rtklib-py 的 trace() 和 tracelevel() 函数。

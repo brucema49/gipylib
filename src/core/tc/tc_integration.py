@@ -114,6 +114,11 @@ class TcIntegration:
         self._writer = None
         self._output_count = 0
         self.last_qins: int = 2
+        # 一次性 yaw 航向对齐状态 (ins.yaw_align_on_move=1 时启用)
+        self._yaw_aligned = False
+        self._yaw_hist = collections.deque()
+        # 最近一次量测更新的轻量信息快照 (stat_writer GIPY_* 使用)
+        self.last_update_info = None
         # false fix 检测: 跟踪上次量测更新后的位置, 检测异常跳变
         self._last_meas_pos: Optional[np.ndarray] = None
         self._amb_fixed: bool = False
@@ -651,6 +656,20 @@ class TcIntegration:
             n_code_att=int(info.get("n_code_att", 0)),
             n_code_acc=int(info.get("n_code_acc", 0)),
         )
+        # 轻量更新信息快照 (供 stat_writer 的 GIPY_INNOV/GIPY_GAIN 使用)
+        self.last_update_info = {
+            "mode": mode,
+            "innovation_norm": float(np.linalg.norm(v)),
+            "n_meas": int(n_meas),
+            "n_phase_acc": int(info.get("n_phase_acc", 0)),
+            "n_code_acc": int(info.get("n_code_acc", 0)),
+            "k_pos_norm": float(k_pos_norm),
+            "k_vel_norm": float(k_vel_norm),
+            "k_att_norm": float(k_att_norm),
+            "k_bg_norm": float(k_bg_norm),
+            "k_ba_norm": float(k_ba_norm),
+            "ref_sats": info.get("ref_sats", []),
+        }
         self._degrade.on_success(self._est)
         self.last_qins = 3  # TC 量测更新完成
         self._meas_count += 1
@@ -683,6 +702,73 @@ class TcIntegration:
                 return
 
         self._last_meas_pos = self._est.state.pos_e.copy()
+        self._maybe_align_yaw(t_gnss)
+
+    def _maybe_align_yaw(self, t_gnss: float) -> None:
+        """一次性 yaw 航向对齐 (等价 ignav ant2inins/vel2head 语义)。
+
+        背景: RTD-TC 码差量测对姿态零可观测 (零杆臂时 H[att]=0), 静态初始化
+        yaw 完全未知 (P_yaw=π²); 手机 MEMS 陀螺漂移使 yaw 在传播中发散到
+        数十度, 重力泄漏产生 m/s² 级虚假加速度。车辆起步后, 用自身更新点
+        位置在时间窗内的位移方向作为航向观测 (公共水平偏置在差分中抵消),
+        一次性把 yaw 拉齐并把 P_yaw 收紧。
+
+        触发条件(全部满足, 且仅执行一次):
+          - 配置 ins.yaw_align_on_move=1
+          - 尚未对齐
+          - 已积累 >= yaw_align_window 秒的对齐缓存
+          - 缓存首尾水平位移 >= yaw_align_min_disp 米 (保证航向可观测)
+        """
+        ins_cfg = self._cfg.get("ins", {})
+        if not int(ins_cfg.get("yaw_align_on_move", 0)) or self._yaw_aligned:
+            return
+        pos = self._est.state.pos_e.copy()
+        self._yaw_hist.append((t_gnss, pos))
+        win = float(ins_cfg.get("yaw_align_window", 10.0))
+        min_disp = float(ins_cfg.get("yaw_align_min_disp", 15.0))
+        t0, p0 = self._yaw_hist[0]
+        if t_gnss - t0 < win:
+            return
+        d = pos - p0
+        disp_h = float(np.hypot(d[0], d[1]))
+        if disp_h < min_disp:
+            self._yaw_hist.popleft()
+            return
+        # ECEF 位移 -> ENU 航向
+        lat, lon, _ = ecef2llh(pos)
+        sl, cl, so, co = np.sin(lat), np.cos(lat), np.sin(lon), np.cos(lon)
+        R = np.array([[-so, co, 0.0],
+                      [-sl * co, -sl * so, cl],
+                      [cl * co, cl * so, sl]])
+        enu = R @ d
+        heading_ned = math.atan2(enu[0], enu[1])  # atan2(East, North)
+
+        state = self._est.state
+        roll, pitch, _ = state.att_rpy
+        cr, sr, cp, sp, cy, sy = (math.cos(roll), math.sin(roll),
+                                  math.cos(pitch), math.sin(pitch),
+                                  math.cos(heading_ned), math.sin(heading_ned))
+        C_b_n = np.array([
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ])
+        C_e_n = cal_Ce2n(lat, lon)
+        new_Cbe = C_e_n.T @ C_b_n
+        from src.core.ins.attitude import dcm2quat, quat2dcm
+        state.C_b_e = quat2dcm(dcm2quat(new_Cbe))
+        state.q_b_e = dcm2quat(state.C_b_e)
+        state.att_rpy = np.array([roll, pitch, heading_ned])
+        si = self._est.si
+        yaw_var = float(ins_cfg.get("yaw_align_std", 5.0)) ** 2
+        for k in range(3):
+            self._est.P[si.att + k, si.att + k] = max(
+                yaw_var if k == 2 else self._est.P[si.att + k, si.att + k], 0.0)
+            self._est.x[si.att + k] = 0.0
+        self._yaw_aligned = True
+        logger.warning(
+            f"TC yaw aligned from displacement: heading={math.degrees(heading_ned):.1f} deg, "
+            f"disp={disp_h:.1f}m over {t_gnss - t0:.1f}s")
 
     def _ambiguity_enabled(self, mode: str, has_ambiguity: bool) -> bool:
         """判断当前 TC 配置是否允许执行模糊度固定/保持。
