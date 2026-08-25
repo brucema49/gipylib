@@ -6,8 +6,8 @@
 
 实验矩阵由两部分组成：
 
-1. 主矩阵：两套程序各运行 RTK、RTK-TC、RTK-LC，主星座配置为 GPS+BDS（必要时保留现有全星座作为对照）。
-2. BDS-3 专项：两套程序的纯 GNSS 和 TC 分别运行 `GPS-only`、`BDS-only`、`GPS+BDS`；LC 仅对主矩阵的全星座配置做端到端检查。
+1. 主矩阵：两套程序各运行 RTK、RTK-TC、RTK-LC，主星座配置固定为 GPS+BDS。
+2. BDS-3 专项：两套程序的纯 GNSS 和 TC 分别运行 `GPS-only`、`BDS-only`、`GPS+BDS`；LC 仅对主矩阵的 GPS+BDS 配置做端到端检查。
 
 精度主参考为 `HG4930_GroundTruth.txt`（IMU 参考点），并使用给定 IMU→GNSS 杆臂和安装旋转转换到天线点，与 `ROVE_GroundTruth.txt` 交叉验证。
 
@@ -81,7 +81,7 @@ IMR 原始数据保持 RFU；配置显式声明 RFU，由两个程序输入层�
 
 评估器读取 `.pos`/`.rslt` 和两份真值，完成：
 
-- GPS week/sow 对齐，必要时线性插值真值；
+- GPS week/sow 对齐；解算历元落在相邻真值历元之间且距两端均不超过 1.01 s 时线性插值，否则不纳入精度统计并计入未匹配覆盖率；
 - ECEF 残差转 ENU；
 - 位置 E/N/U、水平、3D 的 RMSE、均值、标准差、最大值和 95% 分位；
 - 速度误差（ECEF 与 ENU）同样统计；
@@ -120,3 +120,4 @@ IMR 原始数据保持 RFU；配置显式声明 RFU，由两个程序输入层�
 - 统一精度评估脚本及位置/姿态/BDS 图表；
 - `HG4930` 主真值、`ROVE` 杆臂交叉验证报告；
 - gipylib 与 ignav 的 RTK/TC/LC 及 BDS-3 对比总结。
+- `Data19_20201214_HG4930_CAR_Opensky/skill/first_compute.md`：包含环境检查、解码、逐组配置与命令、验收判据、结果索引和故障停止条件的最终运行指导。
