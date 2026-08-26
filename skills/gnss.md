@@ -35,6 +35,33 @@
 
 ---
 
+## 北斗与 BDS-3 处理基线（Data19 已验证）
+
+北斗不是 GPS 频点或 GPS 时标的别名。启用 `BDS` 时，RINEX 解析、广播星历、卫星
+坐标/钟差、SPP 星间钟偏和相对定位必须同时处于 BDS 路径；只看到 `Cxx` 卫星进入
+观测数组并不足以证明北斗或 BDS-3 可用。
+
+| 项目 | 当前约定/实现 | 不能省略的检查 |
+| --- | --- | --- |
+| RINEX 观测 | `C1I/L1I` -> 槽位 0，`C7I/L7I` -> 槽位 1；按信号频带号映射 | 分别核对 rover/base 的 P/L/S/LLI；BASE 的 `C,C,L,L,S,S` 排列曾导致 C7I 丢失 |
+| BDS 双频 | B1I=`1561.098 MHz`、B2I/B2b=`1207.14 MHz` | `freq_ix0[BDS]=6`、`freq_ix1[BDS]=3`，且 `freq_table[6]` 必须存在；不得误用 GPS L1/L2 |
+| 时间 | BDT 转 GPST：`week+1356` 且 `toc/toe/tot+14 s` | 比较选中 TOE/TOC；漏 14 s 会产生数十公里级卫星沿迹误差 |
+| GEO 轨道 | PRN `1..5`、`59+` 使用 GEO 专用 5 deg 倾角旋转 | 按 ECEF 三分量和钟差与 RTKLIB 对照，不能只看轨道半径 |
+| SPP/TC 时钟 | GPS 公共钟差之外，GLO/GAL/BDS 各有 ISB；SPP 为位置 + 4 个钟差参数 | GPS+BDS 必须估计 BDS ISB，不能把 BDT-GPST 偏差留在伪距残差中 |
+
+Data19 HG4930 端到端验证得到 GPS+BDS RTK 固定率 `99.7%`，且与 RTKLIB 双固定
+历元解差 RMSE 为 `2.7 cm`。这验证了 B1I/B2I 和已见 BDS-3 卫星的当前处理链，
+并不表示任意 BDS RINEX/B-CNAV2 均已覆盖。BDS-only RTK 仍可能没有 FIX；应以浮点
+误差、有效历元和同配置 RTKLIB 对照判断，不能仅以 FIX 率判定失败。
+
+诊断顺序固定为：原始 RINEX 列与信号 -> 频率/波长 -> BDT/GPST 和 TOE/TOC ->
+卫星 ECEF/钟差/TGD -> SPP 残差 -> rover/base 公共卫星与 DD 残差 -> AR/最终解。
+完整 9-case GPS/BDS/GPS+BDS 对照见
+`Data19_20201214_HG4930_CAR_Opensky/bds_diagnosis/README.md` 与
+`issue/8-25北斗卫星处理修复.md`。
+
+---
+
 ## 目录
 
 - [1. 架构总览](#1-架构总览)

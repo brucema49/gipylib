@@ -148,8 +148,8 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 
 | 字段 | 类型 | 默认值 | 单位 | 说明 | rtklib-py 对应 |
 |------|------|--------|------|------|---------------|
-| `maxinno` | float | `1.0` | m | 载波相位周跳/粗差阈值 | `maxinno` |
-| `maxcode` | float | `10.0` | m | 伪距粗差阈值 | `maxcode` |
+| `maxinno` | float | `5.0`（RTK 建议） | m | 载波相位双差创新/粗差阈值；不等于伪距门限 | `maxinno` |
+| `maxcode` | float | `30.0`（RTKLIB 参考） | m | 伪距创新/粗差阈值，与 `maxinno` 独立 | `maxcode` |
 | `maxage` | float | `30.0` | s | 最大差分龄期 | `maxage` |
 | `maxout` | int | `4` | epoch | 最大差分中断历元数 | `maxout` |
 | `thresdop` | float | `5.0` | — | 多普勒法周跳检测阈值 | `thresdop` |
@@ -203,10 +203,10 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 
 | 字段 | 类型 | 默认值 | 说明 | rtklib-py 对应 |
 |------|------|--------|------|---------------|
-| `gnss_t` | list | `["GPS", "GLO", "GAL"]` | 启用星座列表 | `gnss_t` |
-| `freq_ix0` | dict | `{GPS: 0, GLO: 4, GAL: 0}` | 第一频率索引（L1） | `freq_ix0` |
-| `freq_ix1` | dict | `{GPS: 2, GLO: 5, GAL: 2}` | 第二频率索引（L5/E5b） | `freq_ix1` |
-| `freq_table` | list | `[1.57542e9, 1.22760e9, 1.17645e9, 1.20714e9, 1.60200e9, 1.24600e9]` | 支持频率表 (Hz) | `freq` |
+| `gnss_t` | list | `["GPS", "GLO", "GAL"]` | 启用星座列表；北斗显式写 `BDS` | `gnss_t` |
+| `freq_ix0` | dict | `{GPS: 0, GLO: 4, GAL: 0, BDS: 6}` | BDS B1I/B1C 为索引 6 | `freq_ix0` |
+| `freq_ix1` | dict | `{GPS: 2, GLO: 5, GAL: 2, BDS: 3}` | BDS B2I/B2b 为索引 3 | `freq_ix1` |
+| `freq_table` | list | `[1.57542e9, 1.22760e9, 1.17645e9, 1.20714e9, 1.60200e9, 1.24600e9, 1.561098e9]` | 支持频率表 (Hz)，BDS B1I 不可省略 | `freq` |
 | `dfreq_glo` | [float, float] | `[0.56250e6, 0.43750e6]` | Hz | GLONASS 频率间隔 [L1, L2] | `dfreq_glo` |
 
 **支持的信号类型**（sig_tbl 映射）：
@@ -217,6 +217,13 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 | `2W` / `2L` / `2C` / `2X` | L2W / L2L / L2C / L2X |
 | `5Q` / `5X` | L5Q / L5X |
 | `7Q` / `7X` | L7Q / L7X |
+| `1I` | BDS B1I（`1561.098 MHz`） |
+| `7I` | BDS B2I/B2b（`1207.14 MHz`） |
+
+北斗 RINEX 的 `C1I/L1I`、`C7I/L7I` 必须分别进入双频槽位 0/1。当前实现按
+信号频带号而非头部列位置映射，以兼容 `C,C,L,L,S,S` 类型分组。BDS 广播星历
+从 BDT 转 GPST 时同时执行 `week+1356` 和 `toc/toe/tot+14 s`；BDS GEO PRN
+`1..5`、`59+` 使用专用坐标旋转。GPS+BDS SPP 与 SPP-TC 使用 BDS 独立 ISB。
 
 ### 3.9 基站与初始位置
 

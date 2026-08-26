@@ -101,8 +101,8 @@ GNSS 配置部分参考 rtklib-py 的 `config_phone.py` / `config_f9p.py`，已�
 
 | 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
 |------|------|--------|------|---------|------|
-| `maxinno` | double | `1.0` | m | >0 | 载波相位周跳/粗差检测阈值（创新值），超限观测值被剔除 |
-| `maxcode` | double | `10.0` | m | >0 | 伪距粗差检测阈值，超限观测值被剔除 |
+| `maxinno` | double | `5.0`（RTK 建议） | m | >0 | **载波相位**双差创新/粗差阈值；不是伪距门限。Data19 稳定 RTK 使用 5.0，改为 30 会放过未初始化模糊度行并损害 FIX |
+| `maxcode` | double | `30.0`（RTKLIB 参考） | m | >0 | **伪距**创新/粗差阈值；与 `maxinno` 独立，不能用一个值同时表达两者 |
 | `maxage` | double | `30.0` | s | >0 | 最大差分龄期，超限后差分修正失效 |
 | `maxout` | int | `4` | epoch | >0 | 最大差分中断历元数，超限后差分重置 |
 | `thresdop` | double | `5.0` | — | >0 | 多普勒法周跳检测阈值 |
@@ -156,11 +156,31 @@ GNSS 配置部分参考 rtklib-py 的 `config_phone.py` / `config_f9p.py`，已�
 
 | 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
 |------|------|--------|------|---------|------|
-| `gnss_t` | array | `["GPS", "GLO", "GAL"]` | — | 星座列表 | 启用星座列表 |
-| `freq_ix0` | dict | `{GPS: 0, GLO: 4, GAL: 0}` | — | 频率索引 | 第一频率索引（L1） |
-| `freq_ix1` | dict | `{GPS: 2, GLO: 5, GAL: 2}` | — | 频率索引 | 第二频率索引（L5/E5b） |
-| `freq_table` | array[6] | `[1.57542e9, ...]` | Hz | >0 | 支持频率表，索引对应 `freq_ix0`/`freq_ix1` 中的值 |
+| `gnss_t` | array | `["GPS", "GLO", "GAL"]` | — | 星座列表 | 启用星座列表；启用北斗时显式加入 `BDS` |
+| `freq_ix0` | dict | `{GPS: 0, GLO: 4, GAL: 0, BDS: 6}` | — | 频率索引 | BDS B1I/B1C 为索引 6 |
+| `freq_ix1` | dict | `{GPS: 2, GLO: 5, GAL: 2, BDS: 3}` | — | 频率索引 | BDS B2I/B2b 为索引 3 |
+| `freq_table` | array[7] | `[1.57542e9, 1.22760e9, 1.17645e9, 1.20714e9, 1.60200e9, 1.24600e9, 1.561098e9]` | Hz | >0 | 支持频率表；BDS 配置必须含索引 6 的 B1I，不能复用 GPS L1 |
 | `dfreq_glo` | array[2] | `[0.56250e6, 0.43750e6]` | Hz | >0 | GLONASS 频率间隔 [L1, L2]，用于 FDMA 频率计算 |
+
+**BDS RINEX 3 配置样例（Data19 的 B1I+B2I）**：
+
+```yaml
+gnss:
+  gnss_t: [GPS, BDS]
+  nf: 2
+  freq_table: [1575420000.0, 1227600000.0, 1176450000.0, 1207140000.0,
+               1602000000.0, 1246000000.0, 1561098000.0]
+  freq_ix0: {GPS: 0, GLO: 4, GAL: 0, BDS: 6}
+  freq_ix1: {GPS: 1, GLO: 5, GAL: 2, BDS: 3}
+  maxinno: 5.0
+  maxcode: 30.0
+```
+
+读取 BDS 文件后审计 RINEX 头与首个公共历元。当前解析器按信号频带号把
+`C1I/L1I` 放入槽位 0、`C7I/L7I` 放入槽位 1，以兼容 `C,C,L,L,S,S` 这类类型
+分组列；不要基于观测列位置自行实现频点选择。BDS 广播星历是 BDT，内部转换为
+GPST 必须同时做 `week+1356` 和 `toc/toe/tot+14 s`。GPS+BDS SPP/TC 还依赖 BDS
+独立接收机 ISB，不能用 GPS 公共钟差代替。
 
 ### 1.9 基站与初始位置
 
@@ -438,6 +458,7 @@ INS 配置部分参考 ignav 的 `configure.ini` 和 `tools/KF-GINS/config/kf-gi
 | `estimate_mounting_angle` | int | `0` | — | 0 / 1 | 1=估计 IMU 安装角（2维，替代旧 `evaluate_imu_angle`） |
 | `estimate_imu_leverarm` | int | `0` | — | 0 / 1 | 1=估计 IMU 杆臂 b→v（3维，需 `estimate_mounting_angle=1`） |
 | `estimate_time_sync` | int | `1` | — | 0 / 1 | 1=估计时间对齐误差（1维，算法参考 ignav） |
+| `imu_time_offset_s` | double | `0.0` | s | — | IMU 输入时间戳的固定偏移，在 `TcStream.feed_imu()` 边界施加；仅用于已由独立时移扫描证实的设备/数据集，不能用它补偿 BDS 时标或 GNSS 模型错误 |
 | `lever_arm_psd` | double | `0.0` | m²/s | ≥0 | GNSS 杆臂随机游走 PSD（0=常数） |
 | `imu_angle_psd` | double | `1.0e-6` | rad²/s | ≥0 | 安装角随机游走 PSD |
 | `imu_leverarm_psd` | double | `1.0e-8` | m/s | ≥0 | IMU 杆臂随机游走 PSD |
