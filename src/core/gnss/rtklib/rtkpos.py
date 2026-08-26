@@ -143,7 +143,10 @@ def zdres_sat(nav, obs, r, rtype, dant, ix):
     y = np.zeros(nf * 2)
     for f in range(nf):
         freq = sat2freq(obs.sat[ix], f, nav)
-        if obs.S[ix,f] < nav.cnr_min[f]:
+        # S==0 表示接收机未记录该频点 SNR (如 BASE 只记 S2), 不应视为
+        # 低信噪比剔除; 否则整频被丢, 迫使双差落在未初始化模糊度的频点上。
+        # 与 RTKLIB C 对齐: snr mask 默认关闭, 仅在 S 有效时才做门限判断。
+        if 0 < obs.S[ix, f] < nav.cnr_min[f]:
             continue
         # residuals = observable - estimated range (phase and code)
         y[f] = obs.L[ix,f] * _c / freq - r - dant[f] if obs.L[ix,f] else 0
@@ -338,6 +341,11 @@ def ddres(nav, x, P, yr, er, yu, eu, sat, el, dt, obsr, save_res=False):
                 
                 jj = IB(sat[j], frq, nav.na)
                 if not code:  # carrier phase
+                    # 未初始化的模糊度状态 (x=0 且 P=0, 如基站缺该频点伪距导致
+                    # udbias 无法初始化) 不得参与量测: P=0 ⇒ KF 增益为 0,
+                    # 该行残差含完整 λ·N 误差却只污染位置状态。
+                    if nav.P[ii, ii] == 0.0 or nav.P[jj, jj] == 0.0:
+                        continue
                     # adjust phase residual by double-differenced phase-bias term
                     freqj = sat2freq(sat[j], frq, nav)
                     lamj = _c / freqj

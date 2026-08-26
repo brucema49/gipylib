@@ -73,7 +73,7 @@ class TcEstimator(LcEstimator):
         self._clk_q = 1e-2   # 钟差随机游走 PSD (m²/s)
         # GNSS 直接估计 (stored): clk/amb 的当前最佳估计
         # x[clk_bias]/x[amb] 存修正量 ε (correction), feedback 时累积到 stored
-        self._clk_stored = np.zeros(3, dtype=np.float64)
+        self._clk_stored = np.zeros(4, dtype=np.float64)
         self._N_stored = np.zeros(tc_si.n_amb if tc_si.has_ambiguity() else 0,
                                   dtype=np.float64)
 
@@ -87,8 +87,8 @@ class TcEstimator(LcEstimator):
         si = self.si
         x = self.x.copy()
         if si.clk_bias >= 0:
-            x[si.clk_bias:si.clk_bias + 3] = (
-                self._clk_stored + self.x[si.clk_bias:si.clk_bias + 3])
+            x[si.clk_bias:si.clk_bias + 4] = (
+                self._clk_stored + self.x[si.clk_bias:si.clk_bias + 4])
         if si.has_ambiguity():
             amb_slice = slice(si.amb_start, si.amb_start + si.n_amb)
             # 动态调整 _N_stored 尺寸 (set_ambiguity_count 可能改变 n_amb)
@@ -217,7 +217,7 @@ class TcEstimator(LcEstimator):
             clk0 = si.clk_bias
             # 仅清零 clk 误差状态 (ε_clk=0, 用 _clk_stored 作有效估计)
             # Pclk 不重置, 由 time_update 的 Q_clk 随机游走累积
-            self.x[clk0:clk0 + 3] = 0.0
+            self.x[clk0:clk0 + 4] = 0.0
 
     def tc_meas_update(self, v, H, R, source: str = ""):
         """GNSS 量测更新 (调 joseph_update + feedback)。"""
@@ -251,7 +251,7 @@ class TcEstimator(LcEstimator):
         si = self.si
         # 累积 GNSS 直接状态修正到 stored
         if si.clk_bias >= 0:
-            self._clk_stored += self.x[si.clk_bias:si.clk_bias + 3]
+            self._clk_stored += self.x[si.clk_bias:si.clk_bias + 4]
         if si.has_ambiguity():
             amb_slice = slice(si.amb_start, si.amb_start + si.n_amb)
             if len(self._N_stored) != si.n_amb:
@@ -282,7 +282,7 @@ class TcEstimator(LcEstimator):
         from src.core.ins.transfer_matrix import TransferMatrix
         self.tm = TransferMatrix(self._tc_config, new_si)
         # 重置 GNSS 直接估计 (新模式从零开始)
-        self._clk_stored = np.zeros(3, dtype=np.float64)
+        self._clk_stored = np.zeros(4, dtype=np.float64)
         self._N_stored = np.zeros(new_si.n_amb if new_si.has_ambiguity() else 0,
                                   dtype=np.float64)
         if builder is not None:

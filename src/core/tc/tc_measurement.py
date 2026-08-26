@@ -197,7 +197,7 @@ class SppTcMeas(TcMeasurement):
 
     钟差模型 (与 GINav rescode_sppins.m:47-62 / rtklib-py pntpos.py:113-126 一致):
       GPS:  dtr = x[clk_bias+0]
-      BDS:  dtr = x[clk_bias+0] + x[clk_bias+1]
+      BDS:  dtr = x[clk_bias+0] + x[clk_bias+3]
       GAL:  dtr = x[clk_bias+0] + x[clk_bias+2]
     """
 
@@ -241,10 +241,6 @@ class SppTcMeas(TcMeasurement):
             sat = obsr.sat[i]
             if svh[i] != 0:
                 continue
-            # 仅使用 GPS 卫星, 与 GPS-only SPP 初始化一致
-            sys, _ = sat2prn(sat)
-            if sys != uGNSS.GPS:
-                continue
             r, e = geodist(rs[i, :3], rr)
             if r <= 0.0:
                 continue
@@ -268,7 +264,7 @@ class SppTcMeas(TcMeasurement):
             # 钟差估计值 (从 effective_x 取 = stored + ε_clk)
             # 模型 (与 GINav rescode_sppins.m:47-62 / rtklib-py pntpos.py:113-126 一致):
             #   GPS:  dtr = x[clk_bias+0]                    (common receiver clock)
-            #   BDS:  dtr = x[clk_bias+0] + x[clk_bias+1]     (clock + inter-system bias)
+            #   BDS:  dtr = x[clk_bias+0] + x[clk_bias+3]     (clock + inter-system bias)
             #   GAL:  dtr = x[clk_bias+0] + x[clk_bias+2]     (clock + inter-system bias)
             sys_off = self._sys_clk_offset(sat)
             dtr_est = 0.0
@@ -344,17 +340,18 @@ class SppTcMeas(TcMeasurement):
 
     @staticmethod
     def _sys_clk_offset(sat):
-        """GPS=0, GLO/BDS=1, GAL=2 (对应 clk_bias 三维块)。
+        """GPS=0, GLO=1, GAL=2, BDS=3 (对应 clk_bias 四维块)。
 
-        注: clk_bias 块固定 3 维, GPS/GAL 各占 1 维, GLO 与 BDS 共享 offset 1
-        (同一时刻只启用 GLO 或 BDS, 不冲突)。
+        BDS 独立钟差状态: BDT 与 GPST 存在系统偏差, 与 SPP (pntpos NX=7)
+        的星间钟偏处理一致。
         """
         sys, _ = sat2prn(sat)
         if sys == uGNSS.GPS:
             return 0
         if sys == uGNSS.GAL:
             return 2
-        # GLO / BDS 共用 offset 1
+        if sys == uGNSS.BDS:
+            return 3
         return 1
 
 

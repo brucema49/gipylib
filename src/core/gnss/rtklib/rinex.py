@@ -12,6 +12,19 @@ from .rtkcmn import uGNSS, rSIG, Eph, Geph, prn2sat, gpst2time, time2gpst, Obs, 
 from . import rtkcmn as gn
 from .ephemeris import satposs
 
+# RINEX 观测量按"类型分组"排列时 (如 BASE: C,C,L,L,S,S), 位置分块启发式失效。
+# 此处以信号频带号为主键映射到频点槽位, 与 freq_ix 配置语义一致:
+#   GPS/GLO: L1->0, L2->1        GAL: E1->0, E5a->1
+#   BDS: B1I/B1C(band1)->0, B2I/B2b(band7)->1
+BAND_SLOT = {
+    uGNSS.GPS: {1: 0, 2: 1},
+    uGNSS.GLO: {1: 0, 2: 1},
+    uGNSS.GAL: {1: 0, 5: 1},
+    uGNSS.BDS: {1: 0, 7: 1},
+    uGNSS.QZS: {1: 0, 2: 1},
+}
+
+
 class rnx_decode:
     """ class for RINEX decoder """
     MAXSAT = uGNSS.GPSMAX+uGNSS.GLOMAX+uGNSS.GALMAX+uGNSS.BDSMAX+uGNSS.QZSMAX
@@ -24,6 +37,7 @@ class rnx_decode:
         self.skip_sig_tbl = cfg.skip_sig_tbl
         self.nf = 4
         self.sigid = np.ones((uGNSS.GNSSMAX, rSIG.SIGMAX*3), dtype=int) * rSIG.NONE
+        self.sigband = np.zeros((uGNSS.GNSSMAX, rSIG.SIGMAX*3), dtype=int)
         self.typeid = np.ones((uGNSS.GNSSMAX, rSIG.SIGMAX*3), dtype=int) * rSIG.NONE
         self.nsig = np.zeros((uGNSS.GNSSMAX), dtype=int)
         self.nband = np.zeros((uGNSS.GNSSMAX), dtype=int)
@@ -137,10 +151,17 @@ class rnx_decode:
     
                     # BDS ephemeris uses BDT week (epoch 2006-01-01 = GPS week 1356)
                     # Convert to GPS week for correct toe/tot computation
+                    # BDT = GPST - 14s: RINEX BDS 时间标签为 BDT, 需加 14s 转 GPST
+                    # (RTKLIB C rinex.c:1252-1258 bdt2gpst, 缺失会导致 tk 偏 14s,
+                    #  MEO 卫星位置沿迹误差 ~50km, SPP 发散而 RTK 双差不受影响)
                     if sys == uGNSS.BDS:
                         eph.week += 1356
-                    eph.toe = gpst2time(eph.week, eph.toes)
-                    eph.tot = gpst2time(eph.week, tot)
+                        eph.toc = timeadd(eph.toc, 14.0)
+                        eph.toe = timeadd(gpst2time(eph.week, eph.toes), 14.0)
+                        eph.tot = timeadd(gpst2time(eph.week, tot), 14.0)
+                    else:
+                        eph.toe = gpst2time(eph.week, eph.toes)
+                        eph.tot = gpst2time(eph.week, tot)
                     nav.eph.append(eph)
                 else:  # GLONASS
                     if prn > uGNSS.GLOMAX:
@@ -236,6 +257,8 @@ class rnx_decode:
                     else:
                         continue
                     self.sigid[sys][k] = self.sig_tbl[sig[1:3]]
+                    # 记录每列的 RINEX 频带号 (sig 第二字符), 供列->频点槽位映射
+                    self.sigband[sys][k] = int(sig[1]) if sig[1].isdigit() else -1
                 self.nband[sys] = len(np.where(self.typeid[sys]==1)[0])
         return 0
 
@@ -292,7 +315,12 @@ class rnx_decode:
                         obsval = float(obs_)
                     except:
                         obsval = 0
-                    f = i // (self.nsig[sys] // self.nband[sys])
+                    band = self.sigband[sys][i]
+                    if band > 0 and sys in BAND_SLOT and band in BAND_SLOT[sys]:
+                        f = BAND_SLOT[sys][band]
+                    else:
+                        # 未知频带: 回退位置分块启发式
+                        f = i // max(self.nsig[sys] // self.nband[sys], 1)
                     if f >= gn.MAX_NFREQ:
                         print('Obs file too complex, please use RTKCONV to remove unused signals')
                         raise SystemExit

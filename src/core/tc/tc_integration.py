@@ -391,9 +391,14 @@ class TcIntegration:
 
         # 缓存 GNSS 位置 (5 秒窗口, 用于动态初始化: 首尾位置差分计算 yaw)
         self._gnss_pos_cache.append((t_gnss, rr.copy()))
-        # 限制缓存大小: 保留最近 6 个历元 (span=5s, 与 5 秒初始化窗口一致)
-        if len(self._gnss_pos_cache) > 6:
-            self._gnss_pos_cache = self._gnss_pos_cache[-6:]
+        # 限制缓存大小: 按时间保留最近 6s (span=5s 初始化窗口)
+        # 注: 按历元数修剪假设 1Hz GNSS, 5Hz 数据 (如 Data19 ROVE.20O)
+        # 6 历元仅覆盖 1.0s, 导致 span<5.0 恒不满足, TC 永远无法初始化
+        if len(self._gnss_pos_cache) > 1:
+            t_cut = self._gnss_pos_cache[-1][0] - 6.0
+            if self._gnss_pos_cache[0][0] < t_cut:
+                self._gnss_pos_cache = [e for e in self._gnss_pos_cache
+                                        if e[0] >= t_cut]
 
         if len(self._gnss_pos_cache) < 2:
             return
@@ -454,7 +459,9 @@ class TcIntegration:
             self._est._clk_stored[0] = float(x_spp[3])   # GPS
             self._est._clk_stored[1] = float(x_spp[4])   # GLO
             self._est._clk_stored[2] = float(x_spp[5])   # GAL
-            for k in range(3):
+            if len(x_spp) >= 7:
+                self._est._clk_stored[3] = float(x_spp[6])   # BDS
+            for k in range(4):
                 self._est.P[si.clk_bias + k, si.clk_bias + k] = 10.0 ** 2
         self._initialized = True
         self._last_q = quality
@@ -1031,14 +1038,16 @@ class TcIntegration:
         # 零偏/杆臂等: 保留原方差
         # 钟差: 重置
         if si.clk_bias >= 0:
-            for k in range(3):
+            for k in range(4):
                 est.P[si.clk_bias + k, si.clk_bias + k] = 100.0 ** 2
             est._clk_stored[:] = 0.0
             if len(x_spp) >= 6:
                 est._clk_stored[0] = float(x_spp[3])
                 est._clk_stored[1] = float(x_spp[4])
                 est._clk_stored[2] = float(x_spp[5])
-                for k in range(3):
+                if len(x_spp) >= 7:
+                    est._clk_stored[3] = float(x_spp[6])
+                for k in range(4):
                     est.P[si.clk_bias + k, si.clk_bias + k] = 10.0 ** 2
         # 模糊度: 重置
         if si.has_ambiguity():
@@ -1052,7 +1061,7 @@ class TcIntegration:
         # 清零交叉协方差 (位置/速度/钟差/模糊度与其他状态的交叉项)
         reset_idx = list(range(si.pos, si.vel + 3))
         if si.clk_bias >= 0:
-            reset_idx.extend(range(si.clk_bias, si.clk_bias + 3))
+            reset_idx.extend(range(si.clk_bias, si.clk_bias + 4))
         if si.has_ambiguity():
             reset_idx.extend(range(si.amb_start, si.amb_start + si.n_amb))
         keep_idx = [i for i in range(si.dim) if i not in set(reset_idx)]

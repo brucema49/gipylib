@@ -2,7 +2,7 @@
 
 状态布局:
   δx = [δr^e, δv^e, δψ^e, δb_g, δb_a, 可选块, clk_bias(3)?, ambiguity(N)?]
-  - SPP: + clk_bias(3)  [dtr, dtr_glo, dtr_gal]
+  - SPP: + clk_bias(4)  [dtr, dtr_glo, dtr_gal, dtr_bds]
   - RTK: + ambiguity(N)  N 运行时动态
   - RTD: 无 GNSS 参数块 (双差消除钟差, 仅伪距无模糊度)
 
@@ -66,7 +66,7 @@ class TcStateIndex(StateIndex):
         self.n_amb = 0
         if self.mode == "spp":
             self.clk_bias = cur
-            cur += 3
+            cur += 4  # [dtr_gps, dtr_glo, dtr_gal, dtr_bds]
         elif self.mode == "rtk":
             self.amb_start = cur
             # ambiguity 数量运行时设置

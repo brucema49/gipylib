@@ -51,6 +51,13 @@ class TcStream:
         self.writer = writer
         self.stat_writer = stat_writer
         self._tc_mode = config.get("gnss", {}).get("positioning_mode", "spp")
+        # IMU 时标固定偏移 [s]: 部分数据集 IMR 时标相对 GNSS 存在系统滞后
+        # (Data19 HG4930 实测 ≈ -0.75s: 真值起步/时移扫描/逐历元匹配三重验证),
+        # 在喂入边界统一修正, 使 INS 状态内容与时间戳对齐。
+        import dataclasses
+        self._imu_dataclasses = dataclasses
+        self._imu_time_offset = float(
+            config.get("ins", {}).get("imu_time_offset_s", 0.0))
         self._integ = TcIntegration(
             config, mode=self._tc_mode, output_callback=self._write_integration_output
         )
@@ -88,6 +95,9 @@ class TcStream:
 
     def feed_imu(self, imu: ImuMeasurement) -> None:
         """喂入 IMU。初始化前缓冲，初始化后委托 TcIntegration。"""
+        if self._imu_time_offset != 0.0:
+            imu = self._imu_dataclasses.replace(
+                imu, timestamp=imu.timestamp + self._imu_time_offset)
         if not self._initialized:
             self._init_imu.append(imu)
             # 修剪 _init_imu: 只保留最新 GNSS 历元前 10s 的数据
