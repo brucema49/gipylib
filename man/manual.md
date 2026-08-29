@@ -1,6 +1,8 @@
 # 配置文件使用手册
 
-本手册详细讲解 `data/config.yaml` 配置文件中所有参数的含义、单位、默认值与取值范围。
+本手册详细讲解项目 YAML 配置文件中各参数的含义、单位、默认值与取值范围。`data/` 配置用于 CPT 等参考数据，`phone/rtdtc.yaml` 是手机低成本 IMU 的 RTD-TC 配置示例；不同数据集的噪声和星座设置不能直接混用。
+
+> **当前状态（2026-08-29）**：本手册以 `skills/项目当前状态.md` 和当前源码为准。RTK 浮点基线使用 `prnbias=0.03`；相位 `maxinno` 与伪距 `maxcode` 分开设置；TC/LC 的 `pos_psd` 不能互相照搬。实验结果必须同时记录数据集、模式、配置快照、评估窗口和更新/传播点规则。
 
 配置文件采用 YAML 格式，包含三大段：`gnss`（GNSS 解算）、`ins`（组合导航）、`output`（输出配置）。另有 `tc` 段在紧组合模式下生效。
 
@@ -79,7 +81,7 @@ GNSS 配置部分参考 rtklib-py，已吸收到 `src/core/gnss/rtklib/`。
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `nf` | int | `2` | 频率数：1=单频（L1）；2=双频（L1+L2/L5） |
+| `nf` | int | `1` | 频率数：1=单频（L1）；2=双频（L1+L2/L5） |
 | `pmode` | str | `"kinematic"` | rtklib-py 定位模式：`static`/`kinematic` |
 | `filtertype` | str | `"forward"` | 滤波类型：`forward`/`backward`/`combined`/`combined_noreset` |
 | `use_sing_pos` | bool | `false` | 每历元是否重新单点定位初始化位置 |
@@ -96,8 +98,8 @@ GNSS 配置部分参考 rtklib-py，已吸收到 `src/core/gnss/rtklib/`。
 
 | 参数 | 类型 | 默认值 | 单位 | 说明 |
 |------|------|--------|------|------|
-| `maxinno` | float | `1.0` | m | 载波相位周跳/粗差阈值 |
-| `maxcode` | float | `30.0` | m | 伪距粗差阈值 |
+| `maxinno` | float | `5.0` | m | 载波相位周跳/粗差阈值；代码中作为相位双差门限 |
+| `maxcode` | float | `30.0` | m | 伪距双差粗差阈值；手机 RTD-TC 已验证配置使用 `60.0` 以容纳较大的初始状态误差 |
 | `maxage` | float | `30.0` | s | 最大差分龄期 |
 | `maxout` | int | `4` | — | 最大差分中断历元数 |
 | `thresdop` | float | `5.0` | — | 多普勒法周跳检测阈值 |
@@ -152,13 +154,13 @@ GNSS 配置部分参考 rtklib-py，已吸收到 `src/core/gnss/rtklib/`。
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `gnss_t` | array | `["GPS", "GLO", "GAL"]` | 启用星座列表 |
+| `gnss_t` | array | `["GPS", "GLO", "GAL"]` | 启用星座列表。手机当前正式配置为 `["GPS", "GAL"]`，BDS 因 TC 双差残差系统性偏差暂时停用 |
 | `freq_ix0` | dict | `{GPS: 0, GLO: 4, GAL: 0, BDS: 0}` | 第一频率索引（L1/E1/B1I） |
 | `freq_ix1` | dict | `{GPS: 1, GLO: 5, GAL: 2, BDS: 3}` | 第二频率索引（L2/E5a/B2b） |
 | `freq_table` | array | `[1.57542e9, 1.22760e9, 1.17645e9, 1.20714e9, 1.60200e9, 1.24600e9]` | 频率表 [Hz] |
 | `dfreq_glo` | array[2] | `[0.56250e6, 0.43750e6]` | GLONASS 频率间隔 [L1, L2] [Hz] |
 
-> **注意**：北斗卫星观测无需特殊处理，rtklib-py 中 BDS 星历解码器受限。
+> **注意**：BDS GEO 轨道、BDT→GPST 时标和 BDS 独立钟差处理已在代码中修复；手机配置仍暂不启用 BDS，恢复前需完成逐卫星残差验证。
 
 ### 2.9 基站与初始位置
 
@@ -203,6 +205,7 @@ rb: [34.052235, -118.243683, 100.0]
 | `data_rate` | int | `100` | IMU 采样率 [Hz]（`external` 模式仅支持 100） |
 | `imu_format` | str | `"euroc"` | IMU 数据格式：`gpst`=GPS 周+周内秒；`euroc`=Unix 纳秒时间戳 |
 | `imu_coordinate_system` | str | `"RFU"` | IMU 原始坐标系：`FRD`=前右下（默认）；`RFU`=右前上（读取时自动转换） |
+| `imu_time_offset_s` | float | `0.0` | s | 在 IMU 喂入 TC 边界平移时间戳。仅在数据集确认存在固定 IMU-GNSS 时标偏移时设置；不能直接套用其它数据集的偏移值 |
 
 **IMU 数据格式说明**：
 - `gpst` 格式：CSV 文件，列为 `week, sow, gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z`
@@ -229,10 +232,10 @@ rb: [34.052235, -118.243683, 100.0]
 | 参数 | 类型 | 默认值 | 单位 | 说明 |
 |------|------|--------|------|------|
 | `static_speed_threshold` | float | `0.5` | m/s | 静态检测阈值（GNSS 速度 < 此值判定为静态） |
-| `dynamic_speed_threshold` | float | `3.0` | m/s | 动态速度阈值（平面速度 > 此值才可动对准） |
+| `dynamic_speed_threshold` | float | `3.0` | m/s | 动态速度阈值（平面速度 > 此值才可动对准）；手机配置使用 `4.0` |
 | `angular_velocity_threshold_deg` | float | `30.0` | deg/s | 动态角速度阈值（陀螺范数 < 此值才可动对准） |
 | `alignnment_dynamic_method` | str | `"position_diff"` | — | 动对准方法：`auto`/`velocity_vector`/`position_diff` |
-| `gnss_buffer_size` | int | `5` | — | 位置差分 GNSS 历元缓冲区大小（5 历元 span=4s，首尾差分计算速度） |
+| `gnss_buffer_size` | int | `5` | — | 位置差分 GNSS 历元缓冲区大小；手机配置为 `3`，CPT 配置为 `5` |
 | `high_precision_ins_mode` | bool | `false` | — | 高精度 INS 初始化模式：`false`=低精度（当前实现）；`true`=高精度（预留） |
 | `static_duration` | float | `10.0` | s | 静态初始化 GNSS 位置平均窗口（少于 10s 用全部，多于 10s 取最新 10s） |
 
@@ -284,13 +287,14 @@ rb: [34.052235, -118.243683, 100.0]
 | `accel_psd` | float | `2.604e-06` | m²s⁻³ | 加计过程噪声 PSD |
 | `gyro_bias_psd` | float | `2.612e-14` | rad²s⁻³ | 陀螺零偏随机游走 PSD |
 | `acce_bias_psd` | float | `1.661e-09` | m²s⁻⁵ | 加计零偏随机游走 PSD |
-| `pos_psd` | float | `5.0` | m²/s | 位置随机游走 PSD（LC 模式必需，防止 P_pos 趋零导致滤波锁死） |
+| `pos_psd` | float | LC 参考 `5.0`；TC `0.0` | m²/s | 位置随机游走 PSD。LC 通常需要非零值；TC 已验证使用 `0.0`，避免通过位置-速度交叉协方差污染速度 |
 | `pos_diff_vel_std` | float | `0.15` | m/s | 位置差分速度 sigma 下限 |
 | `vel_psd` | float | `0.5` | m²/s² | 速度随机游走 PSD |
+| `vel_var_floor` | float | `0.0` | m²/s² | TC/RTK 速度协方差下限；非零时防止量测更新后 `P_vel` 过小导致机动段卡死 |
 | `innov_reject_threshold` | float | `0.0` | m | 位置创新拒绝阈值（0=禁用） |
 | `innov_reject_warmup` | int | `100` | — | 创新拒绝预热历元数（前 N 个 GNSS 历元不拒绝） |
 
-> **调参提示**：`pos_psd` 是 LC EKF 必需项。无 `pos_psd` 时 P_pos 在量测更新后趋近 0，K→0，滤波器锁死无法跟踪 GNSS。`pos_psd=5.0` 使 P_pos 在 1s 内增长约 5，配合 R=0.0225（sigma=0.15）使 K≈0.98。
+> **调参提示**：LC 中无 `pos_psd` 时，P_pos 可能在量测更新后趋近 0，K→0，滤波器锁死无法跟踪 GNSS；但 TC 不能照搬该经验值。RTK-TC MECH-16 使用 `pos_psd=0`、`vel_psd=0` 和 `vel_var_floor=3e-4`，LC 与手机 RTD-TC 的过程噪声必须按各自数据集验证。
 
 ### 3.9 NHC 配置
 
@@ -364,8 +368,30 @@ tc:
 - SPP-INS：伪距 + 多普勒观测
 - RTK-INS：双差载波 + 伪距观测
 - RTD-INS：双差伪距观测
-- 量测更新在 `n_meas < 4` 时跳过（防止发散）
-- 启动阶段使用 RTK 计算结果初始化（不使用 SPP）
+- RTD/RTK 量测使用 rover/base 共视卫星形成双差；单颗 GPS 观测不能单独形成双差
+- 量测构造后的有效残差数 `n_meas < 4` 时跳过 EKF 更新；卫星原始数量不等于有效量测数量
+- 量测失败时尝试 SPP 位置 fallback，但 SPP 仍要求至少 4 颗有效 GPS 卫星
+- 启动阶段按 `positioning_mode` 使用 GNSS 结果初始化；初始化前输出 `Qins=0`
+
+### RTK-TC 当前验证基线
+
+`data/rtk-ins紧组合.yaml` 的 MECH-16/FINAL4 证据为：目标窗口 GPS Week 2046、SOW `359000--359100` 水平 RMSE `0.0394 m`，全段 `0.2595 m`，传播速度 RMSE 约 `0.099 m/s`，量测间速度增长约 `8.0 cm/s`。这是正式非 AR 基线；`armode=3` 的约 `0.019 m` 结果属于独立 AR 分支，不能与基线收益混报。
+
+TC 模糊度管理已完成 LAMBDA 异常降级、SD→DD 变换、正定保护、过程噪声和健康门控修复。若参考 ignav 的 R/Q 或观测策略使目标窗口、最差机动窗口或全段恶化，必须回退并保留对照证据。
+
+### 手机 RTD-TC 当前状态
+
+`phone/rtdtc.yaml` 当前采用 `positioning_mode: rtd`、`ins.enabled: tc`、GPS+Galileo（BDS 暂停）。手机 MEMS IMU 噪声显著高于 CPT 传感器，因此使用较大的 `gyro_psd`、`accel_psd`、零偏随机游走和 `vel_psd`；这些数值来自手机数据实测调谐，不能直接替换为 CPT 配置中的小噪声。
+
+手机 RTD-TC 结果可用以下脚本评估：
+
+```bash
+python phone/eval_enu.py phone/output/RTDTC.rslt phone/mate40ref.kf
+python phone/error_rslt.py phone/output/RTDTC.rslt
+python phone/tra-mech.py
+```
+
+图像和运行日志写入 `phone/plot/`。`error_rslt.py` 的 ENU 误差图按 `Qins=2`（红色，机械编排）和 `Qins=3`（绿色，量测更新）标记；`tra-mech.py` 默认绘制 GPS week 2382、SOW 115665--115755（08:07:45--08:09:15）的平面轨迹。
 
 ---
 
@@ -379,7 +405,11 @@ output:
   rslt_filename: "RTKLC.rslt"
   position_format: "llh"
   time_format: "gpst"
+  trace_enabled: true
   trace_level: 0
+  stat_level: 0
+  stat_rate: "update"
+  stat_filename: ""
 ```
 
 | 参数 | 类型 | 默认值 | 说明 |
@@ -391,6 +421,10 @@ output:
 | `position_format` | str | `"llh"` | 位置输出格式：`llh`=经纬度高 / `xyz`=ECEF 直角坐标 |
 | `time_format` | str | `"gpst"` | 时间输出格式：`gpst`=GPS 周+周内秒 / `datetime`=YYYY/MM/DD HH:MM:SS.sss |
 | `trace_level` | int | `0` | trace 文件等级：0=off / 1=info / 2=detail / 3=debug |
+| `trace_enabled` | bool | `true` | trace 总开关；为 `false` 时不生成 trace |
+| `stat_level` | int | `0` | 状态诊断等级：0=off；1=基础状态；2=增加 TC 更新摘要；3=逐卫星/逐模糊度/矩阵明细（S4 当前预留） |
+| `stat_rate` | str | `"update"` | 状态输出节奏：`update`=GNSS/约束更新点；`second`=整数秒；`imu`=每个 IMU 点 |
+| `stat_filename` | str | `""` | 状态诊断文件名；留空时由输出模块按模式自动命名 |
 
 **输出文件按模式启用**：
 - `ins.enabled=off` → `.pos`（纯 GNSS，1Hz）
@@ -417,7 +451,7 @@ output:
 |------|------|------|
 | 0-1 | week, sow | GPS 周 + 周内秒 |
 | 2-4 | lat/lon/h 或 x/y/z | 位置（按 `position_format`） |
-| 5 | Q | GNSS 质量标志（1=FIX, 2=FLOAT, 5=SPP） |
+| 5 | Q | GNSS 质量标志（1=FIX, 2=FLOAT, 4=RTD/DGPS, 5=SPP） |
 | 6 | Qins | INS 状态标志（0=未初始化, 2=机械编排, 3=量测更新） |
 | 7 | ns | 卫星数 |
 | 8-13 | sdn, sde, sdu, sdne, sdeu, sdun | 位置协方差 |
@@ -427,6 +461,8 @@ output:
 | 25-27 | roll, pitch, yaw | 姿态角（度） |
 | 28-30 | sdroll, sdpitch, sdyaw | 姿态协方差 |
 | 31-36 | lever_x, lever_y, lever_z, sdlx, sdly, sdlz | 杆臂参数（仅 `estimate_leverarm=1`） |
+
+当 `output.stat_level >= 2` 时，状态文件还会在 TC 更新点写入 `GIPY_EPOCH`、`GIPY_COV`、`GIPY_INNOV`、`GIPY_GAIN` 等诊断摘要；更新点由 `update_flag` 标识，`Qins` 仅是结果行上的状态属性。
 
 ---
 
@@ -439,7 +475,7 @@ output:
 3. **`gnss_source` 校验**：必须为 `internal` 或 `external`
 4. **纯 GNSS 模式约束**：`ins.enabled=off` 时 `gnss_source` 必须为 `internal`
 5. **基站坐标格式校验**：`rb_format` 必须为 `xyz` 或 `llh`；`llh` 时自动转 ECEF
-6. **输出格式校验**：`position_format` ∈ {llh, xyz}；`time_format` ∈ {gpst, datetime}；`trace_level` ∈ {0, 1, 2, 3}
+6. **输出格式校验**：`position_format` ∈ {llh, xyz}；`time_format` ∈ {gpst, datetime}；`trace_level` ∈ {0, 1, 2, 3}；`stat_level` ∈ {0, 1, 2, 3}；`stat_rate` ∈ {update, second, imu}
 7. **`external` 模式约束**：`ins.enabled` 必须为 `lc`，`data_rate` 必须为 100
 8. **`internal` 模式约束**：`positioning_mode` 必填（spp/rtd/rtk）；`rover_path`、`eph_path` 必填；`rtk`/`rtd` 模式 `base_path` 必填；`ins.enabled=lc/tc` 时 `imu_data_path` 必填
 
@@ -541,7 +577,33 @@ gnss:
 
 加载时自动转换为 ECEF xyz，内部统一使用 xyz。
 
-### 7.5 输出 ECEF 坐标 + 日期时间格式
+### 7.5 手机 RTD-TC 配置
+
+手机配置可直接参考 `phone/rtdtc.yaml`：
+
+```yaml
+gnss:
+  gnss_source: "internal"
+  positioning_mode: "rtd"
+  nf: 1
+  gnss_t: ["GPS", "GAL"]       # BDS 当前暂停，待手机 C2I 残差专项验证
+  maxinno: 5.0                  # 相位门限（RTD 当前不使用载波相位）
+  maxcode: 60.0                 # 手机初始状态误差较大时使用
+
+ins:
+  enabled: "tc"
+  imu_data_path: "phone/phone_imu_euroc.csv"
+  imu_format: "euroc"
+  imu_coordinate_system: "RFU"
+  data_rate: 100
+  imu_time_offset_s: 0.0
+```
+
+手机 IMU 的过程噪声应按实测调谐。当前正式配置使用 `gyro_psd=1e-5`、`accel_psd=1e-2`、`gyro_bias_psd=1e-10`、`acce_bias_psd=1e-4` 和 `vel_psd=1.0`；不要直接复制 CPT 级小噪声。
+
+手机 RTD-TC 的已验证结果约为水平 RMSE `7.72 m`，较改前 `14.45 m` 改善，但仍明显差于纯 RTD 约 `3.58 m`。当前暂停 BDS，恢复前必须完成逐卫星残差、频率映射和 RTKLIB 对照；不能把 `maxcode=60` 推广为通用默认值。
+
+### 7.6 输出 ECEF 坐标 + 日期时间格式
 
 ```yaml
 output:

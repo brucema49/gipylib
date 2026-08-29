@@ -1,5 +1,7 @@
 # 日志流和输出结果流方案
 
+> **当前状态索引（2026-08-29）**：stat/trace 已完成 S0-S3：支持基础状态、TC 更新点协方差/创新/增益摘要、RUN_START/RUN_END、速率控制和有限值诊断；S4 逐卫星/逐模糊度/矩阵明细仍未实现。详见 [项目当前状态](项目当前状态.md)。
+
 > 规划日志记录和输出结果的流式设计方案，与 StreamDesign.md 中的多线程架构衔接。
 >
 > **时间系统约定**：全框架内部统一使用 **Unix 时间戳（float 秒，与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）**。
@@ -14,14 +16,15 @@
 > - ✅ 已实现：`src/log/aligner.py::Aligner`（IMU 积攒 + GNSS 收割的匹配器，时间戳基于 Unix）
 > - ✅ 已实现：`src/core/ins/initializer.py::InsInitializer`（INS 初始化，三种模式 + 三阈值检验，详见 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md)）
 > - ✅ 已实现：`src/core/ins/lc_runner.py::LcRunner`（松组合批处理运行器，收集 IMU+GNSS 后批量执行 LC EKF，输出松组合 .pos，详见 [estimator.md](file:///home/mxl/workplace/gipylib/skills/estimator.md)）
-> - 🚧 预留：RawDataWriter / Solution CSV/NMEA 输出 / INS 状态输出（当前未实现）
+> - ✅ 已实现：`src/log/stat_writer.py::StatWriter`，支持 GIPY_STAT_V1 基础状态和 TC 更新摘要；逐卫星/逐模糊度/矩阵明细（S4）仍预留
+> - 🚧 预留：RawDataWriter / Solution CSV/NMEA 输出（当前未实现）
 >
 > **三种运行模式**（由 `ins.enabled` 配置项决定）：
 > - `ins.enabled=off`（纯 GNSS）→ SolutionLogger + SolutionWriter → `.pos`
-> - `ins.enabled=on`（松组合 LC）→ LcStream + RSLTWriter → `.rslt`（100Hz）
+> - `ins.enabled=lc`（松组合 LC）→ LcStream + RSLTWriter → `.rslt`（100Hz）
 > - `ins.enabled=tc`（紧组合 TC）→ TcStream + RSLTWriter → `.rslt`（100Hz）
 >
-> **输出格式配置**：`output.position_format`（`llh`/`xyz`）、`output.time_format`（`gpst`/`datetime`）、`trace_level`（0-3）。
+> **输出格式配置**：`output.position_format`（`llh`/`xyz`）、`output.time_format`（`gpst`/`datetime`）、`trace_enabled`、`trace_level`（0-3）、`stat_level`（0-3）、`stat_rate`（`update`/`second`/`imu`）和 `stat_filename`。
 >
 > **框架设计模式集成**：
 > - **纯队列流水线**：`Logger` / `SolutionLogger` 作为估计线程或传感器线程的下游消费者，从对应队列取数据（`queue.get()`），**无观察者回调、无 notify()**，与传感器层统一为纯队列流水线
@@ -892,7 +895,7 @@ def build_logger(config: dict, queues: dict, control) -> Logger:
   SolutionLogger.run()                                  (queue.get() 消费)
     → SolutionWriter.write(GnssSolution)                (Unix → week/sow 输出 .pos)
 
-【当前实现：外部对齐模式（external + ins.enabled=on，路径 A）】
+【历史实现：外部对齐模式（external + ins.enabled=lc，路径 A）】
   ImuSensor.run()
     → ImuFormator.decode(line) → ImuMeasurement         (gpst_to_unix 时间戳)
     → imu_queue.put(SensorData(tag="imu"))

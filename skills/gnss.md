@@ -1,5 +1,7 @@
 # GNSS 算法架构设计
 
+> **当前状态索引（2026-08-29）**：BDS GEO、BDS ISB、BDT→GPST 14 s、RINEX 基站列映射和未初始化相位行保护已完成验证。RTK 当前使用相位/伪距分离门限；BDS-only AR 仍未闭环。详见 [项目当前状态](项目当前状态.md)。
+
 > 基于 rtklib-py 算法参考 + GREAT-MSF 架构模式，设计 GInsStream 流式 GNSS 处理框架。
 > 实现 SPP 和 RTK（含 RTD 退化模式）功能，采用 ABC 抽象类继承体系。
 >
@@ -1029,7 +1031,7 @@ class GnssPositioningStrategy(OdometryStrategy):
     → SolutionWriter.write(sol)                            (写 .pos 文件)
     → 文件结束推入 None sentinel
 
-模式 2：松组合 LC (ins.enabled=on, 当前实现):
+模式 2：松组合 LC (ins.enabled=lc, 当前实现):
   InternalGnssSensor.run() 线程
     → ... 同纯 GNSS 模式的解算流程 ...
     → output_queue.put(SensorData(tag="gnss_solution"))   (推入 gnss_queue)

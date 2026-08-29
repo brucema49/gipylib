@@ -1,5 +1,7 @@
 # 配置参数详细说明
 
+> **当前状态索引（2026-08-29）**：本文参数表以当前代码为准；特别注意 `maxinno=5`（相位）与 `maxcode=30`（伪距）的语义分离、TC/LC 的 `pos_psd` 边界、`vel_var_floor`、`imu_time_offset_s` 和 stat/trace 输出配置。详见 [项目当前状态](项目当前状态.md)。
+
 > 本文档详细解释 `data/config.yaml` 中所有配置参数的含义、单位、默认值、取值范围与参考来源。
 > 配置文件采用**行内注释**风格（注释在参数右侧），本文档提供完整说明。
 > 与 [初始化.md](file:///home/mxl/workplace/gipylib/skills/初始化.md) 保持一致，初始化相关参数交叉引用初始化.md 对应章节。
@@ -75,10 +77,10 @@ GNSS 配置部分参考 rtklib-py 的 `config_phone.py` / `config_f9p.py`，已�
 **校验规则**（`src/utility/config_loader.py`）：
 - `gnss_source` 必须为 `internal` 或 `external`
 - `ins.enabled=off` 时 `gnss_source` 必须为 `internal`（纯 GNSS 模式不支持外部结果输入）
-- `external` 模式下 `ins.enabled` 必须为 `on`，且 `data_rate` 必须为 100
+- `external` 模式下 `ins.enabled` 必须为 `lc`，且 `data_rate` 必须为 100
 - `internal` 模式下 `positioning_mode` 必填，`rover_path` 和 `eph_path` 必填
 - `internal` + `rtk`/`rtd` 模式下 `base_path` 必填
-- `internal` + `ins.enabled=on/tc` 模式下 `imu_data_path` 必填
+- `internal` + `ins.enabled=lc/tc` 模式下 `imu_data_path` 必填
 
 ### 1.2 定位模式
 
@@ -123,7 +125,7 @@ GNSS 配置部分参考 rtklib-py 的 `config_phone.py` / `config_f9p.py`，已�
 | `snrmax` | double | `45.0` | dB-Hz | >0 | 方差计算最大信噪比，超过此值按此值计算 |
 | `accelh` | double | `3.0` | m/s² | >0 | 水平加速度噪声 sigma（系统噪声） |
 | `accelv` | double | `1.0` | m/s² | >0 | 垂直加速度噪声 sigma（系统噪声） |
-| `prnbias` | double | `0.01` | cycles | >0 | 载波相位偏差 sigma |
+| `prnbias` | double | `0.01`（通用默认；RTK 基线 `0.03`） | cycles | >0 | 载波相位偏差 sigma；RTK 验证表明 `0.5` 会导致浮点解退化为码级 |
 | `sig_p0` | double | `30.0` | m | >0 | 初始位置 sigma |
 | `sig_v0` | double | `10.0` | m/s | >0 | 初始速度/加速度 sigma |
 | `sig_n0` | double | `30.0` | m | >0 | 初始模糊度 sigma |
@@ -263,7 +265,7 @@ INS 配置部分参考 ignav 的 `configure.ini` 和 `tools/KF-GINS/config/kf-gi
 
 | 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
 |------|------|--------|------|---------|------|
-| `imu_data_path` | str | `"data/cpt_imu.csv"` | — | 有效文件路径 | IMU 数据文件路径（`ins.enabled=on` 时必填） |
+| `imu_data_path` | str | `"data/cpt_imu.csv"` | — | 有效文件路径 | IMU 数据文件路径（`ins.enabled=lc/tc` 时必填） |
 | `gnss_data_path` | str | `"data/spp.pos"` | — | 有效文件路径 | GNSS 数据文件路径（`external` 模式结果文件） |
 | `result_output_path` | str | `"output/"` | — | 有效目录 | 结果输出目录 |
 | `data_rate` | double | `100` | Hz | >0 | IMU 采样率。`external` 模式仅支持 100 Hz |
@@ -355,6 +357,11 @@ INS 配置部分参考 ignav 的 `configure.ini` 和 `tools/KF-GINS/config/kf-gi
 | `pos_psd` | double | `5.0e-3` | m²/s | ≥0 | **位置随机游走 PSD（LC EKF 必需项）**。使 P_pos 1s 内增长 ~0.005，配合 R=0.0025(sigma=0.05) 使 K≈0.8。无 pos_psd 时 P_pos 在量测更新后趋近 0，K→0，滤波器锁死无法跟踪 GNSS |
 
 > **注意**：`pos_psd` 是 LC EKF 必需项。`TransferMatrix` 通过 `ins_cfg.get("pos_psd", 0.0)` 读取（标量），Q 矩阵使用 `pos_psd * dt`。旧版 `position_random_walk`（数组）已废弃，不再使用。
+
+> **TC/LC 边界**：TC 中 `pos_psd=0` 已通过 RTK-TC 验证；LC 不能直接清零，否则位置量测后 `P_pos` 坍缩，可能导致滤波锁死和速度尖峰。`vel_psd`、`vel_var_floor` 也必须按模式和数据集分别验证，不能从 TC 基线直接推广到 LC。
+
+| `vel_psd` | double | 依模式 | m²/s³ | ≥0 | 速度随机游走 PSD；TC MECH-16 使用 0 并以 `vel_var_floor` 保持运行点，LC 参考配置使用非零值 |
+| `vel_var_floor` | double | `0.0` | (m/s)² | ≥0 | TC 可选的 `P_vel` 运行点下限；低于已验证边界可能造成量测响应不足，默认关闭 |
 
 #### 2.7.3 初始不确定度（SI 单位，从 cpt-rtktc_gps.conf 提取）
 
@@ -504,12 +511,16 @@ INS 配置部分参考 ignav 的 `configure.ini` 和 `tools/KF-GINS/config/kf-gi
 | 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
 |------|------|--------|------|---------|------|
 | `output_dir` | str | `"output"` | — | 有效目录 | 输出目录 |
-| `gnss_filename` | str | `"RTK.pos"` | — | 有效文件名 | 纯 GNSS 解算结果文件名（`.pos`，`ins.enabled=off/on` 输出，由 `SolutionWriter` 输出） |
-| `aligned_filename` | str | `"aligned.csv"` | — | 有效文件名 | 对齐块状 CSV 文件名（`ins.enabled=on` 输出，由 `AlignedWriter` 输出） |
-| `rslt_filename` | str | `"RTKLC.rslt"` | — | 有效文件名 | 组合导航结果文件名（`.rslt`，`ins.enabled=on/tc` 输出，100Hz，ECEF 位置/速度 + 姿态，由 `RSLTWriter` 输出） |
+| `gnss_filename` | str | `"RTK.pos"` | — | 有效文件名 | 纯 GNSS 解算结果文件名（`.pos`，`ins.enabled=off/lc` 输出，由 `SolutionWriter` 输出） |
+| `aligned_filename` | str | `"aligned.csv"` | — | 有效文件名 | 对齐块状 CSV 文件名（`ins.enabled=lc` 输出，由 `AlignedWriter` 输出） |
+| `rslt_filename` | str | `"RTKLC.rslt"` | — | 有效文件名 | 组合导航结果文件名（`.rslt`，`ins.enabled=lc/tc` 输出，100Hz，ECEF 位置/速度 + 姿态，由 `RSLTWriter` 输出） |
 | `position_format` | str | `"llh"` | — | `llh` / `xyz` | 位置输出格式。`llh`=经纬度高 (lat/lon/h)；`xyz`=ECEF 直角坐标 |
 | `time_format` | str | `"gpst"` | — | `gpst` / `datetime` | 时间输出格式。`gpst`=GPS 周+周内秒；`datetime`=YYYY/MM/DD HH:MM:SS.sss |
 | `trace_level` | int | `0` | — | 0 / 1 / 2 / 3 | trace 文件级别。0=off；1=info；2=detail；3=debug。生成与主输出同名的 `.trace` 文件，存放于 `output_dir`（由 `TraceFileWriter` 重定向 rtklib-py trace 输出，Unix 时间戳转 GPS 周+周内秒，过滤无效调试行） |
+| `trace_enabled` | bool | `true` | — | true/false | trace 总开关；关闭时即使 `trace_level>0` 也不生成 `.trace` |
+| `stat_level` | int | `0` | — | 0 / 1 / 2 / 3 | stat 级别：0=off；1=基础状态；2=TC 更新摘要；3=逐卫星与矩阵明细（当前 S4 预留） |
+| `stat_rate` | str | `"update"` | — | update / second / imu | stat 采样速率 |
+| `stat_filename` | str | `""` | — | 有效文件名 | stat 文件名；为空时使用主输出 stem + `.stat` |
 | `log_raw_data` | bool | `false` | — | true/false | 是否记录原始数据到 `raw/` |
 | `log_level` | str | `"INFO"` | — | `DEBUG` / `INFO` / `WARNING` / `ERROR` | 运行日志级别 |
 | `terminal_summary_interval` | int | `10` | — | >0 | 终端摘要间隔（每 N 条解算结果输出一次摘要） |
@@ -574,13 +585,13 @@ INS 配置部分参考 ignav 的 `configure.ini` 和 `tools/KF-GINS/config/kf-gi
 参考 `src/utility/config_loader.py::load_config`：
 
 1. **`coupling_mode` 已废弃**：存在该字段则报错，改用 `ins.enabled` 控制组合模式
-2. **`ins.enabled` 必填**：必须为 `off` / `on` / `tc`
+2. **`ins.enabled` 必填**：必须为 `off` / `lc` / `tc`
 3. **`gnss_source` 校验**：必须为 `internal` 或 `external`
 4. **`ins.enabled=off` 校验**：`gnss_source` 必须为 `internal`（纯 GNSS 模式不支持外部结果输入）
 5. **基站坐标归一化**：`rb_format=llh` 时由 `_normalize_rb()` 转为 ECEF xyz
 6. **输出格式校验**：`position_format` ∈ {llh, xyz}；`time_format` ∈ {gpst, datetime}；`trace_level` ∈ {0,1,2,3}
 7. **`external` 模式校验**：
-   - `ins.enabled` 必须为 `on`
+   - `ins.enabled` 必须为 `lc`
    - `data_rate` 必须为 100
    - `external_sol_format` 必须为 `pos`（当前仅支持）
 8. **`internal` 模式校验**：
@@ -588,4 +599,4 @@ INS 配置部分参考 ignav 的 `configure.ini` 和 `tools/KF-GINS/config/kf-gi
    - `rover_path` 必填
    - `eph_path` 必填
    - `positioning_mode=rtk/rtd` 时 `base_path` 必填
-   - `ins.enabled=on/tc` 时 `imu_data_path` 必填
+   - `ins.enabled=lc/tc` 时 `imu_data_path` 必填

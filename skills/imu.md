@@ -1,5 +1,7 @@
 # IMU 机械编排方案
 
+> **当前状态索引（2026-08-29）**：当前调用方统一使用 `src/core/ins/interpolator.py::imu_interpolate_linear`；`imu_interpolate` 最近邻函数只保留兼容历史接口。`ImuSensor` 已支持 RFU→FRD，Data19/手机的额外时间偏移通过 `TcStream.feed_imu` 边界配置。旧 `OdometryStrategy`/双滤波章节仅作历史背景，详见 [项目当前状态](项目当前状态.md)。
+
 > 实现 INS 机械编排和初始化，支持增量式和速率式两种 IMU 数据格式，
 > 以及 IMU/GNSS 时间对齐插值。
 > 参考 GREAT-MSF 的 t_gsins、t_gimu、t_gbase、t_ginterp 类设计。
@@ -443,7 +445,7 @@ ImuPreprocessor.check_imu_data() 检测内容：
 
 ---
 
-## 5. IMU/GNSS 时间对齐（最近邻匹配）
+## 5. IMU/GNSS 时间对齐（线性插值；最近邻仅为兼容接口）
 
 ### 5.1 问题背景
 
@@ -469,8 +471,8 @@ IMU 和 GNSS 具有不同的采样率（IMU 通常 100~200Hz，GNSS 通常 1~10H
 > - **KF-GINS** 使用增量式 IMU（`dtheta`/`dvel`），其 `imuInterpolate` 按比例切分增量，不适用于速率式 IMU
 > - **GINav** 也使用增量式 IMU（`imu.dw`/`imu.dv`），初始化时无时间插值
 >
-> 因此本项目采用 **GNSS 时间最近邻匹配** 策略：在包夹 `t_gnss` 的两个 IMU 历元中，选时间戳最接近 `t_gnss` 的那个，直接作为 `t_gnss` 时刻的 IMU 测量值（不插值）。
-> 时间对齐误差（最大半个 IMU 采样周期 ≈ 5ms @100Hz）后续由卡尔曼滤波在线估计。
+> 当前实现采用 **GNSS 时刻线性插值**：在包夹 `t_gnss` 的两个速率式 IMU 历元之间按时间比例计算 gyro/accel，生成真正标记为 `t_gnss` 的测量。旧 `imu_interpolate` 最近邻函数只为历史调用方兼容保留。
+> 初始化、LC 和 TC 主循环均调用 `imu_interpolate_linear`；额外的设备级时标偏移通过 `TcStream.feed_imu` 的 `ins.imu_time_offset_s` 配置处理。
 
 **最近邻匹配核心思想**：
 
@@ -532,9 +534,9 @@ class ImuMeasurement:
 >
 > **格式选择**：`ImuSensor._create_formator(imu_format)` 工厂方法根据 `imu_format` 配置值创建对应解码器实例（`"gpst"` → `ImuFormator()`，`"euroc"` → `EuRoCImuFormator()`，其他值抛 `ValueError`）。
 
-### 5.4 最近邻匹配实现（src/core/ins/interpolator.py）
+### 5.4 插值实现（src/core/ins/interpolator.py）
 
-> **已实现**。函数名 `imu_interpolate` 保留以兼容调用方，但实际行为是最近邻匹配而非插值。
+> **已实现**。生产调用方使用 `imu_interpolate_linear`；函数名 `imu_interpolate` 保留以兼容历史调用方，其行为仍是最近邻匹配。
 
 ```python
 def imu_interpolate(imu_pre: ImuMeasurement,
@@ -609,7 +611,7 @@ GNSS(t_gnss) 到达，IMU 缓冲区有 imu_list
   │ 若找不到 → 返回 None（不满足包夹条件）                   │
   └─────────────────────────────────────────────────────────┘
 
-步骤 2: imu_interpolate(imu_pre, imu_cur, t_gnss) 最近邻匹配
+步骤 2: imu_interpolate_linear(imu_pre, imu_cur, t_gnss) 线性插值
   ┌─────────────────────────────────────────────────────────┐
   │ dt_pre = |imu_pre.timestamp - t_gnss|                   │
   │ dt_cur = |imu_cur.timestamp - t_gnss|                   │
@@ -628,22 +630,22 @@ GNSS(t_gnss) 到达，IMU 缓冲区有 imu_list
 | 维度 | KF-GINS | GINav | 本项目 |
 |------|---------|-------|--------|
 | **IMU 数据形式** | 增量 (dtheta/dvel) | 增量 (dw/dv) | 速率 (gyro/accel) |
-| **对齐方式** | 增量切分 | 无初始化插值 | 最近邻匹配 |
-| **时间误差** | 无 | N/A | 最大半个采样周期（5ms） |
-| **误差补偿** | 无需 | N/A | KF 在线估计 δt |
+| **对齐方式** | 增量切分 | 无初始化插值 | 速率式线性插值 |
+| **时间误差** | 无 | N/A | 由包夹历元计算到目标时刻 |
+| **误差补偿** | 无需 | N/A | 设备级偏移可由 `imu_time_offset_s` 指定 |
 | **坐标系** | n 系 | n 系 | E 系 |
 | **接口参考** | `imuInterpolate` / `isToUpdate` | `ins_init.m` | `imu_interpolate` / `is_to_update` |
 
 ### 5.8 详细实现位置
 
-- **初始化阶段**：`src/core/ins/interpolator.py`（已实现），详见 [初始化.md 第 4 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#4-imu-时间对齐到-gnss-时间戳最近邻匹配)
+- **初始化阶段**：`src/core/ins/interpolator.py`（已实现），详见 [初始化.md 第 4 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#4-imu-时间对齐到-gnss-时间戳)
 - **机械编排阶段**（预留）：估计器内的时间同步逻辑，详见 [estimator.md 第 9 节](file:///home/mxl/workplace/gipylib/skills/estimator.md#9-时间同步与-imu-插值)
 
 ### 5.9 时间对齐注意事项
 
-- **不进行精细化插值**：最近邻匹配直接取最近邻历元的原始测量值，不对 gyro/accel 做比例计算
-- **不修改原始 IMU 历元**：`imu_pre` 和 `imu_cur` 保持不变，仅生成新的 `ImuMeasurement`（timestamp 标记为 `t_gnss`，数据复制自最近邻）
-- **时间对齐误差容忍**：100Hz IMU 下最大 5ms 误差，由 KF 在线估计补偿（δt 作为状态参数）
+- **必须使用包夹历元**：生产路径要求 `imu_pre.timestamp <= t_gnss <= imu_cur.timestamp`
+- **不修改原始 IMU 历元**：仅生成新的 `ImuMeasurement`（timestamp 标记为 `t_gnss`，gyro/accel 为线性插值）
+- **设备级时标偏移单独处理**：若数据集存在系统滞后，应在 TC 喂入边界使用已验证的 `imu_time_offset_s`，不能在解码器和滤波参数中重复补偿
 - **包夹条件强制**：GNSS 时间戳前后必须各有一个 IMU 历元，不满足时延迟处理
 - **边界处理**：当 GNSS 历元超出 IMU 缓冲区范围时，不满足包夹条件，延迟处理
 
@@ -1431,7 +1433,7 @@ class SensorFactory:
 ```
 IMU 数据到达（纯队列流水线，无观察者回调）:
 
-【当前实现：外部对齐模式 external + ins.enabled=on（路径 A）】
+【历史实现：外部对齐模式 external + ins.enabled=lc（路径 A）】
   ImuSensor.run()                        (StreamerBase 继承的线程入口)
     → open(file_path) 逐行读取
     → ImuFormator.decode(line)            (解码：week,sow,gx,gy,gz,ax,ay,az → ImuMeasurement)

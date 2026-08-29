@@ -1,5 +1,7 @@
 # 配置文件说明
 
+> **当前状态索引（2026-08-29）**：配置说明需同时区分相位 `maxinno` 与伪距 `maxcode`；TC 可用 `pos_psd=0`，LC 不能直接照搬。当前 RTK 浮点基线为 `prnbias=0.03`，输出支持 `stat_level`/`trace_enabled`，Data19 可使用 `ins.imu_time_offset_s`。详见 [项目当前状态](项目当前状态.md)。
+
 > 定义 GInsStream 统一定位解算配置文件的格式、字段与默认值。
 > 配置文件采用 YAML 格式，存放于 `data/config.yaml`（参考配置：`data/spp-ins-lc.yaml`、`data/rtdtc.yaml`、`phone/rtdtc.yaml`、`data/ignav-rtktc.conf`）。
 >
@@ -170,7 +172,7 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 | `snrmax` | float | `45.0` | dB-Hz | 方差计算最大信噪比 | `snrmax` |
 | `accelh` | float | `3.0` | m/s² | 水平加速度噪声 sigma | `accelh` |
 | `accelv` | float | `1.0` | m/s² | 垂直加速度噪声 sigma | `accelv` |
-| `prnbias` | float | `0.01` | cycles | 载波相位偏差 sigma | `prnbias` |
+| `prnbias` | float | `0.01`（通用适配默认；RTK 验证基线 `0.03`） | cycles | 载波相位偏差 sigma；旧值 `0.5` 会使浮点模糊度协方差过大 | `prnbias` |
 | `sig_p0` | float | `30.0` | m | 初始位置 sigma | `sig_p0` |
 | `sig_v0` | float | `10.0` | m/s | 初始速度/加速度 sigma | `sig_v0` |
 | `sig_n0` | float | `30.0` | m | 初始模糊度 sigma | `sig_n0` |
@@ -428,12 +430,16 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `output_dir` | str | `"output"` | 输出目录 |
-| `gnss_filename` | str | `"RTK.pos"` | 纯 GNSS 解算结果文件名（`.pos`，`ins.enabled=off/on` 输出） |
-| `aligned_filename` | str | `"aligned.csv"` | 对齐块状 CSV 文件名（`ins.enabled=on` 输出） |
-| `rslt_filename` | str | `"RTKLC.rslt"` | 组合导航结果文件名（`.rslt`，`ins.enabled=on/tc` 输出，100Hz，ECEF 位置/速度 + 姿态） |
+| `gnss_filename` | str | `"RTK.pos"` | 纯 GNSS 解算结果文件名（`.pos`，`ins.enabled=off/lc` 输出） |
+| `aligned_filename` | str | `"aligned.csv"` | 对齐块状 CSV 文件名（`ins.enabled=lc` 输出） |
+| `rslt_filename` | str | `"RTKLC.rslt"` | 组合导航结果文件名（`.rslt`，`ins.enabled=lc/tc` 输出，100Hz，ECEF 位置/速度 + 姿态） |
 | `position_format` | str | `"llh"` | 位置输出格式：`llh`=经纬度高 (lat/lon/h) / `xyz`=ECEF 直角坐标 |
 | `time_format` | str | `"gpst"` | 时间输出格式：`gpst`=GPS 周+周内秒 / `datetime`=YYYY/MM/DD HH:MM:SS.sss |
 | `trace_level` | int | `0` | trace 文件级别：0=off / 1=info / 2=detail / 3=debug。生成与主输出同名的 `.trace` 文件，存放于 `output_dir` |
+| `trace_enabled` | bool | `true` | trace 总开关；关闭时即使 `trace_level>0` 也不生成 `.trace` |
+| `stat_level` | int | `0` | stat 级别：0=off / 1=基础状态 / 2=TC 更新摘要 / 3=逐卫星与矩阵明细（当前 S4 预留） |
+| `stat_rate` | str | `"update"` | stat 采样速率：`update` / `second` / `imu` |
+| `stat_filename` | str | `""` | stat 文件名；为空时使用主输出 stem + `.stat` |
 | `log_raw_data` | bool | `false` | 是否记录原始数据到 raw/ |
 | `log_level` | str | `"INFO"` | 运行日志级别：DEBUG/INFO/WARNING/ERROR |
 | `terminal_summary_interval` | int | `10` | 终端摘要间隔（每 N 条解算结果） |
@@ -510,9 +516,9 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 
 | 文件 | 格式 | 内容 | 触发模式 |
 |------|------|------|---------|
-| `output/RTK.pos` | POS | 纯 GNSS 解算结果（SPP/RTK），由 `src/log/solution_writer.py::SolutionWriter` 输出 | `ins.enabled=off/on` |
-| `output/aligned.csv` | CSV | 对齐块状输出（G + N 行 I），由 `src/log/aligned_writer.py::AlignedWriter` 输出 | `ins.enabled=on` |
-| `output/RTKLC.rslt` | RSLT | 组合导航结果（100Hz，ECEF 位置/速度 + 姿态），松组合由 `RSLTWriter` 输出 / 紧组合由 `TcStream` + `RSLTWriter` 输出 | `ins.enabled=on/tc` |
+| `output/RTK.pos` | POS | 纯 GNSS 解算结果（SPP/RTK），由 `src/log/solution_writer.py::SolutionWriter` 输出 | `ins.enabled=off/lc` |
+| `output/aligned.csv` | CSV | 对齐块状输出（G + N 行 I），由 `src/log/aligned_writer.py::AlignedWriter` 输出 | `ins.enabled=lc` |
+| `output/RTKLC.rslt` | RSLT | 组合导航结果（100Hz，ECEF 位置/速度 + 姿态），松组合由 `RSLTWriter` 输出 / 紧组合由 `TcStream` + `RSLTWriter` 输出 | `ins.enabled=lc/tc` |
 | `output/<name>.trace` | 文本 | rtklib-py trace 输出，由 `src/log/trace_file_writer.py::TraceFileWriter` 重定向，Unix 时间戳转 GPS 周+周内秒，过滤无效调试行 | `trace_level>0` |
 | `output/raw/imu_raw.csv` | CSV | IMU 原始数据 | `log_raw_data=true`（可选） |
 | `output/raw/rover_raw.csv` | CSV | 流动站原始数据（内部模式） | `log_raw_data=true`（可选） |
@@ -524,4 +530,4 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 >
 > `SolutionWriter` 与 `RSLTWriter` 接受 `position_format` 与 `time_format` 参数控制输出格式。
 > `trace_level>0` 时生成 `.trace` 文件（与主输出同名，存放于 `output_dir`），由 `TraceFileWriter` 重定向 rtklib-py trace 输出。
-> `config_loader.py` 校验 `ins.enabled=off` 时 `gnss_source` 必须为 `internal`；`ins.enabled=on/tc` 时 `imu_data_path` 必填。
+> `config_loader.py` 校验 `ins.enabled=off` 时 `gnss_source` 必须为 `internal`；`ins.enabled=lc/tc` 时 `imu_data_path` 必填。

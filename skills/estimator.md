@@ -1,5 +1,7 @@
 # 融合估计指导方案
 
+> **当前状态索引（2026-08-29）**：当前估计器为单滤波 EKF，`LcEstimator` 与 `TcEstimator` 共用 INS 误差状态和 Joseph 更新；TC 的 GNSS 参数块、过程噪声运行点和反馈诊断已纳入实现。不要使用本文历史参数扫描替代 [项目当前状态](项目当前状态.md) 中的 TC/LC 边界。
+
 > **单滤波**松组合 EKF：固定 15 维基础状态 + 可选参数块（GNSS 杆臂 3 / IMU 安装角 2 / IMU 杆臂 3 / 时间对齐 1），含 NHC 约束与 ZUPT 零速更新。
 > 参数块/矩阵块管理采用 `StateIndex` dataclass；算法参考 ignav（H 矩阵公式、ψ-error 模型）；OOP 风格参考 GREAT-MSF-main。
 >
