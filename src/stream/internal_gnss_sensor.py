@@ -96,7 +96,7 @@ class InternalGnssSensor(Thread):
 
         # 4. RTK 模式加载基站
         base = None
-        if self.gnss_cfg.get("positioning_mode") == "rtk":
+        if self.gnss_cfg.get("positioning_mode") in ("rtk", "rtd"):
             base_path = self._prepare_rinex(self.gnss_cfg["base_path"])
             base = rn.rnx_decode(env.get_cfg())
             base.decode_obsfile(nav, base_path, None)
@@ -117,6 +117,10 @@ class InternalGnssSensor(Thread):
                 from src.core.gnss.rtk_processor import RtkProcessor
                 processor = RtkProcessor(nav)
                 self._run_rtk_loop(processor, rov, base, nav, rn)
+        elif mode == "rtd":
+            from src.core.gnss.rtd_processor import RtdProcessor
+            processor = RtdProcessor(nav)
+            self._run_rtk_loop(processor, rov, base, nav, rn)
         else:
             raise ValueError(f"Unsupported positioning_mode: {mode}")
 

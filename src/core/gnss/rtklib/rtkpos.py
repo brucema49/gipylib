@@ -277,7 +277,8 @@ def varerr(nav, sys, el, f, dt, rcvstd, snr_rover, snr_base):
     return var
 
 
-def ddres(nav, x, P, yr, er, yu, eu, sat, el, dt, obsr, save_res=False):
+def ddres(nav, x, P, yr, er, yu, eu, sat, el, dt, obsr, save_res=False,
+          use_phase=True):
     """ /* double-differenced residuals and partial derivatives  -----------------------------------
         I nav  = sat nav data
         I dt = time diff between base and rover observations
@@ -311,7 +312,8 @@ def ddres(nav, x, P, yr, er, yu, eu, sat, el, dt, obsr, save_res=False):
     # step through sat systems
     for sys in nav.gnss_t:
         # step through phases/codes
-        for f in range(0, nf*2):
+        frequencies = range(0, nf*2) if use_phase else range(nf, nf*2)
+        for f in frequencies:
             frq = f % nf
             code = 1 * (f >= nf)
             idx = sysidx(sat, sys) # find sats in sys
@@ -937,7 +939,7 @@ def holdamb(nav, xa):
     nav.x, nav.P = gn.filter(nav.x, nav.P, H[:,:nv], v[:nv], R)
         
         
-def relpos(nav, obsr, obsb, sol):
+def relpos(nav, obsr, obsb, sol, use_phase=True):
     """ relative positioning for PPK """
     
     # time diff between rover and base
@@ -999,7 +1001,8 @@ def relpos(nav, obsr, obsb, sol):
     els = azel[iu,1]
     
     # calculate double-differenced residuals and create state matrix from sat angles 
-    v, H, R = ddres(nav, nav.x, nav.P, yr, er, yu, eu, sats, els, nav.dt, obsr, True)
+    v, H, R = ddres(nav, nav.x, nav.P, yr, er, yu, eu, sats, els, nav.dt, obsr,
+                     True, use_phase=use_phase)
     
     if len(v) < 4:
         trace(3, 'not enough double-differenced residual\n')
@@ -1021,7 +1024,8 @@ def relpos(nav, obsr, obsb, sol):
         yu, eu, _ = zdres(nav, obsr, rs, dts, svh, var, xp[0:3], 1)
         yu, eu = yu[iu,:], eu[iu,:]
         # calc double diff residuals again after kalman filter update for float solution 
-        v, H, R = ddres(nav, xp, Pp, yr, er, yu, eu, sats, els, nav.dt, obsr)
+        v, H, R = ddres(nav, xp, Pp, yr, er, yu, eu, sats, els, nav.dt, obsr,
+                         use_phase=use_phase)
         # validation of float solution, always returns 1, msg to trace file if large residual
         valpos(nav, v, R)
         
@@ -1144,5 +1148,3 @@ def rtkpos(nav, rov, base, fp_stat, dir):
             break
     trace(3, 'rtkpos: end solution\n')
                 
-
-
