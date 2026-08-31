@@ -414,8 +414,6 @@ class _DdBase(TcMeasurement):
         _c = rCST.CLIGHT
         nf = nav.nf
         ns = len(el)
-        # 单差最大对数 (phase+code 各一组)
-        max_nv = ns * nf * 2
         v_list, H_rows = [], []
         Ri_list, Rj_list = [], []
         nb_per_block = []   # ddcov 用
@@ -426,7 +424,8 @@ class _DdBase(TcMeasurement):
 
         # 用于 amb 索引: 当 si.amb_idx 返回 -1 (RTD) 时跳过 ambiguity 列
         for sys in nav.gnss_t:
-            for f in range(nf * 2):
+            frequencies = range(nf * 2) if self.use_phase else range(nf, nf * 2)
+            for f in frequencies:
                 frq = f % nf
                 code = 1 if f >= nf else 0
                 # 该 sys 内的 sat 索引
@@ -661,12 +660,42 @@ class RtdTcMeas(_DdBase):
         super().__init__(config)
         self.use_phase = False
         self.use_code = True
+        ins = config.get("ins", {}) if config else {}
+        self.use_doppler = bool(ins.get("tc_use_doppler", False))
+        self._doppler_sigma = float(config.get("gnss", {}).get("tc_doppler_sigma", 0.3))
 
     def _amb_idx(self, sat, freq, si):
         return -1
 
     def _has_amb(self, si):
         return False
+
+    def _build_doppler_dd(self, nav, si, sat, el, eu, doppler_r,
+                          doppler_b, velocity_e=None):
+        sat = np.asarray(sat)
+        dr = np.asarray(doppler_r, dtype=float).reshape(-1)
+        db = np.asarray(doppler_b, dtype=float).reshape(-1)
+        idx = np.flatnonzero((dr != 0.0) & (db != 0.0))
+        if len(dr) != len(sat) or len(db) != len(sat) or len(idx) < 2:
+            return np.array([]), np.zeros((0, si.dim)), np.zeros((0, 0)), {"n_doppler_acc": 0}
+        ref_i = idx[np.argmax(np.asarray(el)[idx])]
+        vals, rows, ri, rj = [], [], [], []
+        for j in idx:
+            if j == ref_i:
+                continue
+            row = np.zeros(si.dim)
+            row[si.vel:si.vel + 3] = np.asarray(eu)[ref_i] - np.asarray(eu)[j]
+            observed = (dr[ref_i] - db[ref_i]) - (dr[j] - db[j])
+            # Range-rate prediction is -H_vel*v_nominal for this error-state
+            # convention, so innovation is observed + H_vel*v_nominal.
+            predicted_error = (float(row[si.vel:si.vel + 3] @ velocity_e)
+                               if velocity_e is not None else 0.0)
+            vals.append(observed + predicted_error)
+            rows.append(row)
+            ri.append(self._doppler_sigma ** 2)
+            rj.append(self._doppler_sigma ** 2)
+        R = ddcov(np.array([len(vals)]), 1, np.asarray(ri), np.asarray(rj), len(vals))
+        return np.asarray(vals), np.asarray(rows), R, {"n_doppler_acc": len(vals), "doppler_ref_sat": int(sat[ref_i])}
 
     def build(self, state, obsr, nav, si, x=None, obsb=None):
         """构造 RTD 双差伪距量测。"""
@@ -696,23 +725,26 @@ class RtdTcMeas(_DdBase):
         if x is None:
             x = np.zeros(si.dim)
         P = None
-        # RTD 只取 code: 在 _build_dd 中通过 use_phase=False 控制
-        # 但 _build_dd 仍会遍历 phase/code, 这里在构造后过滤掉 phase 行
-        v_all, H_all, R_all, info = self._build_dd(
+        # RTD 的 _build_dd 直接只遍历 code 频率，并保留 code DD 的完整协方差。
+        v, H, R, info = self._build_dd(
             nav, x, P, yr, er, yu, eu, sats, els, dt, obsr, si, state)
-        if len(v_all) == 0:
-            return v_all, H_all, R_all, info
-        # info['pairs'] 中的 code 字段: 0=phase, 1=code
-        pairs = info["pairs"]
-        code_mask = np.array([p[3] == 1 for p in pairs])
-        v = v_all[code_mask]
-        H = H_all[code_mask]
-        # R 需要重新构造 (因为删除了 phase 行, ddcov 的分块结构变了)
-        # 简单处理: 对角取 R_all 对角元素
-        if R_all.shape[0] == len(v_all):
-            R = np.diag(np.diag(R_all)[code_mask])
-        else:
-            R = R_all[code_mask][:, code_mask]
-        info["n"] = len(v)
-        info["pairs"] = [p for p in pairs if p[3] == 1]
+        if self.use_doppler and obsb is not None:
+            rmap = {int(s): i for i, s in enumerate(obsr.sat)}
+            bmap = {int(s): i for i, s in enumerate(obsb.sat)}
+            dr, db = [], []
+            for s in sats:
+                ir0, ib0 = rmap.get(int(s), -1), bmap.get(int(s), -1)
+                if ir0 < 0 or ib0 < 0:
+                    dr.append(0.0); db.append(0.0); continue
+                lam = rCST.CLIGHT / sat2freq(int(s), 0, nav)
+                dr.append(-lam * float(obsr.D[ir0, 0]))
+                db.append(-lam * float(obsb.D[ib0, 0]))
+            vd, Hd, Rd, idop = self._build_doppler_dd(nav, si, sats, els, eu, dr, db, state.vel_e)
+            if len(vd):
+                n0 = len(v)
+                v = np.concatenate((v, vd))
+                H = np.vstack((H, Hd))
+                R = np.block([[R, np.zeros((n0, len(vd)))],
+                              [np.zeros((len(vd), n0)), Rd]])
+                info.update(idop)
         return v, H, R, info
