@@ -53,6 +53,11 @@ class LcEstimator:
         # RTK 高程精度好(~0.3m), 不需放大。因子作用于 NED 的 Down 分量
         self._vertical_sigma_factor = float(ins_cfg.get("vertical_sigma_factor", 1.0))
         self._gnss_vel_std = ins_cfg.get("gnss_vel_std", 0.5)
+        self._feedback_pos_fraction = float(
+            ins_cfg.get("feedback_pos_fraction", 1.0)
+        )
+        if not 0.0 < self._feedback_pos_fraction <= 1.0:
+            raise ValueError("ins.feedback_pos_fraction must be in (0, 1]")
         self._innov_reject_threshold = float(ins_cfg.get("innov_reject_threshold", 0.0))
         self._innov_reject_warmup = int(ins_cfg.get("innov_reject_warmup", 100))
         self._gnss_update_count = 0
@@ -91,6 +96,11 @@ class LcEstimator:
         Q = self.tm.build_Q(dt, C_b_e)
         P0 = self.P + 0.5 * Q
         self.P = Phi @ P0 @ Phi.T + 0.5 * Q
+        # Normally x is zero after closed-loop feedback.  A configured
+        # partial position feedback retains a mean error; propagate it with
+        # the same transition matrix as the covariance.
+        if np.any(self.x):
+            self.x = Phi @ self.x
         self.P = 0.5 * (self.P + self.P.T)
 
     # ===== 量测更新 =====
@@ -264,13 +274,14 @@ class LcEstimator:
         si = self.si
 
         # 基础 15 维 (ψ-error, 对齐 ignav lcclp)
-        delta_pos = self.x[si.pos:si.pos+3]
+        delta_pos = self.x[si.pos:si.pos+3].copy()
         delta_vel = self.x[si.vel:si.vel+3]
         delta_psi = self.x[si.att:si.att+3]
         delta_bg = self.x[si.gyro_bias:si.gyro_bias+3]
         delta_ba = self.x[si.accel_bias:si.accel_bias+3]
 
-        new_pos = state.pos_e - delta_pos
+        applied_pos = self._feedback_pos_fraction * delta_pos
+        new_pos = state.pos_e - applied_pos
         new_vel = state.vel_e - delta_vel
         C_b_e_new = rodrigues(-delta_psi) @ state.C_b_e
         U, _, Vt = np.linalg.svd(C_b_e_new)
@@ -307,3 +318,6 @@ class LcEstimator:
 
         self.ins_update.state = new_state
         self.x[:] = 0.0
+        remaining_pos = (1.0 - self._feedback_pos_fraction) * delta_pos
+        if np.any(remaining_pos):
+            self.x[si.pos:si.pos+3] = remaining_pos

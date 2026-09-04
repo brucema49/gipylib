@@ -16,6 +16,8 @@
 """
 import numpy as np
 
+from src.core.ins.attitude import dcm2euler
+from src.core.ins.earth_param import cal_Ce2n, ecef2llh
 from src.core.ins.lc_estimator import LcEstimator
 from src.core.ins.state_index import StateIndex
 from src.core.tc.tc_state_index import TcStateIndex
@@ -76,6 +78,22 @@ class TcEstimator(LcEstimator):
         self._clk_stored = np.zeros(4, dtype=np.float64)
         self._N_stored = np.zeros(tc_si.n_amb if tc_si.has_ambiguity() else 0,
                                   dtype=np.float64)
+        ins_cfg = config.get("ins", {})
+        self._feedback_pos_smoothing_s = float(
+            ins_cfg.get("feedback_pos_smoothing_s", 0.0)
+        )
+        if self._feedback_pos_smoothing_s < 0.0:
+            raise ValueError("ins.feedback_pos_smoothing_s must be >= 0")
+        self._feedback_pos_smoothing_mode = str(
+            ins_cfg.get("feedback_pos_smoothing_mode", "all")
+        ).lower()
+        if self._feedback_pos_smoothing_mode not in {"all", "transverse"}:
+            raise ValueError(
+                "ins.feedback_pos_smoothing_mode must be 'all' or 'transverse'"
+            )
+        self._pending_pos_correction = np.zeros(3, dtype=np.float64)
+        self._pending_pos_elapsed = 0.0
+        self._pending_pos_start = None
 
     def effective_x(self) -> np.ndarray:
         """构造有效状态向量供量测构造: stored + x (ε)。
@@ -186,6 +204,15 @@ class TcEstimator(LcEstimator):
                 grow = (d > 1e-9) & (d < 5.0e3)
                 self.P[a0:a1, a0:a1][grow, grow] += q_amb
 
+        # Preserve and propagate any mean error left by partial position
+        # feedback using the same INS transition as the covariance.
+        if np.any(self.x[:n_ins]):
+            self.x[:n_ins] = Phi_ins @ self.x[:n_ins]
+
+        self._apply_pending_position_correction(
+            self.ins_update.state.timestamp
+        )
+
         # P_vel 运行点下限 (对齐 ignav propinss 自然平衡值 ~17mm):
         # ignav 无 vel_psd 注入, 其 P_vel 由 Phi 耦合自然维持在 mm-cm 级;
         # gipylib 在 vel_psd=0 时 P_vel 会塌缩至更低导致 K 过小、机动段
@@ -249,6 +276,72 @@ class TcEstimator(LcEstimator):
         INS 误差状态由父类 feedback 处理 (state -= x, x 清零)。
         """
         si = self.si
+        smooth_position = (
+            self._feedback_pos_smoothing_s > 0.0
+            and self._feedback_pos_fraction < 1.0
+        )
+        delta_pos = self.x[si.pos:si.pos + 3].copy()
+
+        # The base implementation supports partial feedback by retaining the
+        # unclosed position error in x.  For the TC smoothing mode, retain the
+        # correction in nominal position instead, so the error state remains
+        # closed-loop and the correction can be distributed over IMU epochs.
+        if smooth_position:
+            self._apply_pending_position_correction(
+                self.ins_update.state.timestamp, force=True
+            )
+            fraction = self._feedback_pos_fraction
+            _, deferred = self._split_position_feedback(delta_pos, fraction)
+            self._feedback_pos_fraction = 1.0
+            try:
+                self._feedback_gnss_params_and_base()
+            finally:
+                self._feedback_pos_fraction = fraction
+
+            if np.any(deferred):
+                self.ins_update.state.pos_e += deferred
+                self._refresh_position_frame()
+            self._schedule_pending_position_correction(deferred)
+            return
+
+        self._feedback_gnss_params_and_base()
+
+    def _split_position_feedback(
+        self, delta_pos: np.ndarray, fraction: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return immediate and deferred ECEF position-error components."""
+        if self._feedback_pos_smoothing_mode == "all":
+            return (
+                fraction * delta_pos,
+                (1.0 - fraction) * delta_pos,
+            )
+
+        state = self.ins_update.state
+        lat, lon, _ = ecef2llh(state.pos_e)
+        C_e_n = cal_Ce2n(lat, lon)
+        delta_ned = C_e_n @ delta_pos
+        vel_ned = C_e_n @ state.vel_e
+        horizontal_vel = vel_ned[:2]
+        speed = float(np.linalg.norm(horizontal_vel))
+        if speed <= 1.0e-6:
+            # No stable travel direction: fall back to all-axis smoothing.
+            return (
+                fraction * delta_pos,
+                (1.0 - fraction) * delta_pos,
+            )
+
+        along_ned = np.zeros(3, dtype=np.float64)
+        along_ned[:2] = horizontal_vel / speed
+        along_component = np.dot(delta_ned, along_ned) * along_ned
+        vertical_component = np.array([0.0, 0.0, delta_ned[2]])
+        transverse_component = delta_ned - along_component - vertical_component
+        immediate_ned = along_component + vertical_component + fraction * transverse_component
+        deferred_ned = (1.0 - fraction) * transverse_component
+        return C_e_n.T @ immediate_ned, C_e_n.T @ deferred_ned
+
+    def _feedback_gnss_params_and_base(self) -> None:
+        """Accumulate TC direct states and run the common INS feedback."""
+        si = self.si
         # 累积 GNSS 直接状态修正到 stored
         if si.clk_bias >= 0:
             self._clk_stored += self.x[si.clk_bias:si.clk_bias + 4]
@@ -259,6 +352,52 @@ class TcEstimator(LcEstimator):
             self._N_stored += self.x[amb_slice]
         # 父类 feedback: INS state -= x, 清零全部 x (含 GNSS ε)
         super().feedback()
+
+    def _schedule_pending_position_correction(self, correction: np.ndarray) -> None:
+        """Schedule an unapplied ECEF position correction after feedback."""
+        self._pending_pos_correction = np.asarray(correction, dtype=np.float64).copy()
+        self._pending_pos_elapsed = 0.0
+        self._pending_pos_start = float(self.ins_update.state.timestamp)
+
+        if not np.any(self._pending_pos_correction):
+            self._pending_pos_start = None
+
+    def _refresh_position_frame(self) -> None:
+        """Keep reported attitude Euler angles consistent with ECEF position."""
+        lat, lon, _ = ecef2llh(self.ins_update.state.pos_e)
+        C_b_n = cal_Ce2n(lat, lon) @ self.ins_update.state.C_b_e
+        self.ins_update.state.att_rpy = dcm2euler(C_b_n)
+
+    def _apply_pending_position_correction(
+        self, timestamp: float, force: bool = False
+    ) -> None:
+        """Apply the scheduled correction increment up to ``timestamp``."""
+        correction = self._pending_pos_correction
+        if not np.any(correction):
+            return
+
+        duration = self._feedback_pos_smoothing_s
+        if duration <= 0.0:
+            return
+        if self._pending_pos_start is None:
+            self._pending_pos_start = float(timestamp)
+
+        if force:
+            elapsed = duration
+        else:
+            elapsed = float(timestamp) - self._pending_pos_start
+            elapsed = min(max(elapsed, 0.0), duration)
+
+        increment = correction * (elapsed - self._pending_pos_elapsed) / duration
+        if np.any(increment):
+            self.ins_update.state.pos_e -= increment
+        self._pending_pos_elapsed = elapsed
+
+        if elapsed >= duration:
+            self._refresh_position_frame()
+            self._pending_pos_correction[:] = 0.0
+            self._pending_pos_elapsed = 0.0
+            self._pending_pos_start = None
 
     def switch_mode(self, new_mode: str, builder=None):
         """降级时状态向量重整。
@@ -277,6 +416,9 @@ class TcEstimator(LcEstimator):
         self.P = new_P
         self.x = new_x
         self._mode = new_mode
+        self._pending_pos_correction[:] = 0.0
+        self._pending_pos_elapsed = 0.0
+        self._pending_pos_start = None
         # 重建 TransferMatrix (用 new_si, dim 可能因 clk_bias 块变化而改变)
         # 否则 build_Q 会用旧 si.dim 生成 Q, 与新 P 维度不匹配
         from src.core.ins.transfer_matrix import TransferMatrix
@@ -309,6 +451,9 @@ class TcEstimator(LcEstimator):
         self.state.pos_e[:] = 0.0
         self.state.vel_e[:] = 0.0
         self.state.C_b_e = np.eye(3)
+        self._pending_pos_correction[:] = 0.0
+        self._pending_pos_elapsed = 0.0
+        self._pending_pos_start = None
         # GNSS 直接估计重置
         self._clk_stored[:] = 0.0
         self._N_stored = np.zeros(si.n_amb if si.has_ambiguity() else 0,
