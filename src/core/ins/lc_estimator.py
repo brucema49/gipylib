@@ -24,6 +24,22 @@ from src.core.ins.transfer_matrix import TransferMatrix, rodrigues, skew
 logger = logging.getLogger(__name__)
 
 
+def _config_switch(value, name: str) -> bool:
+    """Parse an on/off configuration value, accepting YAML bools and strings."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"on", "true", "yes", "1"}:
+        return True
+    if text in {"off", "false", "no", "0"}:
+        return False
+    raise ValueError(
+        f"{name} must be on/off or true/false, got {value!r}"
+    )
+
+
 class LcEstimator:
     """松组合 EKF 估计器 (单滤波, StateIndex 参数块管理)。
 
@@ -53,9 +69,20 @@ class LcEstimator:
         # RTK 高程精度好(~0.3m), 不需放大。因子作用于 NED 的 Down 分量
         self._vertical_sigma_factor = float(ins_cfg.get("vertical_sigma_factor", 1.0))
         self._gnss_vel_std = ins_cfg.get("gnss_vel_std", 0.5)
+        feedback_switch = ins_cfg.get("feedback_pos_enable")
+        if feedback_switch is None:
+            # Preserve the pre-switch behavior for legacy configurations that
+            # already declare a feedback ratio.  A completely unspecified
+            # configuration keeps the ignav-style immediate feedback.
+            self._feedback_pos_enabled = "feedback_pos_fraction" in ins_cfg
+        else:
+            self._feedback_pos_enabled = _config_switch(
+                feedback_switch,
+                "ins.feedback_pos_enable",
+            )
         self._feedback_pos_fraction = float(
             ins_cfg.get("feedback_pos_fraction", 1.0)
-        )
+        ) if self._feedback_pos_enabled else 1.0
         if not 0.0 < self._feedback_pos_fraction <= 1.0:
             raise ValueError("ins.feedback_pos_fraction must be in (0, 1]")
         self._innov_reject_threshold = float(ins_cfg.get("innov_reject_threshold", 0.0))

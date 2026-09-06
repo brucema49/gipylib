@@ -91,6 +91,9 @@ class TcEstimator(LcEstimator):
             raise ValueError(
                 "ins.feedback_pos_smoothing_mode must be 'all' or 'transverse'"
             )
+        if not self._feedback_pos_enabled:
+            self._feedback_pos_smoothing_s = 0.0
+            self._feedback_pos_smoothing_mode = "all"
         self._pending_pos_correction = np.zeros(3, dtype=np.float64)
         self._pending_pos_elapsed = 0.0
         self._pending_pos_start = None
