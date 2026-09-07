@@ -6,6 +6,7 @@ from src.core.thread_control import ThreadControl
 from src.stream.base import BaseSensor
 from src.stream.imu_sensor import ImuSensor
 from src.stream.gnss_sol_sensor import GnssSolSensor
+from src.stream.awesome_sensor import AwesomeGnssSensor, AwesomeImuSensor
 
 
 class SensorFactory:
@@ -22,8 +23,18 @@ class SensorFactory:
 
         imu_coord = config.get("ins", {}).get("imu_coordinate_system", "FRD")
         imu_format = config.get("ins", {}).get("imu_format", "gpst")
+        week = int(config.get("gnss", {}).get("week", 0))
+        start_sow = config.get("ins", {}).get("start_sow")
+        end_sow = config.get("ins", {}).get("end_sow")
 
-        if gnss_source == "external":
+        if gnss_source == "awesome_external":
+            imu_path = config["ins"]["imu_data_path"]
+            sensors.append(AwesomeImuSensor(
+                imu_path, imu_queue, control, week, start_sow, end_sow))
+            gnss_path = config["gnss"]["external_sol_path"]
+            sensors.append(AwesomeGnssSensor(
+                gnss_path, gnss_queue, control, week, start_sow, end_sow))
+        elif gnss_source == "external":
             # external + ins.enabled=lc: IMU + 外部 GNSS 结果
             imu_path = config["ins"]["imu_data_path"]
             sensors.append(ImuSensor(imu_path, imu_queue, control, imu_coord, imu_format))

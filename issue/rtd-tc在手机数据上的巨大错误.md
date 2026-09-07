@@ -299,3 +299,22 @@ RTD 自身评估前后一致）。
 2. **ASK-B**：BDS 恢复需要先实现每卫星相位/伪距残差 dump 与 udbias/ddres 细节比对（新专项）。
 3. **ASK-C**：根治垂直通道需姿态可观性——候选：RtdTcMeas 增加 Doppler 速度量测、或 v 系安装角标定后启用 NHC。
    三者均为 src/core 改动，待指示。
+
+## 10. 最新 GPS+GAL RTD-TC 复算（2026-09-06）
+
+根据当前已采纳的手机策略，`phone/rtdtc.yaml` 已统一为：
+
+- `gnss_t: ["GPS", "GAL"]`，暂停存在系统性偏差的 BDS C2I；
+- `maxcode: 60.0`；
+- `ins.feedback_pos_enable: off`，采用 ignav 式位置立即反馈；`feedback_pos_fraction: 0.88`、
+  `feedback_pos_smoothing_s: 1.0`、`feedback_pos_smoothing_mode: transverse` 仅作为 on 时参数保留。
+
+按该配置重新运行 `src/main.py phone/rtdtc.yaml`，`phone/output/RTDTC.rslt` 共 `525743` 个高频历元，
+Qins=0/2/3 为 `18/520533/5192`，GNSS Q=4/5 为 `525608/135`。使用 `phone/error_rslt.py` 的
+固定窗口（Week 2382，SOW 115665--115765，Qins=3 统计）得到 H RMSE `4.211 m`、U RMSE
+`7.325 m`、3D RMSE `8.449 m`；使用 `phone/eval_enu.py` 对全文件整数秒真值匹配得到 H RMS
+`6.055 m`、U RMS `10.034 m`、3D RMS `11.719 m`，最大 3D 误差 `64.245 m`。
+
+已重新生成 `phone/plot/error_plot.png` 和 `phone/plot/tra-mech.png`；后者已参考
+`data/plot/tra-neu.py` 改为纯散点显示，真值高频内插点为绿色小点，RTD-TC 机械编排点为红色小点，
+Qins=3 更新点为红色大点。`phone/eval_enu.py` 为统计脚本，不单独生成图片。

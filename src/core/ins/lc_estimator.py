@@ -65,9 +65,14 @@ class LcEstimator:
         # RTK (Q=1/2) 不使用 rtklib 报的 sd (偏大保守, FLOAT sd 可达 2-9m, 实际精度 0.22m);
         # SPP (Q=5) sd 较可靠, 用 max(base_sigma, sd)。
         self._use_gnss_sd_qualities = {4, 5}  # DGPS / SPP 使用 max(sigma, sd)
+        self._use_reported_gnss_sd = bool(ins_cfg.get("use_reported_gnss_sd", False))
+        self._gnss_sd_scale = float(ins_cfg.get("gnss_sd_scale", 1.0))
+        if self._gnss_sd_scale <= 0.0:
+            raise ValueError("ins.gnss_sd_scale must be positive")
         # 垂直 sigma 放大因子: SPP 高程有系统性偏差(~3m), 需放大高程 sigma 让 EKF 不信任
         # RTK 高程精度好(~0.3m), 不需放大。因子作用于 NED 的 Down 分量
         self._vertical_sigma_factor = float(ins_cfg.get("vertical_sigma_factor", 1.0))
+        self._gnss_time_sync_noise_s = float(ins_cfg.get("gnss_time_sync_noise_s", 0.005))
         self._gnss_vel_std = ins_cfg.get("gnss_vel_std", 0.5)
         feedback_switch = ins_cfg.get("feedback_pos_enable")
         if feedback_switch is None:
@@ -145,7 +150,13 @@ class LcEstimator:
         """
         state = self.ins_update.state
         si = self.si
-        Z = state.pos_e - gnss.position
+        lever_e = state.C_b_e @ state.leverarm
+        fixed_lever = (np.linalg.norm(state.leverarm) > 1e-12
+                        and not si.has_lever_arm())
+        if fixed_lever:
+            Z = state.pos_e + lever_e - gnss.position
+        else:
+            Z = state.pos_e - gnss.position
 
         self._gnss_update_count += 1
         if self._innov_reject_threshold > 0 and self._gnss_update_count > self._innov_reject_warmup:
@@ -160,6 +171,11 @@ class LcEstimator:
 
         H = np.zeros((3, si.dim), dtype=np.float64)
         H[:, si.pos:si.pos+3] = np.eye(3)
+
+        if fixed_lever:
+            # d(C_b^e l)/d(delta_psi) = [C_b^e l]x for the project's
+            # right-multiplicative attitude-error convention.
+            H[:, si.att:si.att+3] = skew(lever_e)
 
         if si.has_lever_arm():
             H[:, si.lever_arm:si.lever_arm+3] = -state.C_b_e
@@ -195,7 +211,10 @@ class LcEstimator:
         # 仅对 DGPS/SPP 使用 max(sigma, gnss.sd): 这些模式 sd 较可靠;
         # RTK (Q=1/2) 的 rtklib sd 偏大保守 (FLOAT sd 可达 2-9m, 实际 0.22m),
         # 用 base_sigma 即可, 避免 K 过低致 INS 自由漂移。
-        if (gnss.quality in self._use_gnss_sd_qualities
+        if (self._use_reported_gnss_sd and gnss.sd is not None
+                and np.all(gnss.sd > 0)):
+            sigma = gnss.sd * self._gnss_sd_scale
+        elif (gnss.quality in self._use_gnss_sd_qualities
                 and gnss.sd is not None and np.all(gnss.sd > 0)):
             sigma = np.maximum(sigma, gnss.sd)
 
@@ -203,7 +222,7 @@ class LcEstimator:
 
         if gnss.cov is not None:
             cov_off_diag = gnss.cov - np.diag(np.diag(gnss.cov))
-            R = R + cov_off_diag
+            R = R + cov_off_diag * (self._gnss_sd_scale ** 2)
 
         # 各向异性高程: 在 NED 系放大 Down 分量 (SPP 高程偏差大)
         if self._vertical_sigma_factor != 1.0:
@@ -213,9 +232,9 @@ class LcEstimator:
             R_ned[2, 2] *= self._vertical_sigma_factor ** 2
             R = C_e_n.T @ R_ned @ C_e_n
 
-        if not self.si.has_time_sync():
+        if not self.si.has_time_sync() and self._gnss_time_sync_noise_s > 0.0:
             speed = float(np.linalg.norm(self.ins_update.state.vel_e))
-            dt_offset = 0.005
+            dt_offset = self._gnss_time_sync_noise_s
             sigma_timing = speed * dt_offset
             R = R + (sigma_timing ** 2) * np.eye(3) / 3.0
 

@@ -6,8 +6,8 @@ import yaml
 
 
 REQUIRED_DATA_RATE = 100  # external/INS 模式仅支持 100Hz
-SUPPORTED_EXTERNAL_FORMATS = {"pos"}
-SUPPORTED_GNSS_SOURCES = {"external", "internal"}
+SUPPORTED_EXTERNAL_FORMATS = {"pos", "awesome_pos"}
+SUPPORTED_GNSS_SOURCES = {"external", "awesome_external", "internal"}
 SUPPORTED_POSITIONING_MODES = {"spp", "rtd", "rtk"}
 SUPPORTED_INS_ENABLED = {"lc", "off", "tc"}
 SUPPORTED_RB_FORMATS = {"xyz", "llh"}
@@ -117,7 +117,7 @@ def load_config(path) -> dict:
             f"got '{gnss_source}'"
         )
 
-    # 纯 GNSS 模式 (ins.enabled=off) 必须 internal, 不接受 external
+    # 纯 GNSS 模式 (ins.enabled=off) 必须 internal, 不接受外部结果
     if ins_enabled == "off" and gnss_source != "internal":
         raise ValueError(
             "gnss_source must be 'internal' when ins.enabled='off' "
@@ -131,18 +131,22 @@ def load_config(path) -> dict:
     output_cfg = cfg.setdefault("output", {})
     _validate_output(output_cfg)
 
-    # external 模式校验
-    if gnss_source == "external":
+    # external/awesome_external 模式校验
+    if gnss_source in ("external", "awesome_external"):
         if ins_enabled != "lc":
             raise ValueError(
                 "ins.enabled must be 'lc' when gnss_source='external' "
                 "(external GNSS requires integrated navigation path)"
             )
         data_rate = cfg["ins"]["data_rate"]
-        if data_rate != REQUIRED_DATA_RATE:
+        if gnss_source == "external" and data_rate != REQUIRED_DATA_RATE:
             raise ValueError(
                 f"IMU data_rate must be {REQUIRED_DATA_RATE}, got {data_rate}. "
-                f"Current stage only supports 100Hz IMU."
+                f"Current external POS stage only supports 100Hz IMU."
+            )
+        if gnss_source == "awesome_external" and float(data_rate) <= 0.0:
+            raise ValueError(
+                f"Awesome IMU data_rate must be positive, got {data_rate}."
             )
         fmt = cfg["gnss"].get("external_sol_format", "pos")
         if fmt not in SUPPORTED_EXTERNAL_FORMATS:
@@ -150,6 +154,15 @@ def load_config(path) -> dict:
                 f"external_sol_format must be one of {SUPPORTED_EXTERNAL_FORMATS}, "
                 f"got '{fmt}'"
             )
+        if gnss_source == "awesome_external":
+            if fmt != "awesome_pos":
+                raise ValueError(
+                    "awesome_external requires external_sol_format='awesome_pos'"
+                )
+            if cfg["ins"].get("imu_format") != "awesome_increment":
+                raise ValueError(
+                    "awesome_external requires ins.imu_format='awesome_increment'"
+                )
 
     # internal 模式校验
     if gnss_source == "internal":

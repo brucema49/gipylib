@@ -55,11 +55,13 @@ class RSLTWriter(WriterBase):
     """
 
     def __init__(self, output_dir: str, filename: str = "RTKLC.rslt",
-                 position_format: str = "llh", time_format: str = "gpst"):
+                 position_format: str = "llh", time_format: str = "gpst",
+                 time_precision: int = 3):
         self.output_dir = output_dir
         self.filename = filename
         self.position_format = position_format
         self.time_format = time_format
+        self.time_precision = int(time_precision)
         self._fp = None
         self._closed = False
 
@@ -91,7 +93,7 @@ class RSLTWriter(WriterBase):
         if self.time_format == "datetime":
             y, mo, d, h, mi, s = sow_to_ymdhms(week, sow)
             return "%04d/%02d/%02d %02d:%02d:%06.3f" % (y, mo, d, h, mi, s)
-        return "%4d %10.3f" % (week, sow)
+        return f"{week:4d} {sow:10.{self.time_precision}f}"
 
     def open(self) -> None:
         os.makedirs(self.output_dir, exist_ok=True)

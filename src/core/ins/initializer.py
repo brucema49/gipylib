@@ -17,7 +17,7 @@ import numpy as np
 
 from src.core.data_types import AlignedBlock, GnssSolution, ImuMeasurement, InsState
 from src.core.ins.attitude import att_caln2e, dcm2quat, euler2dcm
-from src.core.ins.earth_param import cal_Ce2n, ecef2llh
+from src.core.ins.earth_param import cal_Ce2n, cal_Cn2e, ecef2llh, llh2ecef
 from src.core.ins.interpolator import find_bracket_imus, imu_interpolate_linear
 from src.core.ins.state_index import StateIndex
 
@@ -27,6 +27,7 @@ class InitMode(Enum):
     STATIC = "static"
     VELOCITY_VECTOR = "velocity_vector"
     POSITION_DIFF = "position_diff"
+    FIXED = "fixed"
 
 
 class InsInitializer:
@@ -105,6 +106,8 @@ class InsInitializer:
             result = self._align_motion_velocity(gnss)
         elif mode == InitMode.POSITION_DIFF:
             result = self._align_motion_displacement(gnss)
+        elif mode == InitMode.FIXED:
+            result = self._align_fixed()
         else:
             raise ValueError(f"Unsupported init mode: {mode}")
 
@@ -119,6 +122,19 @@ class InsInitializer:
         P = self._set_initial_variance(mode)
 
         return state, P
+
+    def _align_fixed(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Use externally supplied PVA fields, matching KF-GINS."""
+        ins_cfg = self.config.get("ins", {})
+        att_deg = np.asarray(ins_cfg["initial_attitude_deg"], dtype=float)
+        vel_n = np.asarray(ins_cfg.get("initial_velocity_ned", [0.0, 0.0, 0.0]), dtype=float)
+        if att_deg.shape != (3,) or vel_n.shape != (3,):
+            raise ValueError("fixed initialization PVA fields must have three elements")
+        pos_llh = np.asarray(ins_cfg["initial_position_llh"], dtype=float)
+        if pos_llh.shape != (3,):
+            raise ValueError("initial_position_llh must have three elements")
+        lat, lon = math.radians(pos_llh[0]), math.radians(pos_llh[1])
+        return np.radians(att_deg), cal_Cn2e(lat, lon) @ vel_n
 
     def _align_imu_to_gnss(self, imu_list: List[ImuMeasurement],
                            t_gnss: float) -> Optional[ImuMeasurement]:
@@ -349,7 +365,10 @@ class InsInitializer:
         ins_cfg = self.config.get("ins", {})
 
         # 静态模式使用 GNSS 历史平均位置 (低精度模式, 初始化调整.md)
-        if mode == InitMode.STATIC and self._static_pos_mean is not None:
+        if mode == InitMode.FIXED:
+            pos_llh = np.asarray(ins_cfg["initial_position_llh"], dtype=float)
+            pos_e = llh2ecef(math.radians(pos_llh[0]), math.radians(pos_llh[1]), pos_llh[2])
+        elif mode == InitMode.STATIC and self._static_pos_mean is not None:
             pos_e = self._static_pos_mean.copy()
         else:
             pos_e = gnss.position.copy()
@@ -395,6 +414,15 @@ class InsInitializer:
                                 dtype=np.float64)
         leverarm = np.array(ins_cfg.get("leverarm", [0, 0, 0]),
                             dtype=np.float64)
+
+        # The INS position is the IMU reference point.  Awesome's truth and
+        # the external RTK solution refer to different points, so move the
+        # initial state from the GNSS antenna to the IMU using the fixed
+        # body-frame lever arm.  Estimated lever arms retain the legacy
+        # state convention and are handled by their optional state block.
+        if (mode != InitMode.FIXED and np.linalg.norm(leverarm) > 1e-12
+                and not ins_cfg.get("estimate_leverarm", 0)):
+            pos_e = pos_e - C_b_e @ leverarm
 
         return InsState(
             timestamp=gnss.timestamp,

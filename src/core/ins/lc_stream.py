@@ -71,6 +71,8 @@ class LcStream:
     @staticmethod
     def _select_init_mode(config: dict) -> InitMode:
         ins_cfg = config.get("ins", {})
+        if ins_cfg.get("initialization_mode") == "fixed":
+            return InitMode.FIXED
         method = ins_cfg.get("alignnment_dynamic_method", "auto")
         if method == "velocity_vector":
             return InitMode.VELOCITY_VECTOR
@@ -161,6 +163,12 @@ class LcStream:
         # 初始化用 GNSS 的 quality / num_sv 作为后续 per-IMU 输出的最近 GNSS 元数据
         self._last_q = gnss.quality
         self._last_gnss_ns = gnss.num_sv
+
+        # KF-GINS applies the first GNSS position update at the first IMU
+        # boundary after its supplied fixed PVA.  Preserve that timing for
+        # fixed initialization instead of silently dropping the seed epoch.
+        if self._init_mode == InitMode.FIXED:
+            self._integ.add_gnss(gnss)
 
         # 清空初始化缓冲
         self._init_gnss.clear()

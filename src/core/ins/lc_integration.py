@@ -88,6 +88,8 @@ class LcIntegration:
         self._prev_gnss_pos: Optional[np.ndarray] = None
         self._prev_gnss_ts: Optional[float] = None
         self._pos_diff_vel_std = float(ins_cfg.get("pos_diff_vel_std", 0.5))
+        self._position_diff_velocity_update = bool(
+            ins_cfg.get("position_diff_velocity_update", True))
         # Qins 跟踪 (与 ignav outins 一致):
         #   2 = mech + propagate (time_update only)
         #   3 = LC update (GNSS meas_update 或约束触发)
@@ -202,7 +204,9 @@ class LcIntegration:
             if max_sd > 2.0:  # RTK vel_sd 不可靠, 用位置差分替代
                 use_pos_diff = True
 
-        if (vel_for_update is None or use_pos_diff) and self._prev_gnss_pos is not None:
+        if (self._position_diff_velocity_update
+                and (vel_for_update is None or use_pos_diff)
+                and self._prev_gnss_pos is not None):
             dt = gnss.timestamp - self._prev_gnss_ts
             if dt > 0.5:  # 仅在合理时间间隔内计算 (避免 GNSS 中断后差分)
                 vel_diff = (gnss.position - self._prev_gnss_pos) / dt

@@ -185,7 +185,7 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
         logger = SolutionLogger(gnss_queue, writer, control)
         return sensors, logger
 
-    if gnss_source == "internal" and ins_enabled == "lc":
+    if gnss_source in ("internal", "awesome_external") and ins_enabled == "lc":
         # 路径 C: 内部 GNSS 实时解算 + IMU 对齐输出 + 松组合 EKF
         # 输出三个文件：纯 GNSS .pos + 对齐 CSV + 松组合 .rslt (100Hz, ECEF+速度+姿态)
         sensors = SensorFactory.create_sensors(config, imu_queue, gnss_queue, control)
@@ -209,6 +209,7 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
             filename=lc_filename,
             position_format=pos_fmt,
             time_format=time_fmt,
+            time_precision=int(config["output"].get("time_precision", 3)),
         )
         sw = _parse_output_switches(config)
         stat_writer = None
@@ -239,6 +240,7 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
             filename=tc_filename,
             position_format=pos_fmt,
             time_format=time_fmt,
+            time_precision=int(config["output"].get("time_precision", 3)),
         )
         sw = _parse_output_switches(config)
         stat_writer = None
