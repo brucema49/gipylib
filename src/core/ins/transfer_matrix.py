@@ -91,9 +91,13 @@ class TransferMatrix:
     def __init__(self, config: dict, state_index: StateIndex = None):
         ins_cfg = config.get("ins", {}) if config else {}
         self.si = state_index if state_index is not None else StateIndex.from_config(config or {})
-        # 相关时间 (常数, h → s): 0.01h = 36s, 传感器零偏相关时间, 无需调参
-        self.tau_gyro = _CORR_TIME_BIAS_H * 3600.0
-        self.tau_acce = _CORR_TIME_BIAS_H * 3600.0
+        # 相关时间 (常数, h → s): 0.01h = 36s, 传感器零偏相关时间。
+        # Optional per-sensor overrides are used only by controlled experiments;
+        # omitted values preserve the historical 36 s behavior exactly.
+        self.tau_gyro = self._read_bias_corr_time(
+            ins_cfg, "gyro_bias_corr_time_s")
+        self.tau_acce = self._read_bias_corr_time(
+            ins_cfg, "acce_bias_corr_time_s")
         # 过程噪声 PSD (从 config 直接读取, SI 单位)
         self.gyro_psd = ins_cfg.get("gyro_psd", 3.38802348178723e-09)
         self.accel_psd = ins_cfg.get("accel_psd", 2.60420170553977e-06)
@@ -111,6 +115,14 @@ class TransferMatrix:
         self.time_sync_psd = _TIME_SYNC_PSD
         # 地球自转角速度 (E 系常数向量)
         self.w_ie_e = np.array([0.0, 0.0, EARTH_ROTATION_RATE], dtype=np.float64)
+
+    @staticmethod
+    def _read_bias_corr_time(ins_cfg: dict, key: str) -> float:
+        """读取并校验一个零偏 Gauss-Markov 相关时间 (秒)。"""
+        value = float(ins_cfg.get(key, _CORR_TIME_BIAS_H * 3600.0))
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{key} must be a finite positive number")
+        return value
 
     def build_F(self, C_b_e: np.ndarray, f_b: np.ndarray,
                 w_b_ib: np.ndarray, pos_e: np.ndarray) -> np.ndarray:
