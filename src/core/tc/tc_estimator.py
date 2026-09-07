@@ -97,6 +97,12 @@ class TcEstimator(LcEstimator):
         self._pending_pos_correction = np.zeros(3, dtype=np.float64)
         self._pending_pos_elapsed = 0.0
         self._pending_pos_start = None
+        self._last_propagation_snapshot = None
+
+    @property
+    def last_propagation_snapshot(self):
+        """Latest copied 15x15 INS propagation snapshot for diagnostics."""
+        return self._last_propagation_snapshot
 
     def effective_x(self) -> np.ndarray:
         """构造有效状态向量供量测构造: stored + x (ε)。
@@ -139,10 +145,12 @@ class TcEstimator(LcEstimator):
         self.ins_update.update(imu)
 
         if not self.ins_update.last_update_accepted:
+            self._last_propagation_snapshot = None
             return
 
         dt = imu.timestamp - prev_ts
         if dt <= 0.0:
+            self._last_propagation_snapshot = None
             return
 
         si = self.si
@@ -165,6 +173,7 @@ class TcEstimator(LcEstimator):
             Phi_ins = _expm_small(Fdt)
 
         Q_ins = self.tm.build_Q_ins(dt, C_b_e, n_ins)
+        p_before_15 = self.P[:15, :15].copy()
 
         # 分块传播 P
         if n_total == n_ins:
@@ -228,6 +237,15 @@ class TcEstimator(LcEstimator):
                     self.P[3 + k, 3 + k] = vel_floor
 
         self.P = 0.5 * (self.P + self.P.T)
+
+        self._last_propagation_snapshot = {
+            "timestamp": float(self.ins_update.state.timestamp),
+            "dt": float(dt),
+            "p_before": p_before_15,
+            "p_after": self.P[:15, :15].copy(),
+            "phi": Phi_ins[:15, :15].copy(),
+            "q": Q_ins[:15, :15].copy(),
+        }
 
     def reset_clk_variance(self):
         """重置钟差误差状态 (每个 GNSS 历元前调用)。
