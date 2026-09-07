@@ -43,6 +43,7 @@ from src.core.tc.tc_ambiguity import TcAmbiguity
 from src.core.tc.tc_degrade import TcDegradeManager
 from src.core.tc.tc_estimator import TcEstimator
 from src.core.tc.tc_measurement import SppTcMeas, RtkTcMeas, RtdTcMeas
+from src.log.tc_matrix_diagnostics import TcMatrixDiagnosticWriter
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,17 @@ class TcIntegration:
         # this disabled by default prevents normal runs from creating files.
         self._diagnostics_path = str(
             config.get("tc", {}).get("diagnostics_path", ""))
+        self._matrix_diagnostics = None
+        matrix_path = str(config.get("tc", {}).get(
+            "matrix_diagnostics_path", ""))
+        if matrix_path:
+            try:
+                self._matrix_diagnostics = TcMatrixDiagnosticWriter(
+                    matrix_path, mode=mode)
+                self._matrix_diagnostics.open()
+            except OSError as exc:
+                logger.warning("TC matrix diagnostics disabled: %s", exc)
+                self._matrix_diagnostics = None
 
     @property
     def initialized(self) -> bool:
@@ -153,6 +165,74 @@ class TcIntegration:
 
     def set_writer(self, writer) -> None:
         self._writer = writer
+
+    def close(self) -> None:
+        """Close optional diagnostic output without affecting the filter."""
+        if self._matrix_diagnostics is not None:
+            try:
+                self._matrix_diagnostics.close()
+            except OSError as exc:
+                logger.warning("TC matrix diagnostics close failed: %s", exc)
+            finally:
+                self._matrix_diagnostics = None
+
+    def _disable_matrix_diagnostics(self, exc: Exception) -> None:
+        logger.warning("TC matrix diagnostics disabled after write failure: %s", exc)
+        self.close()
+
+    def _record_latest_propagation(self) -> None:
+        """Write the latest estimator propagation, if diagnostics are enabled."""
+        if self._matrix_diagnostics is None or self._est is None:
+            return
+        snapshot = getattr(self._est, "last_propagation_snapshot", None)
+        if snapshot is None:
+            return
+        try:
+            self._matrix_diagnostics.write_imu_prop(
+                timestamp=snapshot["timestamp"],
+                dt=snapshot["dt"],
+                p_before=snapshot["p_before"],
+                phi=snapshot["phi"],
+                q=snapshot["q"],
+                p_after=snapshot["p_after"],
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            self._disable_matrix_diagnostics(exc)
+
+    def _record_matrix_update_diagnostic(self, timestamp: float, pre_p,
+                                         post_p, innovation, s_matrix,
+                                         k_gain, feedback_x, accepted: bool,
+                                         info: dict | None = None) -> None:
+        """Write one GNSS update snapshot, including rejected updates."""
+        if self._matrix_diagnostics is None:
+            return
+        snapshot = getattr(self._est, "last_propagation_snapshot", None)
+        if snapshot is None:
+            phi = np.eye(15, dtype=np.float64)
+            q = np.zeros((15, 15), dtype=np.float64)
+            dt = -1.0
+        else:
+            phi = snapshot["phi"]
+            q = snapshot["q"]
+            dt = snapshot["dt"]
+        diag_info = dict(info or {})
+        diag_info["dt"] = float(dt)
+        try:
+            self._matrix_diagnostics.write_update(
+                timestamp=timestamp,
+                p_before=np.asarray(pre_p)[:15, :15],
+                p_after=np.asarray(post_p)[:15, :15],
+                phi=phi,
+                q=q,
+                innovation=innovation,
+                S_diag=np.diag(s_matrix),
+                K=k_gain,
+                feedback_x=feedback_x,
+                accepted=accepted,
+                info=diag_info,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            self._disable_matrix_diagnostics(exc)
 
     def _emit_output(self, qins: int) -> None:
         """Emit a state at an exact fusion boundary when a stream is attached."""
@@ -239,6 +319,7 @@ class TcIntegration:
                 self.imupre = cur
                 self.imucur = interp
                 self._est.time_update(interp)
+                self._record_latest_propagation()
                 self._static_detect.push(interp)
                 self._apply_constraints(interp)
 
@@ -254,6 +335,7 @@ class TcIntegration:
         self.imupre = cur
         self.imucur = imu
         self._est.time_update(imu)
+        self._record_latest_propagation()
         self._static_detect.push(imu)
         self._apply_constraints(imu)
 
@@ -598,9 +680,11 @@ class TcIntegration:
         # feedback(), so all pre-update values must be copied before this call.
         pre_velocity = self._est.state.vel_e.copy()
         pre_p = self._est.P.copy()
+        pre_x = self._est.x.copy()
         # 量测更新前的 S / K 结构 (诊断): S = H·P·Hᵀ + R, K = P·Hᵀ·S⁻¹
-        s_diag_median = float(np.median(np.diag(H @ pre_p @ H.T + R)))
-        s_inv = np.linalg.inv(H @ pre_p @ H.T + R)
+        s_matrix = H @ pre_p @ H.T + R
+        s_diag_median = float(np.median(np.diag(s_matrix)))
+        s_inv = np.linalg.inv(s_matrix)
         K_gain = pre_p @ H.T @ s_inv
         k_pos_norm = float(np.linalg.norm(K_gain[si.pos:si.pos + 3], axis=1).max())
         k_vel_norm = float(np.linalg.norm(K_gain[si.vel:si.vel + 3], axis=1).max())
@@ -623,6 +707,20 @@ class TcIntegration:
             post_amb_var_median = -1.0
         feedback_x = self._est.tc_meas_update(v, H, R, source=mode)
         if feedback_x is None:
+            reject_info = dict(info)
+            reject_info["postfit_norm"] = float(
+                np.linalg.norm(np.asarray(v) - H @ pre_x))
+            self._record_matrix_update_diagnostic(
+                timestamp=t_gnss,
+                pre_p=pre_p,
+                post_p=pre_p,
+                innovation=np.asarray(v) - H @ pre_x,
+                s_matrix=s_matrix,
+                k_gain=K_gain,
+                feedback_x=np.zeros_like(self._est.x),
+                accepted=False,
+                info=reject_info,
+            )
             logger.debug(
                 "TC postfit_reject (mode=%s, t=%.3f): discard measurement epoch",
                 mode, t_gnss)
@@ -632,6 +730,22 @@ class TcIntegration:
             # post-fit gate.
             self._on_meas_failure(obsr, obsb, nav, t_gnss)
             return
+        update_info = dict(info)
+        postfit = np.asarray(v) - H @ feedback_x
+        update_info["postfit_norm"] = float(np.linalg.norm(postfit))
+        update_info["postfit_chi2"] = float(np.sum(
+            postfit * postfit / np.diag(R)))
+        self._record_matrix_update_diagnostic(
+            timestamp=t_gnss,
+            pre_p=pre_p,
+            post_p=self._est.P,
+            innovation=np.asarray(v) - H @ pre_x,
+            s_matrix=s_matrix,
+            k_gain=K_gain,
+            feedback_x=feedback_x,
+            accepted=True,
+            info=update_info,
+        )
         if si.has_ambiguity():
             post_amb_var_median = float(np.median(np.diag(self._est.P[amb, amb])))
         self._record_measurement_diagnostic(

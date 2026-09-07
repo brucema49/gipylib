@@ -418,7 +418,8 @@ class _DdBase(TcMeasurement):
         Ri_list, Rj_list = [], []
         nb_per_block = []   # ddcov 用
         used_pairs = []     # (i, j, freq, code) 供 info
-        n_phase_att = n_phase_acc = n_code_att = n_code_acc = 0
+        n_phase_att = n_phase_acc = n_phase_rej = 0
+        n_code_att = n_code_acc = n_code_rej = 0
         P_diag = np.diag(P) if P is not None else None
         sig_n0_sq = self._sig_n0 ** 2
 
@@ -502,6 +503,10 @@ class _DdBase(TcMeasurement):
                         # 维护 vsat/rejc, 供 udbias 的失锁计数 (outc) 使用 (与 ddres 一致)
                         nav.vsat[sat[j] - 1, frq] = 0
                         nav.rejc[sat[j] - 1, frq] += 1
+                        if code:
+                            n_code_rej += 1
+                        else:
+                            n_phase_rej += 1
                         continue
                     # 单差方差
                     si_idx = sat[ref_i] - 1
@@ -530,18 +535,21 @@ class _DdBase(TcMeasurement):
                     block_count += 1
                 if block_count > 0:
                     nb_per_block.append(block_count)
+        info = {"pairs": used_pairs, "n": len(v_list),
+                "ref_sats": sorted({p[0] for p in used_pairs}),
+                "n_phase_att": n_phase_att, "n_phase_acc": n_phase_acc,
+                "n_phase_rej": n_phase_rej,
+                "n_code_att": n_code_att, "n_code_acc": n_code_acc,
+                "n_code_rej": n_code_rej}
         if not v_list:
             return (np.array([]), np.zeros((0, si.dim)),
-                    np.zeros((0, 0)), {})
+                    np.zeros((0, 0)), info)
         v = np.array(v_list)
         H = np.array(H_rows)
         # ddcov 构造 R
         R = ddcov(np.array(nb_per_block), len(nb_per_block),
                   np.array(Ri_list), np.array(Rj_list), len(v_list))
-        info = {"pairs": used_pairs, "n": len(v),
-                "ref_sats": sorted({p[0] for p in used_pairs}),
-                "n_phase_att": n_phase_att, "n_phase_acc": n_phase_acc,
-                "n_code_att": n_code_att, "n_code_acc": n_code_acc}
+        info["n"] = len(v)
         return v, H, R, info
 
     @staticmethod

@@ -75,6 +75,8 @@ class TcMatrixDiagnosticWriter:
             "S_diag": self._array(S_diag),
             "K_block_norms": self._block_norms(K),
             "feedback_x": self._array(feedback_x),
+            "postfit_norm": self._scalar(info.get("postfit_norm", np.nan)),
+            "postfit_chi2": self._scalar(info.get("postfit_chi2", np.nan)),
             "n_phase_att": int(info.get("n_phase_att", 0)),
             "n_phase_acc": int(info.get("n_phase_acc", 0)),
             "n_phase_rej": int(info.get("n_phase_rej", 0)),

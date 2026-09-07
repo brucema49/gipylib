@@ -79,6 +79,7 @@ class TcStream:
             self.stat_writer.open()
 
     def close(self) -> None:
+        self._integ.close()
         if self.stat_writer is not None:
             self.stat_writer.close()
         self.writer.close()
