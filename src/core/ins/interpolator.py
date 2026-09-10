@@ -167,9 +167,24 @@ def split_increment_at_gnss(
     if abs(span - cur_data.dt) > 1.0e-8:
         raise ValueError("increment dt does not match its SOW span")
 
-    if abs(gnss_sow - prev_data.sow) < threshold_s:
+    # SOW values can be around 4e5--1e6 seconds.  Their subtraction may move
+    # an exact 1 ms boundary just below the threshold by a few ULPs.  Keep the
+    # KF-GINS asymmetry (`<` at previous, `<=` at current) while making the
+    # comparison stable at that representational boundary.
+    sow_scale = max(
+        1.0,
+        abs(prev_data.sow),
+        abs(cur_data.sow),
+        abs(gnss_sow),
+    )
+    endpoint_eps = 4.0 * np.spacing(sow_scale)
+    front_diff = abs(gnss_sow - prev_data.sow)
+    rear_diff = abs(cur_data.sow - gnss_sow)
+    front_is_threshold = abs(front_diff - threshold_s) <= endpoint_eps
+
+    if front_diff < threshold_s and not front_is_threshold:
         return "previous", None, None
-    if abs(cur_data.sow - gnss_sow) <= threshold_s:
+    if rear_diff <= threshold_s + endpoint_eps:
         return "current", None, None
     if not (prev_data.sow < gnss_sow < cur_data.sow):
         return "outside", None, None
