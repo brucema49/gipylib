@@ -7,7 +7,7 @@
 
 状态顺序 (基础 15 维 + 可选块):
   固定: [δr^e(3), δv^e(3), δφ^e(3), δb_g(3), δb_a(3)]
-  可选: [lever_arm(3), imu_angle(2), imu_leverarm(3), time_sync(1)]
+  可选: [gyro_scale(3), accel_scale(3), lever_arm(3), imu_angle(2), imu_leverarm(3), time_sync(1)]
 """
 import math
 
@@ -83,7 +83,7 @@ class TransferMatrix:
     """F / Φ / Q 矩阵构造器 (支持 StateIndex 动态维度)。
 
     基础 15 维: [pos(3), vel(3), att(3), gyro_bias(3), accel_bias(3)]
-    可选块: lever_arm(3), imu_angle(2), imu_leverarm(3), time_sync(1)
+    可选块: gyro_scale(3), accel_scale(3), lever_arm(3), imu_angle(2), imu_leverarm(3), time_sync(1)
 
     可选块 F=0 (常数或随机游走), Q 按参数类型填充。
     """
@@ -103,6 +103,12 @@ class TransferMatrix:
         self.accel_psd = ins_cfg.get("accel_psd", 2.60420170553977e-06)
         self.gyro_bias_psd = ins_cfg.get("gyro_bias_psd", 2.61160339323310e-14)
         self.acce_bias_psd = ins_cfg.get("acce_bias_psd", 1.66067346797506e-09)
+        self.gyro_scale_psd = ins_cfg.get("gyro_scale_psd", 0.0)
+        self.acce_scale_psd = ins_cfg.get("acce_scale_psd", 0.0)
+        self.tau_gyro_scale = self._read_bias_corr_time(
+            ins_cfg, "gyro_scale_corr_time_s") if self.si.has_imu_scale() else self.tau_gyro
+        self.tau_acce_scale = self._read_bias_corr_time(
+            ins_cfg, "acce_scale_corr_time_s") if self.si.has_imu_scale() else self.tau_acce
         # 位置随机游走 PSD (m²/s): 计入未建模的位置不确定性 (RTK 跳变/多径等)
         self.pos_psd = ins_cfg.get("pos_psd", 0.0)
         # 速度随机游走 PSD (m²/s²): 计入未建模的速度不确定性, 防止 P_vel 坍缩致 K_vel→0
@@ -175,6 +181,16 @@ class TransferMatrix:
         # F_baba = -I / tau_acce  (加计零偏一阶马尔可夫)
         F[12:15, 12:15] = -np.eye(3) / self.tau_acce
 
+        if self.si.has_imu_scale():
+            # ψ-error convention: scale_true - scale_est makes the nominal
+            # corrected increment too large by diag(w/f)·delta_scale.
+            F[3:6, self.si.accel_scale:self.si.accel_scale + 3] = C_b_e @ np.diag(f_b)
+            F[6:9, self.si.gyro_scale:self.si.gyro_scale + 3] = C_b_e @ np.diag(w_b_ib)
+            F[self.si.gyro_scale:self.si.gyro_scale + 3,
+              self.si.gyro_scale:self.si.gyro_scale + 3] = -np.eye(3) / self.tau_gyro_scale
+            F[self.si.accel_scale:self.si.accel_scale + 3,
+              self.si.accel_scale:self.si.accel_scale + 3] = -np.eye(3) / self.tau_acce_scale
+
         # 可选块: F=0 (lever_arm/imu_angle/imu_leverarm/time_sync 均为常数或随机游走)
         return F
 
@@ -203,6 +219,15 @@ class TransferMatrix:
         F[6:9, 9:12] = C_b_e
         F[9:12, 9:12] = -np.eye(3) / self.tau_gyro
         F[12:15, 12:15] = -np.eye(3) / self.tau_acce
+        if self.si.has_imu_scale():
+            if self.si.accel_scale + 3 <= n_ins:
+                F[3:6, self.si.accel_scale:self.si.accel_scale + 3] = C_b_e @ np.diag(f_b)
+                F[self.si.accel_scale:self.si.accel_scale + 3,
+                  self.si.accel_scale:self.si.accel_scale + 3] = -np.eye(3) / self.tau_acce_scale
+            if self.si.gyro_scale + 3 <= n_ins:
+                F[6:9, self.si.gyro_scale:self.si.gyro_scale + 3] = C_b_e @ np.diag(w_b_ib)
+                F[self.si.gyro_scale:self.si.gyro_scale + 3,
+                  self.si.gyro_scale:self.si.gyro_scale + 3] = -np.eye(3) / self.tau_gyro_scale
         return F
 
     def build_Q_ins(self, dt: float, C_b_e: np.ndarray,
@@ -227,6 +252,14 @@ class TransferMatrix:
         Q_diag[12:15, 12:15] = np.diag([self.acce_bias_psd * dt] * 3)
 
         Q = G @ Q_diag @ G.T
+
+        if si.has_imu_scale():
+            if si.gyro_scale + 3 <= n_ins:
+                Q[si.gyro_scale:si.gyro_scale + 3,
+                  si.gyro_scale:si.gyro_scale + 3] = np.diag([self.gyro_scale_psd * dt] * 3)
+            if si.accel_scale + 3 <= n_ins:
+                Q[si.accel_scale:si.accel_scale + 3,
+                  si.accel_scale:si.accel_scale + 3] = np.diag([self.acce_scale_psd * dt] * 3)
 
         # Keep the TC block propagation consistent with build_Q(): the
         # configured velocity random walk is a direct ECEF velocity noise.
@@ -297,6 +330,12 @@ class TransferMatrix:
         Q_diag[12:15, 12:15] = np.diag([self.acce_bias_psd * dt] * 3)
 
         Q = G @ Q_diag @ G.T
+
+        if si.has_imu_scale():
+            Q[si.gyro_scale:si.gyro_scale + 3,
+              si.gyro_scale:si.gyro_scale + 3] = np.diag([self.gyro_scale_psd * dt] * 3)
+            Q[si.accel_scale:si.accel_scale + 3,
+              si.accel_scale:si.accel_scale + 3] = np.diag([self.acce_scale_psd * dt] * 3)
 
         # 直接速度过程噪声 (不经过 G 旋转, 直接注入 ECEF vel 对角块)
         if self.vel_psd > 0.0:

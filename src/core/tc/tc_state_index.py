@@ -46,6 +46,8 @@ class TcStateIndex(StateIndex):
         si.att = base.att
         si.gyro_bias = base.gyro_bias
         si.accel_bias = base.accel_bias
+        si.gyro_scale = base.gyro_scale
+        si.accel_scale = base.accel_scale
         si.lever_arm = base.lever_arm
         si.imu_angle = base.imu_angle
         si.imu_leverarm = base.imu_leverarm

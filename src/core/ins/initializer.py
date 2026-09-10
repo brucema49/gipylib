@@ -414,6 +414,10 @@ class InsInitializer:
                                 dtype=np.float64)
         leverarm = np.array(ins_cfg.get("leverarm", [0, 0, 0]),
                             dtype=np.float64)
+        gyro_scale = np.array(ins_cfg.get("initial_gyro_scale_ppm", [0, 0, 0]),
+                              dtype=np.float64) * 1.0e-6
+        accel_scale = np.array(ins_cfg.get("initial_acce_scale_ppm", [0, 0, 0]),
+                               dtype=np.float64) * 1.0e-6
 
         # The INS position is the IMU reference point.  Awesome's truth and
         # the external RTK solution refer to different points, so move the
@@ -436,6 +440,8 @@ class InsInitializer:
             imu_angle=imu_angle,
             imu_leverarm=imu_leverarm,
             leverarm=leverarm,
+            gyro_scale=gyro_scale,
+            accel_scale=accel_scale,
         )
 
     def _set_initial_variance(self, mode: InitMode) -> np.ndarray:
@@ -483,6 +489,18 @@ class InsInitializer:
         P[6:9, 6:9] = np.diag(att_std ** 2)
         P[9:12, 9:12] = np.diag(gyro_bias_std ** 2)
         P[12:15, 12:15] = np.diag(acce_bias_std ** 2)
+
+        if si.has_imu_scale():
+            gyro_scale_std = np.array(
+                ins_cfg.get("gyro_scale_std_ppm", [300.0, 300.0, 300.0]),
+                dtype=np.float64) * 1.0e-6
+            accel_scale_std = np.array(
+                ins_cfg.get("acce_scale_std_ppm", [300.0, 300.0, 300.0]),
+                dtype=np.float64) * 1.0e-6
+            P[si.gyro_scale:si.gyro_scale + 3,
+              si.gyro_scale:si.gyro_scale + 3] = np.diag(gyro_scale_std ** 2)
+            P[si.accel_scale:si.accel_scale + 3,
+              si.accel_scale:si.accel_scale + 3] = np.diag(accel_scale_std ** 2)
 
         # 可选块: GNSS 杆臂 (随机常数, 初始不确定度 lever_arm_std)
         if si.has_lever_arm():

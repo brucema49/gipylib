@@ -1,5 +1,5 @@
 """GInsStream 核心数据类型定义。"""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List
 
 import numpy as np
@@ -43,6 +43,10 @@ class InsState:
     imu_leverarm: np.ndarray      # [3] IMU 杆臂 b→v (m)
     leverarm: np.ndarray          # [3] GNSS 天线杆臂 (b 系, m)
     time_sync: float = 0.0        # IMU-GNSS 时间对齐误差 (s)
+    # 可选 IMU 比例因子 (无量纲；1.0e-6 = 1 ppm)。默认零以保持
+    # 既有 15 状态路径及所有非 KF-GINS 配置的行为不变。
+    gyro_scale: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
+    accel_scale: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
 
 
 @dataclass

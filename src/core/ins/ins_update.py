@@ -100,11 +100,12 @@ class InsUpdate:
             self.state.timestamp = imu.timestamp
             return self.state
 
-        # 1. IMU 补偿: 速率 → 增量, 减零偏
+        # 1. IMU 补偿: 速率 → 增量, 先减零偏、再除比例因子。
+        # 与 KF-GINS imuCompensate() 的顺序一致。
         dtheta = imu.gyro * dt
         dvel = imu.accel * dt
-        dtheta_comp = dtheta - self.state.gyro_bias * dt
-        dvel_comp = dvel - self.state.accel_bias * dt
+        dtheta_comp = (dtheta - self.state.gyro_bias * dt) / (1.0 + self.state.gyro_scale)
+        dvel_comp = (dvel - self.state.accel_bias * dt) / (1.0 + self.state.accel_scale)
 
         # 记录当前历元比力/角速度 (b 系, 速率) 供 InsPropagate 使用
         self._w_b_ib = dtheta_comp / dt
@@ -140,6 +141,8 @@ class InsUpdate:
             imu_leverarm=self.state.imu_leverarm,
             leverarm=self.state.leverarm,
             time_sync=self.state.time_sync,
+            gyro_scale=self.state.gyro_scale,
+            accel_scale=self.state.accel_scale,
         )
 
         # 6. 更新历史增量 (用于下一历元锥补/划桨, 存储已补偿值, 参考 ignav omgbp/fbp)

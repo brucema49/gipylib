@@ -53,6 +53,12 @@ class LcEstimator:
         self.tm = TransferMatrix(config, self.si)
         self.P = P.copy().astype(np.float64)
         self.x = np.zeros(self.si.dim, dtype=np.float64)
+        # 可选矩阵诊断：保留最近一次时间更新、量测更新以及闭环反馈增量。
+        # 这些值只用于离线对比 KF-GINS，不参与滤波计算。
+        self.last_time_update_diag = None
+        self.last_meas_update_diag = None
+        self.meas_update_diags = []
+        self.last_feedback_x = np.zeros(self.si.dim, dtype=np.float64)
 
         ins_cfg = config.get("ins", {})
         self._gnss_pos_std = {
@@ -69,6 +75,12 @@ class LcEstimator:
         self._gnss_sd_scale = float(ins_cfg.get("gnss_sd_scale", 1.0))
         if self._gnss_sd_scale <= 0.0:
             raise ValueError("ins.gnss_sd_scale must be positive")
+        self._gnss_sd_axis_scale = np.asarray(
+            ins_cfg.get("gnss_sd_axis_scale", [1.0, 1.0, 1.0]),
+            dtype=np.float64)
+        if self._gnss_sd_axis_scale.shape != (3,) \
+                or np.any(self._gnss_sd_axis_scale <= 0.0):
+            raise ValueError("ins.gnss_sd_axis_scale must contain three positive values")
         # 垂直 sigma 放大因子: SPP 高程有系统性偏差(~3m), 需放大高程 sigma 让 EKF 不信任
         # RTK 高程精度好(~0.3m), 不需放大。因子作用于 NED 的 Down 分量
         self._vertical_sigma_factor = float(ins_cfg.get("vertical_sigma_factor", 1.0))
@@ -109,6 +121,11 @@ class LcEstimator:
         P: Φ·(P+0.5Q)·Φ^T + 0.5Q (GINav 中间值法)
         """
         prev_ts = self.ins_update._prev_timestamp
+        # KF-GINS forms F/G from the state and attitude at the beginning of
+        # the interval (pvapre), while the nominal mechanization then advances
+        # to the current IMU epoch.  Keep that same linearization point.
+        prev_C_b_e = self.ins_update.state.C_b_e.copy()
+        prev_pos_e = self.ins_update.state.pos_e.copy()
         self.ins_update.update(imu)
 
         if not self.ins_update.last_update_accepted:
@@ -118,15 +135,17 @@ class LcEstimator:
         if dt <= 0.0:
             return
 
-        C_b_e = self.ins_update.state.C_b_e
+        P_before = self.P.copy()
+        C_b_e = prev_C_b_e
         f_b = self.ins_update.f_b
         w_b_ib = self.ins_update.w_b_ib
-        pos_e = self.ins_update.state.pos_e
+        pos_e = prev_pos_e
 
         F = self.tm.build_F(C_b_e, f_b, w_b_ib, pos_e)
         Phi = self.tm.build_Phi(F, dt)
         Q = self.tm.build_Q(dt, C_b_e)
         P0 = self.P + 0.5 * Q
+        Q_effective = 0.5 * (Phi @ Q @ Phi.T + Q)
         self.P = Phi @ P0 @ Phi.T + 0.5 * Q
         # Normally x is zero after closed-loop feedback.  A configured
         # partial position feedback retains a mean error; propagate it with
@@ -134,6 +153,18 @@ class LcEstimator:
         if np.any(self.x):
             self.x = Phi @ self.x
         self.P = 0.5 * (self.P + self.P.T)
+        self.last_time_update_diag = {
+            "timestamp": float(imu.timestamp),
+            "dt": float(dt),
+            "F": F.copy(),
+            "Phi": Phi.copy(),
+            # Q is the discrete noise actually used by the covariance
+            # propagation; Q_base is the pre-symmetrization GQG^T term.
+            "Q": Q_effective,
+            "Q_base": Q.copy(),
+            "P_before": P_before,
+            "P_after": self.P.copy(),
+        }
 
     # ===== 量测更新 =====
 
@@ -173,9 +204,10 @@ class LcEstimator:
         H[:, si.pos:si.pos+3] = np.eye(3)
 
         if fixed_lever:
-            # d(C_b^e l)/d(delta_psi) = [C_b^e l]x for the project's
-            # right-multiplicative attitude-error convention.
-            H[:, si.att:si.att+3] = skew(lever_e)
+            # The project attitude error is the negative of KF-GINS' phi
+            # state (both use left multiplication, with opposite feedback
+            # sign).  Keep the GNSS lever-arm Jacobian in that convention.
+            H[:, si.att:si.att+3] = -skew(lever_e)
 
         if si.has_lever_arm():
             H[:, si.lever_arm:si.lever_arm+3] = -state.C_b_e
@@ -186,7 +218,8 @@ class LcEstimator:
             H[:, si.time_sync] = dt1
 
         R = self._build_pos_R(gnss)
-        self.joseph_update(Z, H, R)
+        self.joseph_update(Z, H, R, update_kind="position",
+                           update_timestamp=gnss.timestamp)
 
     def _build_pos_R(self, gnss: GnssSolution) -> np.ndarray:
         """构造位置量测噪声协方差 (自适应 sigma + 全协方差矩阵 + 各向异性高程)。
@@ -213,7 +246,7 @@ class LcEstimator:
         # 用 base_sigma 即可, 避免 K 过低致 INS 自由漂移。
         if (self._use_reported_gnss_sd and gnss.sd is not None
                 and np.all(gnss.sd > 0)):
-            sigma = gnss.sd * self._gnss_sd_scale
+            sigma = gnss.sd * self._gnss_sd_scale * self._gnss_sd_axis_scale
         elif (gnss.quality in self._use_gnss_sd_qualities
                 and gnss.sd is not None and np.all(gnss.sd > 0)):
             sigma = np.maximum(sigma, gnss.sd)
@@ -222,7 +255,8 @@ class LcEstimator:
 
         if gnss.cov is not None:
             cov_off_diag = gnss.cov - np.diag(np.diag(gnss.cov))
-            R = R + cov_off_diag * (self._gnss_sd_scale ** 2)
+            axis = self._gnss_sd_scale * self._gnss_sd_axis_scale
+            R = R + (axis[:, None] * cov_off_diag * axis[None, :])
 
         # 各向异性高程: 在 NED 系放大 Down 分量 (SPP 高程偏差大)
         if self._vertical_sigma_factor != 1.0:
@@ -272,7 +306,8 @@ class LcEstimator:
             H[:, si.time_sync] = dt2
 
         R = self._build_vel_R(gnss)
-        self.joseph_update(Z, H, R)
+        self.joseph_update(Z, H, R, update_kind="velocity",
+                           update_timestamp=gnss.timestamp)
 
     def _build_vel_R(self, gnss: GnssSolution) -> np.ndarray:
         """构造速度量测噪声协方差。
@@ -288,7 +323,9 @@ class LcEstimator:
         return 0.5 * (R + R.T)
 
     def joseph_update(self, Z: np.ndarray, H: np.ndarray,
-                      R: np.ndarray, innov_clip: float = 0.0) -> None:
+                      R: np.ndarray, innov_clip: float = 0.0,
+                      update_kind: str = "generic",
+                      update_timestamp: Optional[float] = None) -> None:
         """Joseph form 量测更新 (单滤波, N = si.dim)。
 
         对应 ignav filter(): 供 GNSS 量测更新和 Constraints 模块调用。
@@ -305,17 +342,38 @@ class LcEstimator:
                 scale = (innov_norm / innov_clip) ** 2
                 R = R * scale
 
+        P_before = self.P.copy()
         S = H @ self.P @ H.T + R
         K = self.P @ H.T @ np.linalg.inv(S)
         self.x = self.x + K @ innov
         I_KH = np.eye(n) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
         self.P = 0.5 * (self.P + self.P.T)
+        diag = {
+            "kind": str(update_kind),
+            "timestamp": (float(update_timestamp)
+                          if update_timestamp is not None else None),
+            "H": H.copy(),
+            "R": R.copy(),
+            "S": S.copy(),
+            "K": K.copy(),
+            "innovation": innov.copy(),
+            "Z": np.asarray(Z, dtype=np.float64).copy(),
+            "P_before": P_before,
+            "P_after": self.P.copy(),
+        }
+        self.last_meas_update_diag = diag
+        self.meas_update_diags.append(diag)
+        # 仅保留最近的少量更新，避免长时间运行时无限增长。
+        if len(self.meas_update_diags) > 8:
+            del self.meas_update_diags[:-8]
 
     # ===== 反馈 =====
 
     def feedback(self) -> None:
         """统一反馈校正 (ψ-error + 可选参数块)。"""
+        # 闭环反馈前保存完整误差向量，供 458699 等历元的离线对比使用。
+        self.last_feedback_x = self.x.copy()
         state = self.ins_update.state
         si = self.si
 
@@ -325,6 +383,10 @@ class LcEstimator:
         delta_psi = self.x[si.att:si.att+3]
         delta_bg = self.x[si.gyro_bias:si.gyro_bias+3]
         delta_ba = self.x[si.accel_bias:si.accel_bias+3]
+        delta_gs = (self.x[si.gyro_scale:si.gyro_scale+3]
+                    if si.has_imu_scale() else np.zeros(3))
+        delta_as = (self.x[si.accel_scale:si.accel_scale+3]
+                    if si.has_imu_scale() else np.zeros(3))
 
         applied_pos = self._feedback_pos_fraction * delta_pos
         new_pos = state.pos_e - applied_pos
@@ -345,6 +407,8 @@ class LcEstimator:
         new_state.att_rpy = att_rpy
         new_state.gyro_bias = state.gyro_bias + delta_bg
         new_state.accel_bias = state.accel_bias + delta_ba
+        new_state.gyro_scale = state.gyro_scale + delta_gs
+        new_state.accel_scale = state.accel_scale + delta_as
 
         # 可选: GNSS 杆臂 (δlever = lever_true - lever_est, 反馈加)
         if si.has_lever_arm():

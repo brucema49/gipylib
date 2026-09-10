@@ -619,6 +619,10 @@ class RtkTcMeas(_DdBase):
             sync_tc_ambiguities_with_rtklib(
                 nav, obsb, obsr, iu, ir, amb_init_target, previous_obs_t)
         if ns <= 0:
+            # ``udbias`` has consumed this epoch's slip mask even without a
+            # common satellite.  Save LLI history and clear that mask before
+            # the next epoch can regain common observations.
+            save_tc_phase_state(nav, obsb, obsr, iu, ir)
             return np.array([]), np.zeros((0, si.dim)), np.zeros((0, 0)), {}
         # 4. rover zdres (使用 INS 位置)
         rr = state.pos_e

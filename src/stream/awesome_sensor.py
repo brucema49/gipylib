@@ -68,18 +68,29 @@ class AwesomeImuFormator:
         if self._previous_sow is None:
             self._previous_sow = sow
             return None
-        dt = sow - self._previous_sow
+        previous_sow = self._previous_sow
+        dt = sow - previous_sow
         self._previous_sow = sow
         if not np.isfinite(dt) or dt <= 0.0:
             raise ValueError(f"Awesome IMU timestamps must increase, dt={dt}")
         if ((self.start_sow is not None and sow < self.start_sow)
                 or (self.end_sow is not None and sow > self.end_sow)):
             return None
+        # The rest of the pipeline advances on Unix-float timestamps.  At a
+        # GPS week near 1.5e9 Unix seconds, subtracting two floats introduces
+        # microsecond-scale quantization.  Use that same timestamp interval
+        # for rate conversion so rate * pipeline_dt reconstructs the original
+        # increment exactly, matching KF-GINS' increment-domain propagation.
+        timestamp = gpst_to_unix(self.week, sow)
+        previous_timestamp = gpst_to_unix(self.week, previous_sow)
+        timestamp_dt = timestamp - previous_timestamp
+        if not np.isfinite(timestamp_dt) or timestamp_dt <= 0.0:
+            raise ValueError(f"Awesome IMU Unix timestamps must increase, dt={timestamp_dt}")
         imu = ImuMeasurement(
-            timestamp=gpst_to_unix(self.week, sow),
+            timestamp=timestamp,
             week=self.week,
-            accel=dvel / dt,
-            gyro=dtheta / dt,
+            accel=dvel / timestamp_dt,
+            gyro=dtheta / timestamp_dt,
         )
         return SensorData(tag="imu", imu=imu)
 

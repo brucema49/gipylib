@@ -15,8 +15,10 @@
   - "缓存5个动态的GNSS历元结果, 通过首尾位置差分得到大致的平面速度"
   - 不使用静态回退初始化 (yaw=0 会导致偏航角发散)
 """
+import json
 import logging
 import math
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -58,12 +60,29 @@ class LcStream:
         self._last_q = 5  # 最近 GNSS quality (初值 5=SPP, feed_gnss 时更新)
         self._output_count = 0
 
+        # KF-GINS 对齐诊断输出。默认关闭；配置路径后在指定 SOW 窗口写一条
+        # JSONL 记录，包含 F/Phi/Q/H/R/K 以及 GNSS 反馈增量。
+        ins_cfg = config.get("ins", {})
+        self._matrix_diag_path = ins_cfg.get("lc_matrix_diagnostics_path")
+        self._matrix_diag_start_sow = float(
+            ins_cfg.get("diagnostics_start_sow", -math.inf))
+        self._matrix_diag_end_sow = float(
+            ins_cfg.get("diagnostics_end_sow", math.inf))
+        self._matrix_diag_file = None
+
     def open(self) -> None:
         self.writer.open()
         if self.stat_writer is not None:
             self.stat_writer.open()
+        if self._matrix_diag_path:
+            path = Path(self._matrix_diag_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._matrix_diag_file = path.open("w", encoding="utf-8")
 
     def close(self) -> None:
+        if self._matrix_diag_file is not None:
+            self._matrix_diag_file.close()
+            self._matrix_diag_file = None
         if self.stat_writer is not None:
             self.stat_writer.close()
         self.writer.close()
@@ -209,7 +228,63 @@ class LcStream:
                 state=state, P=P, si=self._si, q=self._last_q,
                 qins=qins, num_sv=self._last_gnss_ns,
             )
+        self._write_matrix_diagnostic(state, qins)
         self._output_count += 1
+
+    @staticmethod
+    def _diag_value(value):
+        """Convert numpy/scalar values into JSON-safe diagnostic values."""
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (np.floating, np.integer)):
+            return value.item()
+        if isinstance(value, dict):
+            return {key: LcStream._diag_value(val) for key, val in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [LcStream._diag_value(val) for val in value]
+        return value
+
+    def _write_matrix_diagnostic(self, state, qins: int) -> None:
+        """Write matrix/feedback diagnostics at the configured GNSS epoch."""
+        if self._matrix_diag_file is None or qins != 3 or self._est is None:
+            return
+        week, sow = unix_to_gpst(float(state.timestamp))
+        if not (self._matrix_diag_start_sow <= sow < self._matrix_diag_end_sow):
+            return
+        diag = {
+            "week": int(week),
+            "sow": float(sow),
+            "timestamp": float(state.timestamp),
+            "state": {
+                "pos_e": state.pos_e.copy(),
+                "vel_e": state.vel_e.copy(),
+                "gyro_bias": state.gyro_bias.copy(),
+                "accel_bias": state.accel_bias.copy(),
+                "gyro_scale": state.gyro_scale.copy(),
+                "accel_scale": state.accel_scale.copy(),
+            },
+            "P": self._est.P.copy(),
+            "time_update": self._est.last_time_update_diag,
+            # 一个 GNSS 历元通常包含位置、速度两次更新；完整保留最近更新序列。
+            "measurement_updates": self._est.meas_update_diags[-4:],
+            "last_measurement_update": self._est.last_meas_update_diag,
+            "feedback_x": self._est.last_feedback_x.copy(),
+            "delta_bg": self._est.last_feedback_x[
+                self._est.si.gyro_bias:self._est.si.gyro_bias + 3].copy(),
+            "delta_ba": self._est.last_feedback_x[
+                self._est.si.accel_bias:self._est.si.accel_bias + 3].copy(),
+            "delta_scale": {
+                "gyro": (self._est.last_feedback_x[
+                    self._est.si.gyro_scale:self._est.si.gyro_scale + 3].copy()
+                    if self._est.si.has_imu_scale() else np.zeros(3)),
+                "accel": (self._est.last_feedback_x[
+                    self._est.si.accel_scale:self._est.si.accel_scale + 3].copy()
+                    if self._est.si.has_imu_scale() else np.zeros(3)),
+            },
+        }
+        self._matrix_diag_file.write(
+            json.dumps(self._diag_value(diag), separators=(",", ":")) + "\n")
+        self._matrix_diag_file.flush()
 
     def _write_state(self, qins: int) -> None:
         """写当前状态到 .rslt 文件 (per-IMU 100Hz)。"""

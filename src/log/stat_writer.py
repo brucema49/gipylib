@@ -162,6 +162,13 @@ class StatWriter:
                 % (week, sow, ista, *(_fmt(b, ".7f") for b in state.gyro_bias)))
         f.write("$ABIAS,%d,%.3f,%d,%s,%s,%s\n"
                 % (week, sow, ista, *(_fmt(b, ".7f") for b in state.accel_bias)))
+        if si.has_imu_scale():
+            f.write("$GSCALE,%d,%.3f,%d,%s,%s,%s\n"
+                    % (week, sow, ista,
+                       *(_fmt(s * 1.0e6, ".4f") for s in state.gyro_scale)))
+            f.write("$ASCALE,%d,%.3f,%d,%s,%s,%s\n"
+                    % (week, sow, ista,
+                       *(_fmt(s * 1.0e6, ".4f") for s in state.accel_scale)))
         f.write("$INSTA,%d,%.3f,%d\n" % (week, sow, ista))
 
         if self.stat_level >= 2 and qins == 3:

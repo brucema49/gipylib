@@ -3,7 +3,7 @@
 固定 15 维基础状态 + 可选参数块, 根据配置动态构建索引。
 状态顺序:
   固定: pos(3), vel(3), att(3), gyro_bias(3), accel_bias(3)
-  可选: lever_arm(3), imu_angle(2), imu_leverarm(3), time_sync(1)
+  可选: gyro_scale(3), accel_scale(3), lever_arm(3), imu_angle(2), imu_leverarm(3), time_sync(1)
 """
 from dataclasses import dataclass
 
@@ -23,6 +23,8 @@ class StateIndex:
     accel_bias: int = 12
 
     # 可选参数块 (-1 表示未启用)
+    gyro_scale: int = -1     # 3 维, 陀螺比例因子 (无量纲)
+    accel_scale: int = -1    # 3 维, 加计比例因子 (无量纲)
     lever_arm: int = -1      # 3 维, GNSS 天线杆臂 (b 系)
     imu_angle: int = -1      # 2 维, IMU 安装角 [pitch, yaw]
     imu_leverarm: int = -1   # 3 维, IMU 杆臂 (b→v, NHC 用)
@@ -37,6 +39,14 @@ class StateIndex:
         si = cls()
         ins_cfg = config.get("ins", {}) if config else {}
         idx = 15
+
+        # KF-GINS 对齐路径: 6 个 IMU 比例因子状态，使基础 INS 块扩展为
+        # [pos, vel, att, bg, ba, sg, sa] 共 21 维。默认关闭。
+        if ins_cfg.get("estimate_imu_scale", 0):
+            si.gyro_scale = idx
+            idx += 3
+            si.accel_scale = idx
+            idx += 3
 
         if ins_cfg.get("estimate_leverarm", 0):
             si.lever_arm = idx
@@ -58,6 +68,9 @@ class StateIndex:
 
     def has_lever_arm(self) -> bool:
         return self.lever_arm >= 0
+
+    def has_imu_scale(self) -> bool:
+        return self.gyro_scale >= 0 and self.accel_scale >= 0
 
     def has_imu_angle(self) -> bool:
         return self.imu_angle >= 0

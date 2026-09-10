@@ -721,7 +721,10 @@ def detslp_ll(nav, obs, ix, rcv):
     
     ixsat = obs.sat[ix] - 1
     initP = (nav.sig_n0 / 2)**2 # init value for slips
-    slip = np.zeros_like(nav.slip)
+    # ``udbias`` calls this once for the base and once for the rover.  Keep
+    # detections from the first receiver while OR-ing the second receiver's
+    # LLI flags into the shared epoch mask.
+    slip = nav.slip.copy()
     for f in range(nav.nf):
         ixL = np.where(obs.L[ix,f] != 0)[0]
         if nav.tt >= 0: # forward
