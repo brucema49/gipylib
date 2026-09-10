@@ -162,16 +162,6 @@ def load_config(path) -> dict:
             "increment IMU input must use "
             "ins.imu_data_process_form='increment'"
         )
-    if imu_data_form == "increment" and ins_enabled != "lc":
-        raise ValueError(
-            "native increment IMU is supported only when ins.enabled='lc'"
-        )
-    if (ins_enabled == "tc" and imu_data_form == "rate"
-            and imu_data_process_form == "increment"):
-        raise ValueError(
-            "rate-to-increment IMU processing for ins.enabled='tc' is "
-            "reserved for a future branch"
-        )
     ins_cfg["imu_data_form"] = imu_data_form
     ins_cfg["imu_data_process_form"] = imu_data_process_form
 

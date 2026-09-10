@@ -31,14 +31,23 @@ from typing import Optional, List
 
 import numpy as np
 
-from src.core.data_types import AlignedBlock, GnssSolution, ImuMeasurement
+from src.core.data_types import (
+    AlignedBlock,
+    GnssSolution,
+    ImuMeasurement,
+    IncrementImuData,
+)
 from src.core.ins.attitude import euler2dcm, att_caln2e, dcm2quat
 from src.core.ins.constraints import Constraints
 from src.core.ins.earth_param import cal_Ce2n, ecef2llh
 from src.core.ins.initializer import InsInitializer, InitMode
-from src.core.ins.interpolator import imu_interpolate_linear
+from src.core.ins.interpolator import (
+    imu_interpolate_linear,
+    split_increment_at_gnss,
+)
 from src.core.ins.lc_integration import _DecimationCounter
 from src.core.ins.static_detect import StaticDetect
+from src.core.time_utils import unix_to_gpst
 from src.core.tc.tc_ambiguity import TcAmbiguity
 from src.core.tc.tc_degrade import TcDegradeManager
 from src.core.tc.tc_estimator import TcEstimator
@@ -96,6 +105,12 @@ class TcIntegration:
         # 估计器 + 量测构造器 (初始化后创建)
         self._est: Optional[TcEstimator] = None
         self._meas_builder = None
+        # Input payload form and the requested propagation form are separate:
+        # native increments stay increments, while rate input may explicitly
+        # opt into the same increment-boundary path.
+        self._imu_data_process_form = str(
+            ins_cfg.get("imu_data_process_form", "rate")
+        ).lower()
 
         # IMU 状态 (GVINS 风格)
         self.imupre: Optional[ImuMeasurement] = None
@@ -278,6 +293,24 @@ class TcIntegration:
                 self._try_init()
             return
 
+        # Dispatch before the legacy rate path.  Native increments must never
+        # enter rate interpolation, and rate-to-increment is an explicit
+        # conversion performed once at the propagation boundary.
+        if imu.is_increment():
+            had_previous = self.imucur is not None
+            self._add_increment_imu(imu)
+            if had_previous and self._est is not None:
+                self._check_velocity_divergence()
+            self._write_state(self.last_qins)
+            return
+        if self._imu_data_process_form == "increment":
+            had_previous = self.imucur is not None
+            self._add_rate_as_increment_imu(imu)
+            if had_previous and self._est is not None:
+                self._check_velocity_divergence()
+            self._write_state(self.last_qins)
+            return
+
         if self.imucur is None:
             self.imucur = imu
             self._static_detect.push(imu)
@@ -339,28 +372,174 @@ class TcIntegration:
         self._static_detect.push(imu)
         self._apply_constraints(imu)
 
-        # 速度发散检测: 速度 > 50 m/s (180 km/h) 说明滤波器已发散
-        # (地面车辆最大速度 ~30 m/s, 50 m/s 是安全阈值)
-        # 重置速度为 0, 放大速度协方差, 等待下次 GNSS 量测修正位置
-        vel = self._est.state.vel_e
-        speed = float(np.linalg.norm(vel))
-        if speed > 50.0:
-            logger.warning(
-                f"TC vel_diverge (t={imu.timestamp:.3f}): "
-                f"speed={speed:.2f} m/s > 50, reset vel & inflate P")
-            self._est.state.vel_e = np.zeros(3, dtype=np.float64)
-            si = self._est.si
-            for k in range(3):
-                self._est.P[si.vel + k, si.vel + k] = 100.0 ** 2
-            # 清零速度与其他状态的交叉协方差
-            for k in range(3):
-                for j in range(si.dim):
-                    if j < si.vel or j >= si.vel + 3:
-                        self._est.P[si.vel + k, j] = 0.0
-                        self._est.P[j, si.vel + k] = 0.0
-            self._est.x[si.vel:si.vel + 3] = 0.0
+        self._check_velocity_divergence()
 
         self._write_state(self.last_qins)
+
+    def _check_velocity_divergence(self) -> None:
+        """Reset an obviously divergent TC velocity after propagation."""
+        vel = self._est.state.vel_e
+        speed = float(np.linalg.norm(vel))
+        if speed <= 50.0:
+            return
+        logger.warning(
+            f"TC vel_diverge (t={self._est.state.timestamp:.3f}): "
+            f"speed={speed:.2f} m/s > 50, reset vel & inflate P")
+        self._est.state.vel_e = np.zeros(3, dtype=np.float64)
+        si = self._est.si
+        for k in range(3):
+            self._est.P[si.vel + k, si.vel + k] = 100.0 ** 2
+        # 清零速度与其他状态的交叉协方差
+        for k in range(3):
+            for j in range(si.dim):
+                if j < si.vel or j >= si.vel + 3:
+                    self._est.P[si.vel + k, j] = 0.0
+                    self._est.P[j, si.vel + k] = 0.0
+        self._est.x[si.vel:si.vel + 3] = 0.0
+
+    def _propagate_increment_segment(self, previous: ImuMeasurement,
+                                     segment: ImuMeasurement) -> None:
+        """Consume one already-bounded increment and apply TC side effects."""
+        self.imupre = previous
+        self.imucur = segment
+        self._est.time_update(segment)
+        self._record_latest_propagation()
+        self._static_detect.push(segment)
+        self._apply_constraints(segment)
+
+    @staticmethod
+    def _raw_gnss_sow(obsr, timestamp: float) -> float:
+        """Return GNSS SOW without requiring a new GREAT input format."""
+        source_sow = getattr(obsr, "source_sow", None)
+        if source_sow is not None:
+            return float(source_sow)
+        _week, sow = unix_to_gpst(timestamp)
+        return float(sow)
+
+    def _add_rate_as_increment_imu(self, imu: ImuMeasurement) -> None:
+        """Convert each rate interval once, then use native split handling."""
+        if not imu.is_rate():
+            raise TypeError("rate-to-increment processing requires rate IMU input")
+        if self.imucur is None:
+            self.imucur = imu
+            self._static_detect.push(imu)
+            self.last_qins = 2
+            self.last_split_action = "none"
+            self.last_split_ratio = None
+            return
+
+        previous = self.imucur
+        dt = imu.timestamp - previous.timestamp
+        if dt <= 0.0:
+            raise ValueError("rate IMU timestamps must be strictly increasing")
+        if not previous.is_rate():
+            raise TypeError("rate-to-increment processing cannot mix payload forms")
+        _week, previous_sow = unix_to_gpst(previous.timestamp)
+        rate = imu.rate_view()
+        current = ImuMeasurement(
+            timestamp=imu.timestamp,
+            week=imu.week,
+            payload=IncrementImuData(
+                dtheta=rate.gyro * dt,
+                dvel=rate.accel * dt,
+                dt=dt,
+                sow=previous_sow + dt,
+            ),
+        )
+        self.imucur = ImuMeasurement(
+            timestamp=previous.timestamp,
+            week=previous.week,
+            payload=IncrementImuData(
+                dtheta=np.zeros(3), dvel=np.zeros(3), dt=dt,
+                sow=previous_sow,
+            ),
+        )
+        self._add_increment_imu(current)
+
+    def _add_increment_imu(self, imu: ImuMeasurement) -> None:
+        """Consume a native increment using KF-GINS head/update/tail order."""
+        if not imu.is_increment():
+            raise TypeError("native increment processing requires increment IMU input")
+        if self.imucur is None:
+            self.imucur = imu
+            self._static_detect.push(imu)
+            self.last_qins = 2
+            self.last_split_action = "none"
+            self.last_split_ratio = None
+            return
+        if not self.imucur.is_increment():
+            raise TypeError("rate and increment IMU samples cannot be mixed")
+
+        self.last_qins = 2
+        self.last_split_action = "none"
+        self.last_split_ratio = None
+        cur = self.imucur
+        segment_current = imu
+        current_propagated = False
+
+        while self.pending_obs:
+            obsr, obsb, nav, t_gnss = self.pending_obs[0]
+            gnss_sow = self._raw_gnss_sow(obsr, t_gnss)
+            prev_sow = cur.increment_view().sow
+            current_sow = segment_current.increment_view().sow
+
+            if gnss_sow < prev_sow:
+                logger.debug(
+                    "过期增量 GNSS sow=%.9f < cur.sow=%.9f, 直接量测更新",
+                    gnss_sow, prev_sow,
+                )
+                self._trigger_meas(cur, obsr, obsb, nav, t_gnss)
+                if self.last_qins == 3:
+                    self._emit_output(3)
+                self.last_qins = 2
+                self.pending_obs.popleft()
+                continue
+            if gnss_sow > current_sow:
+                break
+
+            action, head, tail = split_increment_at_gnss(
+                cur, segment_current, gnss_sow
+            )
+            self.last_split_action = action
+            if action == "previous":
+                self._trigger_meas(cur, obsr, obsb, nav, t_gnss)
+                if self.last_qins == 3:
+                    self._emit_output(3)
+                self.last_qins = 2
+                self.pending_obs.popleft()
+                continue
+
+            if action == "current":
+                self._propagate_increment_segment(cur, segment_current)
+                self._trigger_meas(segment_current, obsr, obsb, nav, t_gnss)
+                if self.last_qins == 3:
+                    self._emit_output(3)
+                self.last_qins = 2
+                self.pending_obs.popleft()
+                cur = segment_current
+                current_propagated = True
+                continue
+
+            if action == "split":
+                self.last_split_ratio = float(
+                    head.increment_view().dt
+                    / segment_current.increment_view().dt
+                )
+                self._propagate_increment_segment(cur, head)
+                self._trigger_meas(head, obsr, obsb, nav, t_gnss)
+                if self.last_qins == 3:
+                    self._emit_output(3)
+                self.last_qins = 2
+                self.pending_obs.popleft()
+                cur = head
+                segment_current = tail
+                continue
+
+            # ``outside`` is handled by endpoint checks above.
+            break
+
+        if not current_propagated and segment_current.timestamp > cur.timestamp:
+            self._propagate_increment_segment(cur, segment_current)
 
     def add_gnss(self, obsr, obsb, nav) -> None:
         """添加 GNSS 原始观测: append 到 pending_obs deque。"""
