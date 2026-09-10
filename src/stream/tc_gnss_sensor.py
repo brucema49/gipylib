@@ -94,15 +94,12 @@ class TcGnssSensor(Thread):
         rov.decode_obsfile(nav, rover_path, None)
         rov.decode_nav(self.gnss_cfg["eph_path"], nav)
 
-        # 4. 加载基站 (RTK/RTD 模式)
+        # 4. 加载基站 (RTK/RTD 模式, 支持多个连续短时段文件)
         base = None
         mode = self.gnss_cfg.get("positioning_mode", "spp")
         if mode in ("rtk", "rtd"):
-            base_path = self._prepare_rinex(self.gnss_cfg["base_path"])
-            base = rn.rnx_decode(env.get_cfg())
-            base.decode_obsfile(nav, base_path, None)
-            if nav.rb[0] == 0:
-                nav.rb = base.pos
+            from src.stream.rinex_base import load_base
+            base = load_base(env, nav, self.gnss_cfg, self._prepare_rinex)
 
         # 5. 时间匹配 rover/base，逐历元推送原始观测
         if base is not None:

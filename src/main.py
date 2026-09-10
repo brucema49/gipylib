@@ -5,6 +5,8 @@
 
 默认 config_path = data/config.yaml
 """
+import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -26,6 +28,12 @@ from src.utility.config_loader import load_config
 
 
 def main(config_path: str = "data/config.yaml"):
+    # 日志级别通过 GIPY_LOG_LEVEL 控制 (默认 WARNING, 不改变既有输出)。
+    # 参数核对时用 GIPY_LOG_LEVEL=INFO 可看到 AR 固定、降级与恢复等中间状态。
+    logging.basicConfig(
+        level=str(os.environ.get("GIPY_LOG_LEVEL", "WARNING")).upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     config = load_config(config_path)
 
     # trace 文件 (level > 0 时启用)

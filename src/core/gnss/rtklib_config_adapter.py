@@ -107,6 +107,7 @@ def build_params(gnss_cfg: dict) -> dict:
         ("GLO", gnss_cfg["efact_glo"]),
         ("GAL", gnss_cfg["efact_gal"]),
         ("BDS", gnss_cfg.get("efact_bds", 1.0)),
+        ("QZS", gnss_cfg.get("efact_qzs", 1.0)),
     ]:
         if sat_str in cmap:
             params["efact"][cmap[sat_str]] = _f(val)
