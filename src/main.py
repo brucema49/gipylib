@@ -277,5 +277,14 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
 
 
 if __name__ == "__main__":
-    cfg = sys.argv[1] if len(sys.argv) > 1 else "data/config.yaml"
-    main(cfg)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="GInsStream 主入口")
+    parser.add_argument(
+        "config", nargs="?", default="data/config.yaml",
+        help="YAML 配置文件路径 (位置参数, 兼容旧用法)")
+    parser.add_argument(
+        "--config", dest="config_option", default=None,
+        help="YAML 配置文件路径 (显式选项, 优先于位置参数)")
+    args = parser.parse_args()
+    main(args.config_option or args.config)

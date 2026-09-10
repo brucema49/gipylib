@@ -459,9 +459,25 @@ class TcIntegration:
         dt = imu.timestamp - previous.timestamp
         if dt <= 0.0:
             raise ValueError("rate IMU timestamps must be strictly increasing")
-        if not previous.is_rate():
+        # ``self.imucur`` alternates between the raw rate sample and the
+        # synthesized increment boundary from the previous conversion, so both
+        # forms must be accepted here.  The rate payload itself is never
+        # mutated; the boundary is rebuilt with the current interval.
+        if previous.is_increment():
+            previous_sow = previous.increment_view().sow
+            previous_boundary = previous
+        elif previous.is_rate():
+            _week, previous_sow = unix_to_gpst(previous.timestamp)
+            previous_boundary = ImuMeasurement(
+                timestamp=previous.timestamp,
+                week=previous.week,
+                payload=IncrementImuData(
+                    dtheta=np.zeros(3), dvel=np.zeros(3), dt=dt,
+                    sow=previous_sow,
+                ),
+            )
+        else:
             raise TypeError("rate-to-increment processing cannot mix payload forms")
-        _week, previous_sow = unix_to_gpst(previous.timestamp)
         rate = imu.rate_view()
         current = ImuMeasurement(
             timestamp=imu.timestamp,
@@ -473,14 +489,7 @@ class TcIntegration:
                 sow=previous_sow + dt,
             ),
         )
-        self.imucur = ImuMeasurement(
-            timestamp=previous.timestamp,
-            week=previous.week,
-            payload=IncrementImuData(
-                dtheta=np.zeros(3), dvel=np.zeros(3), dt=dt,
-                sow=previous_sow,
-            ),
-        )
+        self.imucur = previous_boundary
         self._add_increment_imu(current)
 
     def _add_increment_imu(self, imu: ImuMeasurement) -> None:
