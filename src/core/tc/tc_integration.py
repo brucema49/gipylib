@@ -58,6 +58,13 @@ logger = logging.getLogger(__name__)
 
 _MEAS_BUILDERS = {"spp": SppTcMeas, "rtk": RtkTcMeas, "rtd": RtdTcMeas}
 
+# Unix↔GPST conversion of a GNSS epoch and the SOW stored on an increment can
+# differ by a few ULP at campus01 magnitudes (~1.8e5 s).  A GNSS epoch that is
+# mathematically on an increment endpoint must still be consumed once by that
+# increment, so snap such near-boundary SOW values.  The tolerance stays far
+# below the 1 ms endpoint rule used by ``split_increment_at_gnss``.
+_SOW_ENDPOINT_TOLERANCE_S = 1.0e-6
+
 
 class TcIntegration:
     """紧组合导航集成 (GVINS 风格 IMU 消费 + TC 量测触发)。
@@ -482,6 +489,13 @@ class TcIntegration:
             gnss_sow = self._raw_gnss_sow(obsr, t_gnss)
             prev_sow = cur.increment_view().sow
             current_sow = segment_current.increment_view().sow
+            # Snap a floating-point GNSS epoch onto the increment endpoint it
+            # actually belongs to, so a strict ``>`` cannot defer an endpoint
+            # measurement by one increment.
+            if abs(gnss_sow - current_sow) <= _SOW_ENDPOINT_TOLERANCE_S:
+                gnss_sow = current_sow
+            elif abs(gnss_sow - prev_sow) <= _SOW_ENDPOINT_TOLERANCE_S:
+                gnss_sow = prev_sow
 
             if gnss_sow < prev_sow:
                 logger.debug(
