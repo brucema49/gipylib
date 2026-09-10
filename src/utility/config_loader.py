@@ -36,6 +36,22 @@ def llh_to_ecef(llh):
     return np.array([x, y, z], dtype=np.float64)
 
 
+def _parse_bool(value, field_name: str) -> bool:
+    """解析 YAML 布尔字段，接受 bool/int 与常见字符串写法。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value in (0, 1):
+            return bool(value)
+        raise ValueError(f"{field_name} must be a boolean, got {value!r}")
+    text = str(value).strip().lower()
+    if text in ("true", "1", "yes", "on"):
+        return True
+    if text in ("false", "0", "no", "off"):
+        return False
+    raise ValueError(f"{field_name} must be a boolean, got {value!r}")
+
+
 def _normalize_rb(gnss_cfg: dict) -> None:
     """基站坐标归一化: rb_format=llh 时转 ECEF xyz，原地修改 gnss_cfg['rb']。
 
@@ -132,9 +148,9 @@ def load_config(path) -> dict:
     output_cfg = cfg.setdefault("output", {})
     _validate_output(output_cfg)
 
-    # ``imu_data_form`` 描述传感器文件的数值语义，
-    # ``imu_data_process_form`` 描述导航机械编排采用的语义。旧配置未声明
-    # 处理形式时保持直通，即处理形式与输入形式相同。
+    # ``imu_data_form`` 描述传感器文件的数值语义，``rate_to_increment`` 描述
+    # 是否在机械编排边界把 rate 一次性转成增量。``imu_data_process_form`` 是
+    # 派生字段，保留给 LC/TC 既有消费方，避免两处开关各自演化。
     ins_cfg = cfg.setdefault("ins", {})
     imu_format = str(ins_cfg.get("imu_format", "gpst")).lower()
     inferred_form = "increment" if imu_format == "awesome_increment" else "rate"
@@ -149,20 +165,52 @@ def load_config(path) -> dict:
             "ins.imu_format='awesome_increment' requires "
             "ins.imu_data_form='increment'"
         )
-    imu_data_process_form = str(
-        ins_cfg.get("imu_data_process_form", imu_data_form)
-    ).lower()
-    if imu_data_process_form not in SUPPORTED_IMU_DATA_FORMS:
-        raise ValueError(
-            "ins.imu_data_process_form must be one of "
-            f"{SUPPORTED_IMU_DATA_FORMS}, got '{imu_data_process_form}'"
-        )
-    if imu_data_form == "increment" and imu_data_process_form != "increment":
-        raise ValueError(
-            "increment IMU input must use "
-            "ins.imu_data_process_form='increment'"
-        )
+
+    legacy_process_form = ins_cfg.get("imu_data_process_form")
+    if legacy_process_form is not None:
+        legacy_process_form = str(legacy_process_form).lower()
+        if legacy_process_form not in SUPPORTED_IMU_DATA_FORMS:
+            raise ValueError(
+                "ins.imu_data_process_form must be one of "
+                f"{SUPPORTED_IMU_DATA_FORMS}, got '{legacy_process_form}'"
+            )
+        if imu_data_form == "increment" and legacy_process_form == "rate":
+            raise ValueError(
+                "increment IMU input must use "
+                "ins.imu_data_process_form='increment'"
+            )
+
+    declared_switch = ins_cfg.get("rate_to_increment")
+    if declared_switch is None:
+        if imu_data_form == "increment":
+            rate_to_increment = False
+        else:
+            rate_to_increment = (legacy_process_form == "increment")
+    else:
+        rate_to_increment = _parse_bool(
+            declared_switch, "ins.rate_to_increment")
+        if imu_data_form == "increment" and rate_to_increment:
+            raise ValueError(
+                "ins.rate_to_increment requires rate input; increment IMU "
+                "payloads must not be converted twice"
+            )
+        if legacy_process_form is not None:
+            expected = "increment" if rate_to_increment else "rate"
+            if legacy_process_form != expected:
+                raise ValueError(
+                    "ins.imu_data_process_form conflicts with "
+                    "ins.rate_to_increment"
+                )
+
+    if imu_data_form == "increment":
+        imu_data_process_form = "increment"
+    elif legacy_process_form is not None:
+        imu_data_process_form = legacy_process_form
+    else:
+        imu_data_process_form = "increment" if rate_to_increment else "rate"
+
     ins_cfg["imu_data_form"] = imu_data_form
+    ins_cfg["rate_to_increment"] = bool(rate_to_increment)
     ins_cfg["imu_data_process_form"] = imu_data_process_form
 
     # external/awesome_external 模式校验

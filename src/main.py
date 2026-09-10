@@ -234,14 +234,24 @@ def _assemble_pipeline(config, control, imu_queue, gnss_queue):
         # 输出一个文件：紧组合 .rslt (100Hz, ignav outins 风格 位置+ECEF速度+FRD姿态)
         # 不输出纯 GNSS .pos (TC 不做独立 GNSS 解算)
         sensors = SensorFactory.create_sensors(config, imu_queue, gnss_queue, control)
+        # campus01 实验契约: output.nav_csv_filename 存在时改写 100 Hz 状态 CSV
+        # (固定列 week,sow,x,y,z,vx,vy,vz,roll,pitch,yaw), 否则保持 .rslt。
+        nav_csv_filename = str(config["output"].get("nav_csv_filename", ""))
         tc_filename = config["output"].get("rslt_filename", "RTKTC.rslt")
-        tc_writer = RSLTWriter(
-            output_dir=config["output"]["output_dir"],
-            filename=tc_filename,
-            position_format=pos_fmt,
-            time_format=time_fmt,
-            time_precision=int(config["output"].get("time_precision", 3)),
-        )
+        if nav_csv_filename:
+            from src.log.nav_csv_writer import NavCsvWriter
+            tc_writer = NavCsvWriter(
+                output_dir=config["output"]["output_dir"],
+                filename=nav_csv_filename,
+            )
+        else:
+            tc_writer = RSLTWriter(
+                output_dir=config["output"]["output_dir"],
+                filename=tc_filename,
+                position_format=pos_fmt,
+                time_format=time_fmt,
+                time_precision=int(config["output"].get("time_precision", 3)),
+            )
         sw = _parse_output_switches(config)
         stat_writer = None
         if sw["stat_level"] > 0:

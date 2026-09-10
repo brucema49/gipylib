@@ -6,9 +6,10 @@
 流程:
 1. 初始化前：小缓冲累积 IMU+GNSS 原始观测，每个新 GNSS 到来时尝试初始化
 2. 初始化成功：回放缓冲数据，然后切换增量模式
-3. 增量模式：feed_imu 做 time_update + per-IMU 写出 (.rslt 一行)
+3. 增量模式：feed_imu 委托 TcIntegration 做 time_update
    feed_gnss_raw 入 pending 队列（由后续 IMU 跨越 gnss.t 时 GVINS 风格触发）
-4. 输出：per-IMU (100Hz)，每条 IMU 后立即写一行
+4. 输出：每次真实机械编排提交写一行 (100Hz)，由 TcIntegration 的
+   output_callback 在提交点触发；GNSS 边界拆分时 head/tail 各写一个真实端点
 """
 import logging
 from typing import List, Optional
@@ -95,7 +96,12 @@ class TcStream:
     # ===== 增量喂入 =====
 
     def feed_imu(self, imu: ImuMeasurement) -> None:
-        """喂入 IMU。初始化前缓冲，初始化后委托 TcIntegration。"""
+        """喂入 IMU。初始化前缓冲，初始化后委托 TcIntegration。
+
+        TC 的写出由 ``TcIntegration`` 在每个真实机械编排提交后通过
+        ``output_callback`` 触发: 每个提交一行, GNSS 边界拆分时 head/tail
+        各写一个真实端点, 不做 per-IMU 的无条件补写。
+        """
         if self._imu_time_offset != 0.0:
             imu = self._imu_dataclasses.replace(
                 imu, timestamp=imu.timestamp + self._imu_time_offset)
@@ -117,7 +123,6 @@ class TcStream:
                     self._try_init()
             return
         self._integ.add_imu(imu)
-        self._write_state(self._integ.last_qins)
 
     def feed_gnss_raw(self, obsr, obsb, nav) -> None:
         """喂入原始 GNSS 观测。初始化前缓冲并输出纯GNSS解, 初始化后委托 TcIntegration。"""
@@ -160,22 +165,20 @@ class TcStream:
     # ===== 输出 =====
 
     def _write_integration_output(self, state, P, qins: int) -> None:
-        """Write a state emitted at an interpolated GNSS boundary."""
+        """Write exactly one row per successful TC mechanization commit."""
         si = self._integ.si
         if state is None or P is None or si is None:
             return
-        self.writer.write(
-            state, P, si,
-            self._integ._last_q,
-            qins,
-            self._integ._last_ns,
-        )
+        self._write_state_values(state, P, si, qins)
+
+    def _write_state_values(self, state, P, si, qins: int) -> None:
+        """Write one mechanization state row to the main writer and stat writer."""
+        q = self._integ._last_q if hasattr(self._integ, '_last_q') else 5
+        num_sv = self._integ._last_ns if hasattr(self._integ, '_last_ns') else 0
+        self.writer.write(state, P, si, q, qins, num_sv)
         if self.stat_writer is not None:
             self.stat_writer.write(
-                state, P, si,
-                self._integ._last_q,
-                qins,
-                self._integ._last_ns,
+                state, P, si, q, qins, num_sv,
                 update_info=getattr(self._integ, "last_update_info", None),
             )
         self._output_count += 1
@@ -260,21 +263,4 @@ class TcStream:
         self.writer.write_gnss_only(t_gnss, rr, quality, ns, pos_sd)
         if self.stat_writer is not None:
             self.stat_writer.write_gnss_only(t_gnss, rr, quality, ns, pos_sd)
-        self._output_count += 1
-
-    def _write_state(self, qins: int) -> None:
-        """per-IMU 写出 .rslt 一行。"""
-        state = self._integ.state
-        P = self._integ.P
-        si = self._integ.si
-        if state is None or P is None or si is None:
-            return
-        num_sv = self._integ._last_ns if hasattr(self._integ, '_last_ns') else 0
-        q = self._integ._last_q if hasattr(self._integ, '_last_q') else 5
-        self.writer.write(state, P, si, q, qins, num_sv)
-        if self.stat_writer is not None:
-            self.stat_writer.write(
-                state, P, si, q, qins, num_sv,
-                update_info=getattr(self._integ, "last_update_info", None),
-            )
         self._output_count += 1

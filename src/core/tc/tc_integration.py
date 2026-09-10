@@ -114,10 +114,14 @@ class TcIntegration:
         self._meas_builder = None
         # Input payload form and the requested propagation form are separate:
         # native increments stay increments, while rate input may explicitly
-        # opt into the same increment-boundary path.
-        self._imu_data_process_form = str(
-            ins_cfg.get("imu_data_process_form", "rate")
-        ).lower()
+        # opt into the same increment-boundary path.  ``rate_to_increment`` is
+        # the canonical switch; ``imu_data_process_form`` is the derived field
+        # filled by the config loader and kept for direct-dict callers.
+        process_form = ins_cfg.get("imu_data_process_form")
+        if process_form is None and "rate_to_increment" in ins_cfg:
+            process_form = ("increment" if ins_cfg["rate_to_increment"]
+                            else "rate")
+        self._imu_data_process_form = str(process_form or "rate").lower()
 
         # IMU 状态 (GVINS 风格)
         self.imupre: Optional[ImuMeasurement] = None
@@ -263,6 +267,23 @@ class TcIntegration:
         elif self._writer is not None:
             self._write_state(qins)
 
+    def _emit_propagation(self) -> None:
+        """Write exactly one row per successful mechanization commit.
+
+        Called only after a real ``InsUpdate`` commit (and after any GNSS
+        measurement that refines the same endpoint), never for a pure
+        measurement or bookkeeping step.  Duplicate or synthetic rows would
+        break the 100 Hz spacing contract of ``nav-100hz.csv``.
+        """
+        if self._est is None:
+            return
+        ins_update = getattr(self._est, "ins_update", None)
+        if ins_update is not None and not getattr(
+                ins_update, "last_update_accepted", True):
+            return
+        self._emit_output(self.last_qins)
+        self.last_qins = 2
+
     @staticmethod
     def _select_init_mode(config: dict) -> InitMode:
         """TC 模式初始化模式选择: 动态位置差分。
@@ -308,21 +329,18 @@ class TcIntegration:
             self._add_increment_imu(imu)
             if had_previous and self._est is not None:
                 self._check_velocity_divergence()
-            self._write_state(self.last_qins)
             return
         if self._imu_data_process_form == "increment":
             had_previous = self.imucur is not None
             self._add_rate_as_increment_imu(imu)
             if had_previous and self._est is not None:
                 self._check_velocity_divergence()
-            self._write_state(self.last_qins)
             return
 
         if self.imucur is None:
             self.imucur = imu
             self._static_detect.push(imu)
             self.last_qins = 2
-            self._write_state(self.last_qins)
             return
 
         self.last_qins = 2  # 默认: 仅机械编排 + 协差variance propagation
@@ -335,12 +353,11 @@ class TcIntegration:
 
             if t_gnss < cur.timestamp:
                 # GNSS 已过期 (比 cur 还早): 防御性直接量测更新
+                # (该端点已写过行, 不产生新的机械编排行)
                 logger.debug(
                     f"过期 GNSS obs t={t_gnss:.6f} < cur.t={cur.timestamp:.6f}, "
                     f"直接量测更新")
                 self._trigger_meas(cur, obsr, obsb, nav, t_gnss)
-                if self.last_qins == 3:
-                    self._emit_output(3)
                 self.last_qins = 2
                 self.pending_obs.popleft()
                 continue
@@ -350,7 +367,9 @@ class TcIntegration:
                 break
 
             # cur.t <= t_gnss <= imu.t: GVINS 风格插值触发
+            mechanized = False
             if t_gnss == cur.timestamp:
+                # 该端点已在上一轮机械编排写出, 这里只做量测修正
                 interp = cur
             else:
                 interp = imu_interpolate_linear(cur, imu, t_gnss)
@@ -362,11 +381,12 @@ class TcIntegration:
                 self._record_latest_propagation()
                 self._static_detect.push(interp)
                 self._apply_constraints(interp)
+                mechanized = True
 
             # 触发 TC 量测更新 + 反馈
             self._trigger_meas(interp, obsr, obsb, nav, t_gnss)
-            if self.last_qins == 3:
-                self._emit_output(3)
+            if mechanized:
+                self._emit_propagation()
             self.last_qins = 2
             self.pending_obs.popleft()
             cur = interp
@@ -381,7 +401,7 @@ class TcIntegration:
 
         self._check_velocity_divergence()
 
-        self._write_state(self.last_qins)
+        self._emit_propagation()
 
     def _check_velocity_divergence(self) -> None:
         """Reset an obviously divergent TC velocity after propagation."""
@@ -498,13 +518,12 @@ class TcIntegration:
                 gnss_sow = prev_sow
 
             if gnss_sow < prev_sow:
+                # 该端点已写过行, 只做量测修正
                 logger.debug(
                     "过期增量 GNSS sow=%.9f < cur.sow=%.9f, 直接量测更新",
                     gnss_sow, prev_sow,
                 )
                 self._trigger_meas(cur, obsr, obsb, nav, t_gnss)
-                if self.last_qins == 3:
-                    self._emit_output(3)
                 self.last_qins = 2
                 self.pending_obs.popleft()
                 continue
@@ -516,9 +535,8 @@ class TcIntegration:
             )
             self.last_split_action = action
             if action == "previous":
+                # 量测落在 cur 端点上, 不产生新的机械编排行
                 self._trigger_meas(cur, obsr, obsb, nav, t_gnss)
-                if self.last_qins == 3:
-                    self._emit_output(3)
                 self.last_qins = 2
                 self.pending_obs.popleft()
                 continue
@@ -526,9 +544,7 @@ class TcIntegration:
             if action == "current":
                 self._propagate_increment_segment(cur, segment_current)
                 self._trigger_meas(segment_current, obsr, obsb, nav, t_gnss)
-                if self.last_qins == 3:
-                    self._emit_output(3)
-                self.last_qins = 2
+                self._emit_propagation()
                 self.pending_obs.popleft()
                 cur = segment_current
                 current_propagated = True
@@ -541,9 +557,7 @@ class TcIntegration:
                 )
                 self._propagate_increment_segment(cur, head)
                 self._trigger_meas(head, obsr, obsb, nav, t_gnss)
-                if self.last_qins == 3:
-                    self._emit_output(3)
-                self.last_qins = 2
+                self._emit_propagation()
                 self.pending_obs.popleft()
                 cur = head
                 segment_current = tail
@@ -554,6 +568,7 @@ class TcIntegration:
 
         if not current_propagated and segment_current.timestamp > cur.timestamp:
             self._propagate_increment_segment(cur, segment_current)
+            self._emit_propagation()
 
     def add_gnss(self, obsr, obsb, nav) -> None:
         """添加 GNSS 原始观测: append 到 pending_obs deque。"""
