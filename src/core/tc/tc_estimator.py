@@ -141,14 +141,18 @@ class TcEstimator(LcEstimator):
         不再每历元重置 Pclk (原 ignav 白噪声模型会导致 Pclk=100 >> Ppos,
         钟差吸收全部 innovation, 位置修正不足, 高度误差累积)。
         """
-        prev_ts = self.ins_update._prev_timestamp
         self.ins_update.update(imu)
 
         if not self.ins_update.last_update_accepted:
             self._last_propagation_snapshot = None
             return
 
-        dt = imu.timestamp - prev_ts
+        # InsUpdate is the single source of truth for the accepted segment
+        # interval: increment payloads provide their exact dt, while rate
+        # samples retain the legacy timestamp-delta behavior.  Reusing it
+        # here keeps Phi/Q on the same interval as mechanization and avoids
+        # reconstructing a segment duration from rounded Unix timestamps.
+        dt = float(self.ins_update.last_dt)
         if dt <= 0.0:
             self._last_propagation_snapshot = None
             return
