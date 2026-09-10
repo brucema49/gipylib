@@ -171,6 +171,8 @@ def split_increment_at_gnss(
     # two large SOW values.  This preserves the KF-GINS asymmetry (`<` at
     # previous, `<=` at current) while keeping adjacent representable values
     # on their actual side of each boundary.
+    if gnss_sow < prev_data.sow or gnss_sow > cur_data.sow:
+        return "outside", None, None
     front_boundary = prev_data.sow + threshold_s
     rear_boundary = cur_data.sow - threshold_s
     if gnss_sow < front_boundary:
