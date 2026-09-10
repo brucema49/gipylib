@@ -3,8 +3,8 @@
 参考:
 - GINav ins_mech.m (算法结构: 锥补/划桨/旋转补偿/中点)
 
-本项目 IMU 为速率式 (gyro: rad/s, accel: m/s²),
-需 ×dt 转为增量后套用增量式算法。
+本项目同时支持速率式 (gyro: rad/s, accel: m/s²) 和原生增量式
+(dtheta: rad, dvel: m/s)；两者最终均进入增量式 ECEF 机械编排。
 
 状态更新顺序: 姿态 → 速度 → 位置
 """
@@ -49,6 +49,10 @@ class InsUpdate:
         # 当前历元 ECEF 加速度 (供 time_sync H 矩阵使用)
         self._a_e = np.zeros(3, dtype=np.float64)
         self._last_update_accepted = False
+        self.last_data_form = "rate"
+        self.last_raw_dtheta = np.zeros(3, dtype=np.float64)
+        self.last_raw_dvel = np.zeros(3, dtype=np.float64)
+        self.last_dt = 0.0
 
     @property
     def f_b(self) -> np.ndarray:
@@ -74,13 +78,25 @@ class InsUpdate:
         """一步 INS 递推: 姿态 → 速度 → 位置 (E 系)。
 
         Args:
-            imu: IMU 测量 (速率式: gyro rad/s, accel m/s²)
+            imu: IMU 测量 (速率式或增量式 payload)
 
         Returns:
             更新后的 InsState
         """
-        dt = imu.timestamp - self._prev_timestamp
+        if imu.is_increment():
+            raw_increment = imu.increment_view()
+            dt = raw_increment.dt
+            self.last_data_form = "increment"
+            self.last_raw_dtheta = raw_increment.dtheta.copy()
+            self.last_raw_dvel = raw_increment.dvel.copy()
+        else:
+            raw_increment = None
+            dt = imu.timestamp - self._prev_timestamp
+            self.last_data_form = "rate"
+            self.last_raw_dtheta = np.asarray(imu.gyro, dtype=np.float64) * dt
+            self.last_raw_dvel = np.asarray(imu.accel, dtype=np.float64) * dt
         self._last_update_accepted = False
+        self.last_dt = float(dt)
         if dt <= 0.0:
             logger.warning(
                 f"非正 dt={dt:.6f} (t_curr={imu.timestamp:.6f}, "
@@ -100,10 +116,15 @@ class InsUpdate:
             self.state.timestamp = imu.timestamp
             return self.state
 
-        # 1. IMU 补偿: 速率 → 增量, 先减零偏、再除比例因子。
-        # 与 KF-GINS imuCompensate() 的顺序一致。
-        dtheta = imu.gyro * dt
-        dvel = imu.accel * dt
+        # 1. 统一取得原始增量。速率式只在此处乘 dt；增量式直接使用
+        # payload 的源数据，避免在 GNSS 边界把当前增量重构成速率。
+        if raw_increment is None:
+            dtheta = imu.gyro * dt
+            dvel = imu.accel * dt
+        else:
+            dtheta = raw_increment.dtheta.copy()
+            dvel = raw_increment.dvel.copy()
+        # IMU 补偿顺序与 KF-GINS imuCompensate() 一致：先减零偏、再除比例因子。
         dtheta_comp = (dtheta - self.state.gyro_bias * dt) / (1.0 + self.state.gyro_scale)
         dvel_comp = (dvel - self.state.accel_bias * dt) / (1.0 + self.state.accel_scale)
 

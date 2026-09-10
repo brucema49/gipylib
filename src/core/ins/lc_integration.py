@@ -5,11 +5,12 @@
 - KF-GINS newImuProcess (imupre/imucur/pending_gnss 结构)
 - ignav postpos.cc (NHC/ZUPT/ZARU per-IMU 触发 + decimation)
 
-主循环 (每个新 IMU 到来时, GVINS 风格):
+主循环 (每个新 IMU 到来时):
   1. 检查 pending_gnss 队头:
      - 若 gnss.t < cur.t: 防御性直接量测更新 (过期 GNSS)
-     - 若 cur.t <= gnss.t <= imu.t: 线性插值到 gnss.t, time_update(interp),
-       触发 GNSS 量测更新 + 反馈, 弹出 gnss, cur←interp, 循环处理后续 GNSS
+     - rate payload: 若 cur.t <= gnss.t <= imu.t，线性插值到 gnss.t
+     - increment payload: 按 KF-GINS 规则切分当前原始增量或在端点更新
+       time_update(head), 触发 GNSS 量测更新 + 反馈, 再推进 tail
      - 若 gnss.t > imu.t: 留给后续 IMU, 跳出循环
   2. 推进当前 IMU: imupre←cur, imucur←imu, time_update(imu)
   3. 约束更新: NHC/ZUPT/ZARU (per-IMU, decimation 控制, 互斥)
@@ -25,10 +26,14 @@ from typing import Optional
 
 import numpy as np
 
-from src.core.data_types import GnssSolution, ImuMeasurement
+from src.core.data_types import IncrementImuData, GnssSolution, ImuMeasurement
 from src.core.ins.constraints import Constraints
-from src.core.ins.interpolator import imu_interpolate_linear
+from src.core.ins.interpolator import (
+    imu_interpolate_linear,
+    split_increment_at_gnss,
+)
 from src.core.ins.static_detect import StaticDetect
+from src.core.time_utils import unix_to_gpst
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +92,7 @@ class LcIntegration:
         # vel = (pos_cur - pos_prev) / dt, vel_sd = sqrt(2) * pos_sigma / dt
         self._prev_gnss_pos: Optional[np.ndarray] = None
         self._prev_gnss_ts: Optional[float] = None
+        self._prev_gnss_sow: Optional[float] = None
         self._pos_diff_vel_std = float(ins_cfg.get("pos_diff_vel_std", 0.5))
         self._position_diff_velocity_update = bool(
             ins_cfg.get("position_diff_velocity_update", True))
@@ -100,6 +106,13 @@ class LcIntegration:
         # (与 TcIntegration._nhc_warmup 一致, 默认 1 = 至少 1 次 GNSS 更新后启用)
         self._meas_count: int = 0
         self._nhc_warmup = int(ins_cfg.get("nhc_warmup", 1))
+        self.last_split_action: str | None = None
+        self.last_split_ratio: float | None = None
+        # 输入数据形式与机械编排处理形式独立：目前 LC 可将 rate 输入
+        # 逐区间转为增量处理；TC 的同一接口由配置加载器保留给后续分支。
+        self._imu_data_process_form = str(
+            ins_cfg.get("imu_data_process_form", "rate")
+        ).lower()
 
     def _emit_output(self, qins: int) -> None:
         """Emit a state at an exact fusion boundary when a stream is attached."""
@@ -107,7 +120,7 @@ class LcIntegration:
             self._output_callback(self.est.state, self.est.P, qins)
 
     def add_imu(self, imu: ImuMeasurement) -> None:
-        """GVINS 风格 IMU 消费: 每条 IMU 检查 GNSS 队头时间戳。
+        """按 payload 类型消费 IMU，并检查 GNSS 队头时间戳。
 
         - imu.t < gnss.t: 直接机械编排 (无 GNSS 触发)
         - imu.t >= gnss.t 且 cur.t <= gnss.t:
@@ -119,6 +132,13 @@ class LcIntegration:
 
         参考: tools/GVINS/estimator/src/estimator_node.cpp process() lines 338-378
         """
+        if imu.is_increment():
+            self._add_increment_imu(imu)
+            return
+        if self._imu_data_process_form == "increment":
+            self._add_rate_as_increment_imu(imu)
+            return
+
         if self.imucur is None:
             self.imucur = imu
             self._static_detect.push(imu)
@@ -181,6 +201,164 @@ class LcIntegration:
         self._static_detect.push(imu)
         self._apply_constraints(imu)
 
+    def _add_rate_as_increment_imu(self, imu: ImuMeasurement) -> None:
+        """Process a rate input as a current-sample increment for LC only.
+
+        The rate parser remains lossless.  At the LC propagation boundary, the
+        current rate is integrated over ``current.t - previous.t`` so the
+        native-increment path can apply the same KF-GINS head/update/tail
+        splitting rule.  A rate input is never written back as a mutated
+        payload, and native increments never enter the rate path.
+        """
+        if not imu.is_rate():
+            raise TypeError("rate-to-increment processing requires rate IMU input")
+        if self.imucur is None:
+            self.imucur = imu
+            self._static_detect.push(imu)
+            self.last_qins = 2
+            self.last_split_action = "none"
+            self.last_split_ratio = None
+            return
+
+        previous = self.imucur
+        dt = imu.timestamp - previous.timestamp
+        if dt <= 0.0:
+            raise ValueError("rate IMU timestamps must be strictly increasing")
+        if previous.is_increment():
+            previous_sow = previous.increment_view().sow
+        elif previous.is_rate():
+            _, previous_sow = unix_to_gpst(previous.timestamp)
+            # The first rate sample is only a time boundary.  Its dummy
+            # payload is never mechanically propagated.
+            previous = ImuMeasurement(
+                timestamp=previous.timestamp,
+                week=previous.week,
+                payload=IncrementImuData(
+                    dtheta=np.zeros(3), dvel=np.zeros(3), dt=dt,
+                    sow=previous_sow,
+                ),
+            )
+        else:
+            raise TypeError("unsupported previous IMU payload")
+
+        rate = imu.rate_view()
+        current = ImuMeasurement(
+            timestamp=imu.timestamp,
+            week=imu.week,
+            payload=IncrementImuData(
+                dtheta=rate.gyro * dt,
+                dvel=rate.accel * dt,
+                dt=dt,
+                # Build from the previous boundary so span and propagation dt
+                # remain exactly identical despite Unix timestamp round-off.
+                sow=previous_sow + dt,
+            ),
+        )
+        self.imucur = previous
+        self._add_increment_imu(current, allow_derived_gnss_sow=True)
+
+    def _add_increment_imu(
+            self,
+            imu: ImuMeasurement,
+            *,
+            allow_derived_gnss_sow: bool = False,
+    ) -> None:
+        """Consume a native increment sample with KF-GINS boundary handling."""
+        if self.imucur is None:
+            self.imucur = imu
+            self._static_detect.push(imu)
+            self.last_qins = 2
+            self.last_split_action = "none"
+            self.last_split_ratio = None
+            return
+        if not self.imucur.is_increment():
+            raise TypeError("rate and increment IMU samples cannot be mixed")
+
+        self.last_qins = 2
+        self.last_split_action = "none"
+        self.last_split_ratio = None
+        cur = self.imucur
+        segment_current = imu
+        current_propagated = False
+
+        while self.pending_gnss:
+            gnss = self.pending_gnss[0]
+            if gnss.source_sow is None:
+                if not allow_derived_gnss_sow:
+                    raise ValueError("increment LC requires GNSS source_sow")
+                _, gnss_sow = unix_to_gpst(gnss.timestamp)
+            else:
+                gnss_sow = float(gnss.source_sow)
+            prev_sow = cur.increment_view().sow
+            current_sow = segment_current.increment_view().sow
+
+            if gnss_sow < prev_sow:
+                logger.debug(
+                    "过期增量 GNSS sow=%.9f < cur.sow=%.9f, 直接量测更新",
+                    gnss_sow, prev_sow,
+                )
+                self._apply_gnss_update(gnss)
+                self._emit_output(3)
+                self.last_qins = 2
+                self.pending_gnss.popleft()
+                continue
+            if gnss_sow > current_sow:
+                break
+
+            action, head, tail = split_increment_at_gnss(
+                cur, segment_current, gnss_sow
+            )
+            self.last_split_action = action
+            if action == "previous":
+                self._apply_gnss_update(gnss)
+                self._emit_output(3)
+                self.last_qins = 2
+                self.pending_gnss.popleft()
+                continue
+
+            if action == "current":
+                self.imupre = cur
+                self.imucur = segment_current
+                self.est.time_update(segment_current)
+                self._static_detect.push(segment_current)
+                self._apply_constraints(segment_current)
+                self._apply_gnss_update(gnss)
+                self._emit_output(3)
+                self.last_qins = 2
+                self.pending_gnss.popleft()
+                cur = segment_current
+                current_propagated = True
+                continue
+
+            if action == "split":
+                self.last_split_ratio = float(
+                    head.increment_view().dt
+                    / segment_current.increment_view().dt
+                )
+                self.imupre = cur
+                self.imucur = head
+                self.est.time_update(head)
+                self._static_detect.push(head)
+                self._apply_constraints(head)
+                self._apply_gnss_update(gnss)
+                self._emit_output(3)
+                self.last_qins = 2
+                self.pending_gnss.popleft()
+                cur = head
+                segment_current = tail
+                continue
+
+            # ``outside`` is handled by the endpoint checks above; keep the
+            # queue intact if a malformed ordering reaches this point.
+            break
+
+        if not current_propagated and segment_current.timestamp > cur.timestamp:
+            self.imupre = cur
+            self.imucur = segment_current
+            self.est.time_update(segment_current)
+            self._static_detect.push(segment_current)
+            self._apply_constraints(segment_current)
+
     def add_gnss(self, gnss: GnssSolution) -> None:
         """添加 GNSS: append 到 pending_gnss deque。"""
         self.pending_gnss.append(gnss)
@@ -207,7 +385,11 @@ class LcIntegration:
         if (self._position_diff_velocity_update
                 and (vel_for_update is None or use_pos_diff)
                 and self._prev_gnss_pos is not None):
-            dt = gnss.timestamp - self._prev_gnss_ts
+            if (gnss.source_sow is not None
+                    and self._prev_gnss_sow is not None):
+                dt = gnss.source_sow - self._prev_gnss_sow
+            else:
+                dt = gnss.timestamp - self._prev_gnss_ts
             if dt > 0.5:  # 仅在合理时间间隔内计算 (避免 GNSS 中断后差分)
                 vel_diff = (gnss.position - self._prev_gnss_pos) / dt
                 vel_for_update = vel_diff
@@ -235,6 +417,7 @@ class LcIntegration:
         # 缓存当前 GNSS 位置供下次位置差分
         self._prev_gnss_pos = gnss.position.copy()
         self._prev_gnss_ts = gnss.timestamp
+        self._prev_gnss_sow = gnss.source_sow
 
     def _apply_constraints(self, imu: ImuMeasurement) -> None:
         """NHC/ZUPT/ZARU 约束更新 (per-IMU, decimation, 互斥)。

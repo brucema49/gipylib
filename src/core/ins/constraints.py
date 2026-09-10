@@ -79,7 +79,7 @@ class Nhc:
         C_b_e = state.C_b_e
         C_e_b = C_b_e.T
         v_e = state.vel_e
-        w_b_ib = imu.gyro - state.gyro_bias
+        w_b_ib = imu.rate_view().gyro - state.gyro_bias
         l_imu_b = self.imu_leverarm
 
         # v^v = R_b^v · C_e^b · v^e + R_b^v · [ω_eb^b ×] · l_imu^b
@@ -223,10 +223,10 @@ class Constraints:
         state = estimator.state
         si = estimator.si
         vel_norm = float(np.linalg.norm(state.vel_e))
-        gyro_norm = float(np.linalg.norm(imu.gyro))
+        gyro_norm = float(np.linalg.norm(imu.rate_view().gyro))
         if vel_norm >= self.zaru_max_vel or gyro_norm >= self.zaru_max_gyro:
             return False
-        Z = -imu.gyro.copy()
+        Z = -imu.rate_view().gyro.copy()
         H = np.zeros((3, si.dim), dtype=np.float64)
         H[:, si.gyro_bias:si.gyro_bias+3] = -np.eye(3)
         R = np.diag([self.zaru_std ** 2] * 3).astype(np.float64)

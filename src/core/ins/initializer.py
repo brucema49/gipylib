@@ -18,7 +18,11 @@ import numpy as np
 from src.core.data_types import AlignedBlock, GnssSolution, ImuMeasurement, InsState
 from src.core.ins.attitude import att_caln2e, dcm2quat, euler2dcm
 from src.core.ins.earth_param import cal_Ce2n, cal_Cn2e, ecef2llh, llh2ecef
-from src.core.ins.interpolator import find_bracket_imus, imu_interpolate_linear
+from src.core.ins.interpolator import (
+    find_bracket_imus,
+    imu_interpolate_linear,
+    split_increment_at_gnss,
+)
 from src.core.ins.state_index import StateIndex
 
 
@@ -81,7 +85,7 @@ class InsInitializer:
         # 1. IMU 时间对齐到 GNSS 时间戳 (GVINS 风格线性插值, 验证包夹条件)
         # 动态初始化仅需最新 IMU (不要求包夹), 静态初始化需要包夹做加速度计调平
         if mode == InitMode.STATIC:
-            interp_imu = self._align_imu_to_gnss(imu_list, gnss.timestamp)
+            interp_imu = self._align_imu_to_gnss(imu_list, gnss)
             if interp_imu is None:
                 raise ValueError(
                     "IMU 数据不满足包夹条件 (GNSS 时间戳前后需各有 IMU 历元)"
@@ -137,7 +141,7 @@ class InsInitializer:
         return np.radians(att_deg), cal_Cn2e(lat, lon) @ vel_n
 
     def _align_imu_to_gnss(self, imu_list: List[ImuMeasurement],
-                           t_gnss: float) -> Optional[ImuMeasurement]:
+                           gnss: GnssSolution) -> Optional[ImuMeasurement]:
         """IMU 数据时间对齐到 GNSS 时间戳 (GVINS 风格线性插值, 与主循环一致)。
 
         从 imu_list 中找包夹 t_gnss 的两个历元，线性插值到 t_gnss。
@@ -146,10 +150,24 @@ class InsInitializer:
         """
         if not imu_list:
             return None
+        t_gnss = gnss.timestamp
         bracket = find_bracket_imus(imu_list, t_gnss)
         if bracket is None:
             return None
         imu_pre, imu_cur, _ = bracket
+        if imu_pre.is_increment():
+            if gnss.source_sow is None:
+                raise ValueError("increment initialization requires GNSS source_sow")
+            action, head, _tail = split_increment_at_gnss(
+                imu_pre, imu_cur, gnss.source_sow
+            )
+            if action == "previous":
+                return imu_pre
+            if action == "current":
+                return imu_cur
+            if action == "split":
+                return head
+            return None
         return imu_interpolate_linear(imu_pre, imu_cur, t_gnss)
 
     def _compute_gyro_norm(self, imu_list: List[ImuMeasurement],
@@ -174,7 +192,7 @@ class InsInitializer:
             window_imus = list(imu_list)
         if not window_imus:
             return float('inf')
-        gyro_norms = [float(np.linalg.norm(imu.gyro)) for imu in window_imus]
+        gyro_norms = [float(np.linalg.norm(imu.rate_view().gyro)) for imu in window_imus]
         return float(np.mean(gyro_norms))
 
     def _align_static(self, imu_list: List[ImuMeasurement],
@@ -228,7 +246,7 @@ class InsInitializer:
         # 故 pitch = atan2(f_x, sqrt(f_y² + f_z²)), roll = atan2(-f_y, -f_z)
         # yaw 无法从加速度计估计, 设为 0
         if imu_list:
-            acc_mean = np.mean([imu.accel for imu in imu_list], axis=0)
+            acc_mean = np.mean([imu.rate_view().accel for imu in imu_list], axis=0)
             fx, fy, fz = float(acc_mean[0]), float(acc_mean[1]), float(acc_mean[2])
             pitch = math.atan2(fx, math.sqrt(fy * fy + fz * fz))
             roll = math.atan2(-fy, -fz)

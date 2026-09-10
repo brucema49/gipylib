@@ -47,11 +47,15 @@ class AlignedWriter(WriterBase):
         ])
         # I 行: I, week, sow, gx, gy, gz, ax, ay, az (9 列)
         for imu in block.imu_list:
-            i_week, i_sow = unix_to_gpst(imu.timestamp)
+            rates = imu.rate_view()
+            if imu.is_increment():
+                i_week, i_sow = imu.week, imu.payload.sow
+            else:
+                i_week, i_sow = unix_to_gpst(imu.timestamp)
             self._writer.writerow([
                 "I", i_week, f"{i_sow:.6f}",
-                f"{imu.gyro[0]:.6f}", f"{imu.gyro[1]:.6f}", f"{imu.gyro[2]:.6f}",
-                f"{imu.accel[0]:.6f}", f"{imu.accel[1]:.6f}", f"{imu.accel[2]:.6f}",
+                f"{rates.gyro[0]:.6f}", f"{rates.gyro[1]:.6f}", f"{rates.gyro[2]:.6f}",
+                f"{rates.accel[0]:.6f}", f"{rates.accel[1]:.6f}", f"{rates.accel[2]:.6f}",
             ])
 
     def close(self) -> None:

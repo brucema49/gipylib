@@ -67,8 +67,8 @@ class StaticDetect:
             return False
 
         imus: List[ImuMeasurement] = list(self._buf)
-        accel = np.array([imu.accel for imu in imus], dtype=np.float64)  # [n, 3]
-        gyro = np.array([imu.gyro for imu in imus], dtype=np.float64)    # [n, 3]
+        accel = np.array([imu.rate_view().accel for imu in imus], dtype=np.float64)  # [n, 3]
+        gyro = np.array([imu.rate_view().gyro for imu in imus], dtype=np.float64)    # [n, 3]
 
         if self.method == "GLRT":
             return self._glrt(accel, gyro, pos_e)

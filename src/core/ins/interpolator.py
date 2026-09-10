@@ -12,7 +12,10 @@ GVINS 风格线性插值（imu_interpolate_linear）：
 """
 from typing import Optional
 
-from src.core.data_types import ImuMeasurement
+import numpy as np
+
+from src.core.data_types import IncrementImuData, ImuMeasurement
+from src.core.time_utils import gpst_to_unix
 
 
 def is_to_update(t0: float, t2: float, t_gnss: float,
@@ -119,6 +122,8 @@ def imu_interpolate_linear(imu_pre: ImuMeasurement,
     Returns:
         t_target 时刻的 ImuMeasurement（线性插值数据），或 None（区间不包含 t_target）
     """
+    if not imu_pre.is_rate() or not imu_cur.is_rate():
+        raise TypeError("imu_interpolate_linear only accepts rate IMU samples")
     t0 = imu_pre.timestamp
     t2 = imu_cur.timestamp
     if not (t0 <= t_target <= t2) or t2 <= t0:
@@ -133,3 +138,63 @@ def imu_interpolate_linear(imu_pre: ImuMeasurement,
         accel=w1 * imu_pre.accel + w2 * imu_cur.accel,
         gyro=w1 * imu_pre.gyro + w2 * imu_cur.gyro,
     )
+
+
+def split_increment_at_gnss(
+        previous: ImuMeasurement,
+        current: ImuMeasurement,
+        gnss_sow: float,
+        threshold_s: float = 1.0e-3,
+) -> tuple[str, ImuMeasurement | None, ImuMeasurement | None]:
+    """Split the current raw increment at a GNSS SOW like KF-GINS.
+
+    ``previous`` and ``current`` represent consecutive increment samples whose
+    payloads end at their respective SOW values.  The current payload is the
+    only increment split; the previous payload is used solely for its time
+    boundary and later coning/sculling history.
+    """
+    if not previous.is_increment() or not current.is_increment():
+        raise TypeError("split_increment_at_gnss requires increment IMU samples")
+    if previous.week != current.week:
+        raise ValueError("increment split cannot cross GPS weeks")
+    prev_data = previous.increment_view()
+    cur_data = current.increment_view()
+    if not np.isfinite(gnss_sow):
+        raise ValueError("GNSS SOW must be finite")
+    span = cur_data.sow - prev_data.sow
+    if span <= 0.0:
+        raise ValueError("increment SOW values must be strictly increasing")
+    if abs(span - cur_data.dt) > 1.0e-8:
+        raise ValueError("increment dt does not match its SOW span")
+
+    if abs(gnss_sow - prev_data.sow) < threshold_s:
+        return "previous", None, None
+    if abs(cur_data.sow - gnss_sow) <= threshold_s:
+        return "current", None, None
+    if not (prev_data.sow < gnss_sow < cur_data.sow):
+        return "outside", None, None
+
+    ratio = (gnss_sow - prev_data.sow) / span
+    head_dt = cur_data.dt * ratio
+    tail_dt = cur_data.dt - head_dt
+    head = ImuMeasurement(
+        timestamp=gpst_to_unix(current.week, gnss_sow),
+        week=current.week,
+        payload=IncrementImuData(
+            dtheta=cur_data.dtheta * ratio,
+            dvel=cur_data.dvel * ratio,
+            dt=head_dt,
+            sow=gnss_sow,
+        ),
+    )
+    tail = ImuMeasurement(
+        timestamp=current.timestamp,
+        week=current.week,
+        payload=IncrementImuData(
+            dtheta=cur_data.dtheta - head.payload.dtheta,
+            dvel=cur_data.dvel - head.payload.dvel,
+            dt=tail_dt,
+            sow=cur_data.sow,
+        ),
+    )
+    return "split", head, tail

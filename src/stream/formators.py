@@ -16,7 +16,12 @@ from typing import Optional
 
 import numpy as np
 
-from src.core.data_types import ImuMeasurement, GnssSolution, SensorData
+from src.core.data_types import (
+    GnssSolution,
+    ImuMeasurement,
+    RateImuData,
+    SensorData,
+)
 from src.core.time_utils import ymdhms_to_gpst, gpst_to_unix, unix_to_gpst
 
 
@@ -60,8 +65,10 @@ class ImuFormator(FormatorBase):
         imu = ImuMeasurement(
             timestamp=gpst_to_unix(week, sow),
             week=week,
-            accel=np.array([ax, ay, az], dtype=np.float64),
-            gyro=np.array([gx, gy, gz], dtype=np.float64),
+            payload=RateImuData(
+                accel=np.array([ax, ay, az], dtype=np.float64),
+                gyro=np.array([gx, gy, gz], dtype=np.float64),
+            ),
         )
         return SensorData(tag="imu", imu=imu)
 
@@ -104,8 +111,10 @@ class EuRoCImuFormator(FormatorBase):
         imu = ImuMeasurement(
             timestamp=timestamp,
             week=week,
-            accel=np.array([ax, ay, az], dtype=np.float64),
-            gyro=np.array([wx, wy, wz], dtype=np.float64),
+            payload=RateImuData(
+                accel=np.array([ax, ay, az], dtype=np.float64),
+                gyro=np.array([wx, wy, wz], dtype=np.float64),
+            ),
         )
         return SensorData(tag="imu", imu=imu)
 

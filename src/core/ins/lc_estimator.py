@@ -156,6 +156,10 @@ class LcEstimator:
         self.last_time_update_diag = {
             "timestamp": float(imu.timestamp),
             "dt": float(dt),
+            "imu_data_form": self.ins_update.last_data_form,
+            "raw_dtheta": self.ins_update.last_raw_dtheta.copy(),
+            "raw_dvel": self.ins_update.last_raw_dvel.copy(),
+            "segment_dt": float(self.ins_update.last_dt),
             "F": F.copy(),
             "Phi": Phi.copy(),
             # Q is the discrete noise actually used by the covariance

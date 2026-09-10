@@ -3,7 +3,12 @@ from queue import Queue
 
 import numpy as np
 
-from src.core.data_types import GnssSolution, ImuMeasurement, SensorData
+from src.core.data_types import (
+    GnssSolution,
+    ImuMeasurement,
+    IncrementImuData,
+    SensorData,
+)
 from src.core.thread_control import ThreadControl
 from src.core.time_utils import gpst_to_unix
 from src.stream.base import StreamerBase
@@ -41,7 +46,7 @@ def _enu_to_ecef(lat_deg: float, lon_deg: float) -> np.ndarray:
 
 
 class AwesomeImuFormator:
-    """Decode ``sow dtheta(3) dvel(3)`` into rate-form IMU samples."""
+    """Decode ``sow dtheta(3) dvel(3)`` into native increment samples."""
 
     def __init__(self, week: int = 0, start_sow: float | None = None,
                  end_sow: float | None = None):
@@ -76,21 +81,16 @@ class AwesomeImuFormator:
         if ((self.start_sow is not None and sow < self.start_sow)
                 or (self.end_sow is not None and sow > self.end_sow)):
             return None
-        # The rest of the pipeline advances on Unix-float timestamps.  At a
-        # GPS week near 1.5e9 Unix seconds, subtracting two floats introduces
-        # microsecond-scale quantization.  Use that same timestamp interval
-        # for rate conversion so rate * pipeline_dt reconstructs the original
-        # increment exactly, matching KF-GINS' increment-domain propagation.
         timestamp = gpst_to_unix(self.week, sow)
-        previous_timestamp = gpst_to_unix(self.week, previous_sow)
-        timestamp_dt = timestamp - previous_timestamp
-        if not np.isfinite(timestamp_dt) or timestamp_dt <= 0.0:
-            raise ValueError(f"Awesome IMU Unix timestamps must increase, dt={timestamp_dt}")
         imu = ImuMeasurement(
             timestamp=timestamp,
             week=self.week,
-            accel=dvel / timestamp_dt,
-            gyro=dtheta / timestamp_dt,
+            payload=IncrementImuData(
+                dtheta=dtheta,
+                dvel=dvel,
+                dt=float(dt),
+                sow=float(sow),
+            ),
         )
         return SensorData(tag="imu", imu=imu)
 
@@ -136,6 +136,7 @@ class AwesomeGnssFormator:
             num_sv=0,
             sd=np.sqrt(np.maximum(np.diag(cov), 0.0)),
             cov=cov,
+            source_sow=float(sow),
         )
         return SensorData(tag="gnss_solution", gnss_solution=gnss)
 

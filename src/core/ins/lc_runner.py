@@ -117,7 +117,7 @@ class LcRunner:
             if not (has_before and has_after):
                 continue
 
-            gyro_norms = [float(np.linalg.norm(imu.gyro)) for imu in imu_block]
+            gyro_norms = [float(np.linalg.norm(imu.rate_view().gyro)) for imu in imu_block]
             if float(np.mean(gyro_norms)) >= angular_thr:
                 continue
 

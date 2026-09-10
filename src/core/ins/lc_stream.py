@@ -150,7 +150,7 @@ class LcStream:
         if angular_thr > math.pi:
             angular_thr = math.radians(angular_thr)
         if imu_list:
-            gyro_norm = float(np.linalg.norm(imu_list[0].gyro))
+            gyro_norm = float(np.linalg.norm(imu_list[0].rate_view().gyro))
             if gyro_norm >= angular_thr:
                 return
 
@@ -265,6 +265,10 @@ class LcStream:
             },
             "P": self._est.P.copy(),
             "time_update": self._est.last_time_update_diag,
+            "split_action": (self._integ.last_split_action
+                              if self._integ is not None else None),
+            "split_ratio": (self._integ.last_split_ratio
+                             if self._integ is not None else None),
             # 一个 GNSS 历元通常包含位置、速度两次更新；完整保留最近更新序列。
             "measurement_updates": self._est.meas_update_diags[-4:],
             "last_measurement_update": self._est.last_meas_update_diag,

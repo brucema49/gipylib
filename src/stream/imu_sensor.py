@@ -3,7 +3,7 @@ from queue import Queue
 
 import numpy as np
 
-from src.core.data_types import ImuMeasurement
+from src.core.data_types import ImuMeasurement, IncrementImuData, RateImuData
 from src.core.thread_control import ThreadControl
 from src.stream.base import StreamerBase
 from src.stream.formators import ImuFormator, EuRoCImuFormator
@@ -72,15 +72,28 @@ class ImuSensor(StreamerBase):
         elif self.coordinate_system == "RFU":
             # RFU (Right-Front-Up) → FRD (Front-Right-Down)
             # FRD_x = RFU_y, FRD_y = RFU_x, FRD_z = -RFU_z
-            new_gyro = np.array([imu.gyro[1], imu.gyro[0], -imu.gyro[2]],
-                                dtype=np.float64)
-            new_accel = np.array([imu.accel[1], imu.accel[0], -imu.accel[2]],
-                                 dtype=np.float64)
+            if isinstance(imu.payload, RateImuData):
+                payload = RateImuData(
+                    gyro=np.array([imu.payload.gyro[1], imu.payload.gyro[0],
+                                   -imu.payload.gyro[2]], dtype=np.float64),
+                    accel=np.array([imu.payload.accel[1], imu.payload.accel[0],
+                                    -imu.payload.accel[2]], dtype=np.float64),
+                )
+            elif isinstance(imu.payload, IncrementImuData):
+                payload = IncrementImuData(
+                    dtheta=np.array([imu.payload.dtheta[1], imu.payload.dtheta[0],
+                                     -imu.payload.dtheta[2]], dtype=np.float64),
+                    dvel=np.array([imu.payload.dvel[1], imu.payload.dvel[0],
+                                   -imu.payload.dvel[2]], dtype=np.float64),
+                    dt=imu.payload.dt,
+                    sow=imu.payload.sow,
+                )
+            else:  # pragma: no cover - ImuMeasurement validates payload type.
+                raise TypeError("unsupported IMU payload")
             return ImuMeasurement(
                 timestamp=imu.timestamp,
                 week=imu.week,
-                accel=new_accel,
-                gyro=new_gyro,
+                payload=payload,
             )
         else:
             raise ValueError(

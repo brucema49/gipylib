@@ -10,6 +10,7 @@ SUPPORTED_EXTERNAL_FORMATS = {"pos", "awesome_pos"}
 SUPPORTED_GNSS_SOURCES = {"external", "awesome_external", "internal"}
 SUPPORTED_POSITIONING_MODES = {"spp", "rtd", "rtk"}
 SUPPORTED_INS_ENABLED = {"lc", "off", "tc"}
+SUPPORTED_IMU_DATA_FORMS = {"rate", "increment"}
 SUPPORTED_RB_FORMATS = {"xyz", "llh"}
 SUPPORTED_POS_FORMATS = {"llh", "xyz"}
 SUPPORTED_TIME_FORMATS = {"gpst", "datetime"}
@@ -130,6 +131,49 @@ def load_config(path) -> dict:
     # output 段格式校验
     output_cfg = cfg.setdefault("output", {})
     _validate_output(output_cfg)
+
+    # ``imu_data_form`` 描述传感器文件的数值语义，
+    # ``imu_data_process_form`` 描述导航机械编排采用的语义。旧配置未声明
+    # 处理形式时保持直通，即处理形式与输入形式相同。
+    ins_cfg = cfg.setdefault("ins", {})
+    imu_format = str(ins_cfg.get("imu_format", "gpst")).lower()
+    inferred_form = "increment" if imu_format == "awesome_increment" else "rate"
+    imu_data_form = str(ins_cfg.get("imu_data_form", inferred_form)).lower()
+    if imu_data_form not in SUPPORTED_IMU_DATA_FORMS:
+        raise ValueError(
+            f"ins.imu_data_form must be one of {SUPPORTED_IMU_DATA_FORMS}, "
+            f"got '{imu_data_form}'"
+        )
+    if imu_format == "awesome_increment" and imu_data_form != "increment":
+        raise ValueError(
+            "ins.imu_format='awesome_increment' requires "
+            "ins.imu_data_form='increment'"
+        )
+    imu_data_process_form = str(
+        ins_cfg.get("imu_data_process_form", imu_data_form)
+    ).lower()
+    if imu_data_process_form not in SUPPORTED_IMU_DATA_FORMS:
+        raise ValueError(
+            "ins.imu_data_process_form must be one of "
+            f"{SUPPORTED_IMU_DATA_FORMS}, got '{imu_data_process_form}'"
+        )
+    if imu_data_form == "increment" and imu_data_process_form != "increment":
+        raise ValueError(
+            "increment IMU input must use "
+            "ins.imu_data_process_form='increment'"
+        )
+    if imu_data_form == "increment" and ins_enabled != "lc":
+        raise ValueError(
+            "native increment IMU is supported only when ins.enabled='lc'"
+        )
+    if (ins_enabled == "tc" and imu_data_form == "rate"
+            and imu_data_process_form == "increment"):
+        raise ValueError(
+            "rate-to-increment IMU processing for ins.enabled='tc' is "
+            "reserved for a future branch"
+        )
+    ins_cfg["imu_data_form"] = imu_data_form
+    ins_cfg["imu_data_process_form"] = imu_data_process_form
 
     # external/awesome_external 模式校验
     if gnss_source in ("external", "awesome_external"):
