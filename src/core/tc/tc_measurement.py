@@ -472,7 +472,7 @@ class _DdBase(TcMeasurement):
                     H_row[si.att:si.att + 3] = -los_dd @ skew(lever_e)
                     # 杆臂 Jacobian: ∂(DD_ρ)/∂lever = (eu_ref - eu_j) · C_b_e
                     if si.has_lever_arm():
-                        H_row[si.lever_arm:si.lever_arm + 3] = los_dd @ state.C_b_e
+                        H_row[si.lever_arm:si.lever_arm + 3] = -los_dd @ state.C_b_e
                     if (not code) and self.use_phase:
                         # phase: pred = DD_rho + λ*(N_i - N_j)
                         # innovation: v = obs - pred = DD_y - λ*(N_i - N_j)
