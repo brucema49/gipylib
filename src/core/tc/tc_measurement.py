@@ -624,8 +624,8 @@ class RtkTcMeas(_DdBase):
             # the next epoch can regain common observations.
             save_tc_phase_state(nav, obsb, obsr, iu, ir)
             return np.array([]), np.zeros((0, si.dim)), np.zeros((0, 0)), {}
-        # 4. rover zdres (使用 INS 位置)
-        rr = state.pos_e
+        # 4. rover zdres (使用 INS 天线位置)
+        rr = state.pos_e + state.C_b_e @ state.leverarm
         yu, eu, azel = zdres(nav, obsr, rs, dts, svh, var, rr, 1)
         # decode stdevs
         from src.core.gnss.rtklib import rinex as rn
