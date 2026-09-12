@@ -17,7 +17,13 @@ def base_paths(gnss_cfg: dict) -> List[str]:
     return [str(raw)]
 
 
-def load_base(env, nav, gnss_cfg: dict, prepare_rinex: Callable[[str], str]):
+def load_base(
+    env,
+    nav,
+    gnss_cfg: dict,
+    prepare_rinex: Callable[[str], str],
+    raw_band_priority=None,
+):
     """读取全部基站文件并返回合并后的基站解码器。
 
     Args:
@@ -32,13 +38,17 @@ def load_base(env, nav, gnss_cfg: dict, prepare_rinex: Callable[[str], str]):
     if not paths:
         raise ValueError("base_path is required for rtk/rtd positioning")
 
-    base = rn.rnx_decode(env.get_cfg())
+    base = rn.rnx_decode(
+        env.get_cfg(), raw_band_priority=raw_band_priority
+    )
     for index, path in enumerate(paths):
         prepared = prepare_rinex(path)
         if index == 0:
             base.decode_obsfile(nav, prepared, None)
             continue
-        more = rn.rnx_decode(env.get_cfg())
+        more = rn.rnx_decode(
+            env.get_cfg(), raw_band_priority=raw_band_priority
+        )
         more.decode_obsfile(nav, prepared, None)
         base.obslist.extend(more.obslist)
 

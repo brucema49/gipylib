@@ -65,8 +65,11 @@ class TcGnssSensor(Thread):
             mode="w", suffix=suffix, delete=False, encoding="utf-8"
         )
         tmp.close()
-        freq_priority = self._build_freq_priority()
-        simplify_rinex(path, tmp.name, freq_priority=freq_priority)
+        simplify_rinex(
+            path,
+            tmp.name,
+            raw_band_priority=self.resolved_raw_band_priority,
+        )
         self._temp_files.append(tmp.name)
         return tmp.name
 
@@ -81,7 +84,10 @@ class TcGnssSensor(Thread):
 
         # 3. 加载流动站观测值 + 星历
         from src.core.gnss.rtklib import rinex as rn
-        rov = rn.rnx_decode(env.get_cfg())
+        rov = rn.rnx_decode(
+            env.get_cfg(),
+            raw_band_priority=self.resolved_raw_band_priority,
+        )
         rov.decode_obsfile(nav, rover_path, None)
         rov.decode_nav(self.gnss_cfg["eph_path"], nav)
 
@@ -90,7 +96,13 @@ class TcGnssSensor(Thread):
         mode = self.gnss_cfg.get("positioning_mode", "spp")
         if mode in ("rtk", "rtd"):
             from src.stream.rinex_base import load_base
-            base = load_base(env, nav, self.gnss_cfg, self._prepare_rinex)
+            base = load_base(
+                env,
+                nav,
+                self.gnss_cfg,
+                self._prepare_rinex,
+                raw_band_priority=self.resolved_raw_band_priority,
+            )
 
         # 5. 时间匹配 rover/base，逐历元推送原始观测
         if base is not None:

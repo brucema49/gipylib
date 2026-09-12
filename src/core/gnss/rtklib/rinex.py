@@ -11,11 +11,18 @@ from .rtkcmn import uGNSS, rSIG, Eph, Geph, prn2sat, gpst2time, time2gpst, Obs, 
                     epoch2time, timediff, timeadd, utc2gpst
 from . import rtkcmn as gn
 from .ephemeris import satposs
+from src.stream.gnss_band_mapping import (
+    DEFAULT_RAW_BAND_PRIORITY,
+    raw_band_priority_to_slot_mapping,
+)
 
 # RINEX 观测量按"类型分组"排列时 (如 BASE: C,C,L,L,S,S), 位置分块启发式失效。
 # 此处以信号频带号为主键映射到频点槽位, 与 freq_ix 配置语义一致:
 #   GPS/GLO: L1->0, L2->1        GAL: E1(band1)->0, E5b(band7)->1
 #   BDS: B1I/B1C(band1)->0, B3I(band6)->1
+# Kept as a compatibility view for callers that imported the old constant.
+# ``rnx_decode`` deliberately does not read this global: each decoder owns its
+# raw-band mapping and can therefore represent a different stream layout.
 BAND_SLOT = {
     uGNSS.GPS: {1: 0, 2: 1},
     uGNSS.GLO: {1: 0, 2: 1},
@@ -29,10 +36,18 @@ class rnx_decode:
     """ class for RINEX decoder """
     MAXSAT = uGNSS.GPSMAX+uGNSS.GLOMAX+uGNSS.GALMAX+uGNSS.BDSMAX+uGNSS.QZSMAX
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, raw_band_priority=None):
         self.ver = -1.0
         self.fobs = None
         self.gnss_tbl = {'G': uGNSS.GPS, 'E': uGNSS.GAL, 'R': uGNSS.GLO, 'J': uGNSS.QZS, 'C': uGNSS.BDS}
+        if raw_band_priority is None:
+            raw_band_priority = DEFAULT_RAW_BAND_PRIORITY
+        # The mapping is immutable from the decoder's perspective and is
+        # derived per instance, never shared through BAND_SLOT.
+        self.raw_band_to_slot = raw_band_priority_to_slot_mapping(
+            raw_band_priority
+        )
+        self.slot_frequency_hz = self._slot_frequency_hz(cfg)
         self.sig_tbl = cfg.sig_tbl
         self.skip_sig_tbl = cfg.skip_sig_tbl
         self.nf = 4
@@ -42,6 +57,39 @@ class rnx_decode:
         self.nsig = np.zeros((uGNSS.GNSSMAX), dtype=int)
         self.nband = np.zeros((uGNSS.GNSSMAX), dtype=int)
         self.pos = np.array([0, 0, 0])
+
+    def _slot_frequency_hz(self, cfg):
+        """Expose configured solver Hz for this decoder's ordered slots.
+
+        Raw-band selection and physical frequencies are separate namespaces:
+        this diagnostic view pairs slot order with the existing solver
+        ``freq_ix0``/``freq_ix1`` metadata without deriving either from the
+        other.  Minimal decoder configs used by reader-only callers simply
+        produce an empty view.
+        """
+        freq = getattr(cfg, "freq", None)
+        if freq is None:
+            return {}
+        index_tables = [
+            getattr(cfg, "freq_ix0", {}),
+            getattr(cfg, "freq_ix1", {}),
+        ]
+        result = {}
+        for system, bands in self.raw_band_to_slot.items():
+            if system not in self.gnss_tbl:
+                continue
+            enum = self.gnss_tbl[system]
+            values = []
+            for table in index_tables[:len(bands)]:
+                if enum not in table:
+                    break
+                index = table[enum]
+                if index < 0 or index >= len(freq):
+                    break
+                values.append(float(freq[index]))
+            if values:
+                result[system] = values
+        return result
 
     def flt(self, u, c=-1):
         if c >= 0:
@@ -316,9 +364,10 @@ class rnx_decode:
                     except:
                         obsval = 0
                     band = self.sigband[sys][i]
-                    if band > 0 and sys in BAND_SLOT and band in BAND_SLOT[sys]:
-                        f = BAND_SLOT[sys][band]
-                    else:
+                    # Mapping keys are canonical RINEX system characters;
+                    # ``sys`` is the decoder's uGNSS enum.
+                    band_slot = self.raw_band_to_slot.get(line[0], {})
+                    if band <= 0 or band not in band_slot:
                         # Do not silently assign an unsupported raw band by
                         # column position: that can overwrite another band
                         # and expose a false dual-frequency observation.
@@ -331,11 +380,21 @@ class rnx_decode:
                         }.get(sys, str(sys))
                         raise SystemExit(
                             f"{sys_name} raw band {band} ({line[0]}{band}) "
-                            "is unsupported; simplify the RINEX observations"
+                            "is not configured for this decoder stream"
                         )
+                    f = band_slot[band]
                     if f >= gn.MAX_NFREQ:
-                        print('Obs file too complex, please use RTKCONV to remove unused signals')
-                        raise SystemExit
+                        sys_name = {
+                            uGNSS.GPS: "GPS",
+                            uGNSS.GLO: "GLO",
+                            uGNSS.GAL: "GAL",
+                            uGNSS.BDS: "BDS",
+                            uGNSS.QZS: "QZS",
+                        }.get(sys, str(sys))
+                        raise SystemExit(
+                            f"{sys_name} raw band {band} ({line[0]}{band}) "
+                            f"maps to decoder slot {f}, beyond MAX_NFREQ"
+                        )
                     if self.typeid[sys][i] == 0:  # code
                         obs.P[n, f] = obsval
                         Pstd = line[16*i+18]

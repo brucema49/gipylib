@@ -141,7 +141,11 @@ def _select_signals(sigs: List[str], max_freqs: int,
                 selected_freqs.append(fb)
                 if len(selected_freqs) >= max_freqs:
                     break
-    selected_freqs = sorted(selected_freqs)
+    # Explicit priority order is also the decoder slot order.  Sorting it here
+    # would silently turn a per-stream raw-band mapping into a global physical
+    # frequency order (and can swap two stations using different layouts).
+    if not preferred_freqs:
+        selected_freqs = sorted(selected_freqs)
 
     # 构建新信号列表（C-L-D-S 顺序）与索引映射
     new_sigs: List[str] = []
@@ -203,22 +207,36 @@ def _reorder_obs_line(line: str, old_to_new: List[Optional[int]]) -> str:
 
 
 def simplify_rinex(input_path: str, output_path: str, max_freqs: int = 2,
-                   freq_priority: Dict[str, List[int]] = None) -> str:
+                   freq_priority: Dict[str, List[int]] = None,
+                   raw_band_priority: Dict[str, List[int]] = None) -> str:
     """简化 RINEX 3.02 观测文件。
 
     Args:
         input_path: 输入 RINEX 文件路径
         output_path: 输出简化后 RINEX 文件路径
         max_freqs: 每系统最多保留频点数（默认 2，匹配 rtklib-py MAX_NFREQ）
-        freq_priority: 各系统优先保留的频点列表，键为系统字符（'G'/'C'/'E'等），
+        freq_priority: 各系统优先保留的 normalized 频点列表，键为系统字符（'G'/'C'/'E'等），
                       值为频点序号列表（如 [3, 0] 表示优先保留 B2I, 其次 L1）。
                       用于确保基站与流动站频点匹配。若为 None，或未提供某个
                       系统键，则使用 GREAT 的目标 raw-band 默认；显式提供的
                       系统值（包括 None/空列表）保持原有 normalized 语义。
+        raw_band_priority: 各系统按 decoder slot 顺序排列的 raw RINEX band
+                           列表。传入后在本边界转换为 simplifier 的 normalized
+                           频点序号；不能与 freq_priority 同时传入。
 
     Returns:
         输出文件路径
     """
+    if raw_band_priority is not None:
+        if freq_priority is not None:
+            raise ValueError(
+                "raw_band_priority and freq_priority are mutually exclusive"
+            )
+        from src.stream.gnss_band_mapping import (
+            raw_band_priority_to_simplifier_priority,
+        )
+        freq_priority = raw_band_priority_to_simplifier_priority(raw_band_priority)
+
     in_path = Path(input_path)
     out_path = Path(output_path)
 

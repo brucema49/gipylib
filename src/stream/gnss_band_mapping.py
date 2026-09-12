@@ -63,6 +63,18 @@ RAW_TO_NORMALIZED_BAND = {
 }
 
 
+# Decoder-facing defaults are expressed in raw RINEX band digits.  A caller
+# may provide a different ordered mapping for each stream (for example the
+# legacy GAL/BDS pair versus GREAT's GAL/BDS pair).
+DEFAULT_RAW_BAND_PRIORITY = {
+    "G": [1, 2],
+    "R": [1, 2],
+    "E": [1, 7],
+    "C": [1, 6],
+    "J": [1, 2],
+}
+
+
 def _system_char(system: str) -> str:
     """Return the canonical one-character RINEX system identifier."""
     if not isinstance(system, str):
@@ -202,3 +214,20 @@ def raw_band_priority_to_simplifier_priority(
     for system, bands in canonical.items():
         normalized[system] = [RAW_TO_NORMALIZED_BAND[system][band] for band in bands]
     return normalized
+
+
+def raw_band_priority_to_slot_mapping(
+    raw_priority: Mapping[str, Sequence[int]] = None,
+) -> Dict[str, Dict[int, int]]:
+    """Derive a decoder slot map from each stream's ordered raw bands.
+
+    The first configured raw band is always decoder slot 0, the second slot 1,
+    and so on.  No global constellation-specific slot table is consulted.
+    """
+    if raw_priority is None:
+        raw_priority = DEFAULT_RAW_BAND_PRIORITY
+    canonical = _validate_raw_priority(raw_priority)
+    return {
+        system: {band: slot for slot, band in enumerate(bands)}
+        for system, bands in canonical.items()
+    }
