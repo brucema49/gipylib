@@ -117,10 +117,9 @@ def _select_signals(sigs: List[str], max_freqs: int,
             continue
         if fb not in freq_groups:
             freq_groups[fb] = {}
-        # Header order differs between rover/base receivers.  Select a stable
-        # signal name for each physical band/type so both stations expose the
-        # same observation columns after simplification.
-        if tc not in freq_groups[fb] or sig < freq_groups[fb][tc]:
+        # Preserve the legacy header-first choice when several legal signals
+        # advertise the same physical band and observation type.
+        if tc not in freq_groups[fb]:
             freq_groups[fb][tc] = sig
 
     # 选择频点：优先保留 preferred_freqs 中存在的频点

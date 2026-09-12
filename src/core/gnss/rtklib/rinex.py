@@ -319,8 +319,20 @@ class rnx_decode:
                     if band > 0 and sys in BAND_SLOT and band in BAND_SLOT[sys]:
                         f = BAND_SLOT[sys][band]
                     else:
-                        # 未知频带: 回退位置分块启发式
-                        f = i // max(self.nsig[sys] // self.nband[sys], 1)
+                        # Do not silently assign an unsupported raw band by
+                        # column position: that can overwrite another band
+                        # and expose a false dual-frequency observation.
+                        sys_name = {
+                            uGNSS.GPS: "GPS",
+                            uGNSS.GLO: "GLO",
+                            uGNSS.GAL: "GAL",
+                            uGNSS.BDS: "BDS",
+                            uGNSS.QZS: "QZS",
+                        }.get(sys, str(sys))
+                        raise SystemExit(
+                            f"{sys_name} raw band {band} ({line[0]}{band}) "
+                            "is unsupported; simplify the RINEX observations"
+                        )
                     if f >= gn.MAX_NFREQ:
                         print('Obs file too complex, please use RTKCONV to remove unused signals')
                         raise SystemExit
