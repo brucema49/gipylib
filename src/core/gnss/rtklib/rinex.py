@@ -13,7 +13,12 @@ from . import rtkcmn as gn
 from .ephemeris import satposs
 from src.stream.gnss_band_mapping import (
     DEFAULT_RAW_BAND_PRIORITY,
+    RINEX_TO_SYSTEM,
     raw_band_priority_to_slot_mapping,
+)
+from src.log.observation_mapping_trace import (
+    ObservationMappingError,
+    trace_from,
 )
 
 # RINEX 观测量按"类型分组"排列时 (如 BASE: C,C,L,L,S,S), 位置分块启发式失效。
@@ -36,7 +41,12 @@ class rnx_decode:
     """ class for RINEX decoder """
     MAXSAT = uGNSS.GPSMAX+uGNSS.GLOMAX+uGNSS.GALMAX+uGNSS.BDSMAX+uGNSS.QZSMAX
 
-    def __init__(self, cfg, raw_band_priority=None):
+    _instance_sequence = 0
+
+    def __init__(self, cfg, raw_band_priority=None, *,
+                 diagnostic_sink=None, diagnostic_callback=None,
+                 trace_sink=None, trace_callback=None, mapping_trace=None,
+                 sensor_id=None, instance_id=None, mapping_owner=None):
         self.ver = -1.0
         self.fobs = None
         self.gnss_tbl = {'G': uGNSS.GPS, 'E': uGNSS.GAL, 'R': uGNSS.GLO, 'J': uGNSS.QZS, 'C': uGNSS.BDS}
@@ -47,12 +57,32 @@ class rnx_decode:
         self.raw_band_to_slot = raw_band_priority_to_slot_mapping(
             raw_band_priority
         )
+        rnx_decode._instance_sequence += 1
+        if sensor_id is None:
+            sensor_id = "rnx_decode"
+        if instance_id is None:
+            instance_id = f"{sensor_id}:{rnx_decode._instance_sequence}"
+        if mapping_trace is None:
+            mapping_trace = trace_from(
+                raw_band_priority,
+                sink=diagnostic_sink if diagnostic_sink is not None else trace_sink,
+                callback=(diagnostic_callback if diagnostic_callback is not None
+                          else trace_callback),
+                sensor_id=sensor_id,
+                instance_id=instance_id,
+                mapping_owner=mapping_owner,
+            )
+        self.mapping_trace = mapping_trace
+        self.sensor_id = str(sensor_id)
+        self.instance_id = str(instance_id)
         self.slot_frequency_hz = self._slot_frequency_hz(cfg)
         self.sig_tbl = cfg.sig_tbl
         self.skip_sig_tbl = cfg.skip_sig_tbl
         self.nf = 4
         self.sigid = np.ones((uGNSS.GNSSMAX, rSIG.SIGMAX*3), dtype=int) * rSIG.NONE
         self.sigband = np.zeros((uGNSS.GNSSMAX, rSIG.SIGMAX*3), dtype=int)
+        self.obscode = np.empty((uGNSS.GNSSMAX, rSIG.SIGMAX*3), dtype=object)
+        self.obscode.fill(None)
         self.typeid = np.ones((uGNSS.GNSSMAX, rSIG.SIGMAX*3), dtype=int) * rSIG.NONE
         self.nsig = np.zeros((uGNSS.GNSSMAX), dtype=int)
         self.nband = np.zeros((uGNSS.GNSSMAX), dtype=int)
@@ -290,9 +320,15 @@ class rnx_decode:
 
                 for k in range(self.nsig[sys]):
                     sig = s[4*k:3+4*k]
-                    if sig[1:3] not in self.sig_tbl:
-                        continue
-                    if self.sig_tbl[sig[1:3]] in self.skip_sig_tbl[sys]:
+                    # Keep the literal header code even when it is unknown to
+                    # rtklib.  The reader trace must distinguish an unknown
+                    # target signal (reject) from an unknown distractor
+                    # signal (skip), which requires its raw band first.
+                    self.obscode[sys][k] = sig
+                    self.sigband[sys][k] = (
+                        int(sig[1]) if len(sig) > 1 and sig[1].isdigit() else -1)
+                    signal_id = self.sig_tbl.get(sig[1:3], rSIG.NONE)
+                    if signal_id in self.skip_sig_tbl[sys]:
                         continue
                     if sig[0] == 'C':
                         self.typeid[sys][k] = 0
@@ -304,9 +340,7 @@ class rnx_decode:
                         self.typeid[sys][k] = 3
                     else:
                         continue
-                    self.sigid[sys][k] = self.sig_tbl[sig[1:3]]
-                    # 记录每列的 RINEX 频带号 (sig 第二字符), 供列->频点槽位映射
-                    self.sigband[sys][k] = int(sig[1]) if sig[1].isdigit() else -1
+                    self.sigid[sys][k] = signal_id
                 self.nband[sys] = len(np.where(self.typeid[sys]==1)[0])
         return 0
 
@@ -357,6 +391,7 @@ class rnx_decode:
                     if i >= nsig_max:
                         break
                     band = self.sigband[sys][i]
+                    input_obs_code = self.obscode[sys][i]
                     # Mapping keys are canonical RINEX system characters;
                     # ``sys`` is the decoder's uGNSS enum.
                     band_slot = self.raw_band_to_slot.get(line[0], {})
@@ -366,6 +401,14 @@ class rnx_decode:
                         # target bands, but known unsupported bands retain the
                         # historical hard failure and identity.
                         if self.sigid[sys][i] == 0:
+                            self._trace_mapping(
+                                epoch=nepoch,
+                                time=obs.t.time + obs.t.sec,
+                                constellation=RINEX_TO_SYSTEM.get(line[0], line[0]),
+                                input_obs_code=input_obs_code,
+                                raw_band=band if band > 0 else None,
+                                disposition="skip",
+                            )
                             continue
                         # Do not silently assign an unsupported raw band by
                         # column position: that can overwrite another band
@@ -377,13 +420,17 @@ class rnx_decode:
                             uGNSS.BDS: "BDS",
                             uGNSS.QZS: "QZS",
                         }.get(sys, str(sys))
-                        raise SystemExit(
-                            f"{sys_name} raw band {band} ({line[0]}{band}) "
-                            "is unsupported; simplify the RINEX observations"
+                        self._reject_mapping(
+                            epoch=nepoch,
+                            time=obs.t.time + obs.t.sec,
+                            constellation=RINEX_TO_SYSTEM.get(line[0], line[0]),
+                            input_obs_code=input_obs_code,
+                            raw_band=band if band > 0 else None,
+                            message=(
+                                f"{sys_name} raw band {band} ({line[0]}{band}) "
+                                "is unsupported; simplify the RINEX observations"),
+                            error_code="unsupported_raw_band",
                         )
-                    obs_ = line[16*i+4:16*i+17].strip()
-                    if obs_ == '':
-                        continue
                     if self.sigid[sys][i] == 0:
                         sys_name = {
                             uGNSS.GPS: "GPS",
@@ -392,10 +439,32 @@ class rnx_decode:
                             uGNSS.BDS: "BDS",
                             uGNSS.QZS: "QZS",
                         }.get(sys, str(sys))
-                        raise SystemExit(
-                            f"{sys_name} ({line[0]}) observation code for raw band {band} "
-                            f"({line[0]}{band}) has no signal mapping"
+                        self._reject_mapping(
+                            epoch=nepoch,
+                            time=obs.t.time + obs.t.sec,
+                            constellation=RINEX_TO_SYSTEM.get(line[0], line[0]),
+                            input_obs_code=input_obs_code,
+                            raw_band=band,
+                            slot=band_slot[band],
+                            message=(
+                                f"{sys_name} ({line[0]}) unknown observation code "
+                                f"{input_obs_code} for raw band {band} ({line[0]}{band})"
+                            ),
+                            error_code="unknown_observation_code",
                         )
+                    obs_ = line[16*i+4:16*i+17].strip()
+                    if obs_ == '':
+                        self._trace_mapping(
+                            epoch=nepoch,
+                            time=obs.t.time + obs.t.sec,
+                            constellation=RINEX_TO_SYSTEM.get(line[0], line[0]),
+                            input_obs_code=input_obs_code,
+                            raw_band=band,
+                            slot=band_slot[band],
+                            disposition="skip",
+                            error_code="empty_observation",
+                        )
+                        continue
                     try:
                         obsval = float(obs_)
                     except:
@@ -409,9 +478,18 @@ class rnx_decode:
                             uGNSS.BDS: "BDS",
                             uGNSS.QZS: "QZS",
                         }.get(sys, str(sys))
-                        raise SystemExit(
-                            f"{sys_name} raw band {band} ({line[0]}{band}) "
-                            f"maps to decoder slot {f}, beyond MAX_NFREQ"
+                        self._reject_mapping(
+                            epoch=nepoch,
+                            time=obs.t.time + obs.t.sec,
+                            constellation=RINEX_TO_SYSTEM.get(line[0], line[0]),
+                            input_obs_code=input_obs_code,
+                            raw_band=band,
+                            slot=f,
+                            message=(
+                                f"{sys_name} raw band {band} ({line[0]}{band}) "
+                                f"maps to decoder slot {f}, beyond MAX_NFREQ"
+                            ),
+                            error_code="slot_out_of_range",
                         )
                     if self.typeid[sys][i] == 0:  # code
                         obs.P[n, f] = obsval
@@ -427,6 +505,16 @@ class rnx_decode:
                         obs.S[n, f] = obsval
                     elif self.typeid[sys][i] == 3:  # Doppler
                             obs.D[n, f] = obsval
+                    self._trace_mapping(
+                        epoch=nepoch,
+                        time=obs.t.time + obs.t.sec,
+                        constellation=RINEX_TO_SYSTEM.get(line[0], line[0]),
+                        input_obs_code=input_obs_code,
+                        raw_band=band,
+                        decoder_obs_code=input_obs_code,
+                        slot=f,
+                        disposition="decoded",
+                    )
                 n += 1
             obs.P = obs.P[:n, :]
             obs.L = obs.L[:n, :]
@@ -443,6 +531,48 @@ class rnx_decode:
                 break
         self.index = 0
         self.fobs.close()
+
+    def _trace_mapping(self, *, epoch, time, constellation,
+                       input_obs_code, raw_band, disposition,
+                       decoder_obs_code=None, slot=None,
+                       simplified_obs_code=None, error_class=None,
+                       error_code=None):
+        """Forward an optional reader mapping record without solver coupling."""
+        if self.mapping_trace is None:
+            return
+        self.mapping_trace.emit(
+            epoch=epoch,
+            time=time,
+            constellation=constellation,
+            input_obs_code=input_obs_code,
+            raw_band=raw_band,
+            simplified_obs_code=(
+                input_obs_code if simplified_obs_code is None
+                and disposition == "decoded" else simplified_obs_code),
+            decoder_obs_code=decoder_obs_code,
+            slot=slot,
+            disposition=disposition,
+            error_class=error_class,
+            error_code=error_code,
+        )
+
+    def _reject_mapping(self, *, epoch, time, constellation,
+                        input_obs_code, raw_band, message, error_code,
+                        slot=None):
+        """Trace and raise one controlled reader-domain mapping error."""
+        self._trace_mapping(
+            epoch=epoch,
+            time=time,
+            constellation=constellation,
+            input_obs_code=input_obs_code,
+            raw_band=raw_band,
+            slot=slot,
+            disposition="reject",
+            error_class="observation_mapping",
+            error_code=error_code,
+        )
+        raise ObservationMappingError(
+            message, error_class="observation_mapping", error_code=error_code)
 
     
     def decode_obsfile(self, nav, obsfile, maxepoch):
