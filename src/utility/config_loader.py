@@ -134,6 +134,13 @@ def load_config(path) -> dict:
             f"got '{gnss_source}'"
         )
 
+    # Validate the reader-facing raw-band domain at the configuration
+    # boundary.  This deliberately resolves legacy (system, freq_ix) metadata
+    # without looking at frequency values; the solver indices and RINEX bands
+    # are separate namespaces.
+    from src.stream.gnss_band_mapping import resolve_raw_band_priority
+    resolve_raw_band_priority(cfg.get("gnss", {}))
+
     # 纯 GNSS 模式 (ins.enabled=off) 必须 internal, 不接受外部结果
     if ins_enabled == "off" and gnss_source != "internal":
         raise ValueError(

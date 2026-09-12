@@ -12,6 +12,10 @@ from threading import Thread
 from src.core.thread_control import ThreadControl
 from src.core.data_types import SensorData
 from src.core.gnss.rtklib_config_adapter import RtklibEnv
+from src.stream.gnss_band_mapping import (
+    raw_band_priority_to_simplifier_priority,
+    resolve_raw_band_priority,
+)
 from src.utility.rinex_simplifier import needs_simplification, simplify_rinex
 
 
@@ -29,6 +33,11 @@ class TcGnssSensor(Thread):
         self.output_queue = output_queue
         self.control = control
         self._temp_files = []
+        # Keep raw RINEX bands separate from solver-facing freq_ix values.
+        # The decoder/simplifier wiring will consume this mapping in the next
+        # reader slice; resolving it here makes invalid configuration fail
+        # before the sensor thread starts.
+        self.resolved_raw_band_priority = resolve_raw_band_priority(self.gnss_cfg)
 
     def run(self):
         try:
@@ -42,28 +51,10 @@ class TcGnssSensor(Thread):
             self.output_queue.put(None)  # EOF sentinel
 
     def _build_freq_priority(self) -> dict:
-        """从配置的 freq_ix0/freq_ix1 构建各系统的频点优先级。
-
-        配置中 freq_ix0/freq_ix1 的索引与 _FREQ_ORDER 中的频点序号一致:
-          0=L1/E1/B1, 1=L2, 2=L5/E5a, 3=E5b/B2I, 4=E6/B3
-
-        Returns:
-            {'G': [0, 1], 'C': [3, 3], 'E': [0, 2], ...}
-            键为 RINEX 系统字符，值为优先保留的频点列表。
-        """
-        sys_map = {"GPS": "G", "BDS": "C", "GAL": "E", "GLO": "R", "QZS": "J", "SBS": "S"}
-        freq_ix0 = self.gnss_cfg.get("freq_ix0", {})
-        freq_ix1 = self.gnss_cfg.get("freq_ix1", {})
-        priority = {}
-        for sys_name, sys_char in sys_map.items():
-            freqs = []
-            if sys_name in freq_ix0:
-                freqs.append(int(freq_ix0[sys_name]))
-            if sys_name in freq_ix1:
-                freqs.append(int(freq_ix1[sys_name]))
-            if freqs:
-                priority[sys_char] = freqs
-        return priority
+        """Return the legacy simplifier-rank adapter for resolved raw bands."""
+        return raw_band_priority_to_simplifier_priority(
+            self.resolved_raw_band_priority
+        )
 
     def _prepare_rinex(self, path: str) -> str:
         """如需简化则生成临时简化文件，返回可用路径。"""
