@@ -356,18 +356,17 @@ class rnx_decode:
                 for i in range(self.nsig[sys]):
                     if i >= nsig_max:
                         break
-                    obs_ = line[16*i+4:16*i+17].strip()
-                    if obs_ == '' or self.sigid[sys][i] == 0:
-                        continue
-                    try:
-                        obsval = float(obs_)
-                    except:
-                        obsval = 0
                     band = self.sigband[sys][i]
                     # Mapping keys are canonical RINEX system characters;
                     # ``sys`` is the decoder's uGNSS enum.
                     band_slot = self.raw_band_to_slot.get(line[0], {})
                     if band <= 0 or band not in band_slot:
+                        # Unknown signal codes carry no signal id.  They are
+                        # harmless distractors when outside this stream's
+                        # target bands, but known unsupported bands retain the
+                        # historical hard failure and identity.
+                        if self.sigid[sys][i] == 0:
+                            continue
                         # Do not silently assign an unsupported raw band by
                         # column position: that can overwrite another band
                         # and expose a false dual-frequency observation.
@@ -380,8 +379,27 @@ class rnx_decode:
                         }.get(sys, str(sys))
                         raise SystemExit(
                             f"{sys_name} raw band {band} ({line[0]}{band}) "
-                            "is not configured for this decoder stream"
+                            "is unsupported; simplify the RINEX observations"
                         )
+                    obs_ = line[16*i+4:16*i+17].strip()
+                    if obs_ == '':
+                        continue
+                    if self.sigid[sys][i] == 0:
+                        sys_name = {
+                            uGNSS.GPS: "GPS",
+                            uGNSS.GLO: "GLO",
+                            uGNSS.GAL: "GAL",
+                            uGNSS.BDS: "BDS",
+                            uGNSS.QZS: "QZS",
+                        }.get(sys, str(sys))
+                        raise SystemExit(
+                            f"{sys_name} ({line[0]}) observation code for raw band {band} "
+                            f"({line[0]}{band}) has no signal mapping"
+                        )
+                    try:
+                        obsval = float(obs_)
+                    except:
+                        obsval = 0
                     f = band_slot[band]
                     if f >= gn.MAX_NFREQ:
                         sys_name = {
