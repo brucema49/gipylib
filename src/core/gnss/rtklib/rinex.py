@@ -14,13 +14,13 @@ from .ephemeris import satposs
 
 # RINEX 观测量按"类型分组"排列时 (如 BASE: C,C,L,L,S,S), 位置分块启发式失效。
 # 此处以信号频带号为主键映射到频点槽位, 与 freq_ix 配置语义一致:
-#   GPS/GLO: L1->0, L2->1        GAL: E1->0, E5a->1
-#   BDS: B1I/B1C(band1)->0, B2I/B2b(band7)->1
+#   GPS/GLO: L1->0, L2->1        GAL: E1(band1)->0, E5b(band7)->1
+#   BDS: B1I/B1C(band1)->0, B3I(band6)->1
 BAND_SLOT = {
     uGNSS.GPS: {1: 0, 2: 1},
     uGNSS.GLO: {1: 0, 2: 1},
-    uGNSS.GAL: {1: 0, 5: 1},
-    uGNSS.BDS: {1: 0, 7: 1},
+    uGNSS.GAL: {1: 0, 7: 1},
+    uGNSS.BDS: {1: 0, 6: 1},
     uGNSS.QZS: {1: 0, 2: 1},
 }
 
@@ -415,4 +415,3 @@ def rcvstds(nav, obs):
             nav.rcvstd[s,f] = obs.Lstd[i,f] * 0.004 * 0.2
             # Pstd: 0.01*2^(n+5)
             nav.rcvstd[s,f+nav.nf] = 0.01 * (1 << (obs.Pstd[i,f] + 5))
-

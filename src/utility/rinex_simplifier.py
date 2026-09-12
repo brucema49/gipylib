@@ -30,6 +30,19 @@ _FREQ_ORDER: Dict[str, int] = {
     "8X": 4, "8Q": 4, "8P": 4,
 }
 
+# Canonical raw-RINEX choices used by the GREAT dual-frequency layout.  The
+# values are the normalized bands from ``_FREQ_ORDER`` (not the literal RINEX
+# band digit): GAL raw 1/7 is 0/3, while BDS raw 1/6 is 0/4.  Keeping this
+# table separate from the generic frequency ordering makes the GREAT choice
+# explicit and lets callers override it through ``freq_priority``.
+_DEFAULT_FREQ_PRIORITY: Dict[str, List[int]] = {
+    "G": [0, 1],
+    "R": [0, 1],
+    "E": [0, 3],
+    "C": [0, 4],
+    "J": [0, 1],
+}
+
 # 信号类型优先级：C(伪距) > L(载波) > D(多普勒) > S(信噪比)
 _TYPE_ORDER = {"C": 0, "L": 1, "D": 2, "S": 3}
 
@@ -104,8 +117,10 @@ def _select_signals(sigs: List[str], max_freqs: int,
             continue
         if fb not in freq_groups:
             freq_groups[fb] = {}
-        # 同频点同类型只保留第一个
-        if tc not in freq_groups[fb]:
+        # Header order differs between rover/base receivers.  Select a stable
+        # signal name for each physical band/type so both stations expose the
+        # same observation columns after simplification.
+        if tc not in freq_groups[fb] or sig < freq_groups[fb][tc]:
             freq_groups[fb][tc] = sig
 
     # 选择频点：优先保留 preferred_freqs 中存在的频点
@@ -198,7 +213,9 @@ def simplify_rinex(input_path: str, output_path: str, max_freqs: int = 2,
         max_freqs: 每系统最多保留频点数（默认 2，匹配 rtklib-py MAX_NFREQ）
         freq_priority: 各系统优先保留的频点列表，键为系统字符（'G'/'C'/'E'等），
                       值为频点序号列表（如 [3, 0] 表示优先保留 B2I, 其次 L1）。
-                      用于确保基站与流动站频点匹配。若为 None 则按频点序号选择。
+                      用于确保基站与流动站频点匹配。若为 None，或未提供某个
+                      系统键，则使用 GREAT 的目标 raw-band 默认；显式提供的
+                      系统值（包括 None/空列表）保持原有 normalized 语义。
 
     Returns:
         输出文件路径
@@ -230,7 +247,17 @@ def simplify_rinex(input_path: str, output_path: str, max_freqs: int = 2,
             skip_indices.add(i)
             for j in range(i + 1, next_i):
                 skip_indices.add(j)
-            preferred = freq_priority.get(sys_char) if freq_priority else None
+            if freq_priority is None:
+                # ``None`` keeps the public default behavior: use GREAT's
+                # canonical raw-band pair for every supported constellation.
+                preferred = _DEFAULT_FREQ_PRIORITY.get(sys_char)
+            else:
+                # A caller may override only one constellation.  Missing keys
+                # use the target default, while an explicitly supplied value
+                # (including None or []) keeps its existing semantics.
+                preferred = freq_priority.get(
+                    sys_char, _DEFAULT_FREQ_PRIORITY.get(sys_char)
+                )
             new_sigs, old_to_new = _select_signals(sigs, max_freqs, preferred)
             sys_sigs[sys_char] = (new_sigs, old_to_new)
             i = next_i
