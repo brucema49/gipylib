@@ -89,7 +89,9 @@ def _system_char(system: str) -> str:
     raise ValueError(f"raw_band_priority has unknown system '{system}'")
 
 
-def _validate_raw_priority(raw_priority) -> Dict[str, List[int]]:
+def _validate_raw_priority(
+    raw_priority, *, expected_band_count=None
+) -> Dict[str, List[int]]:
     """Validate and canonicalize an explicit raw-band priority mapping."""
     if not isinstance(raw_priority, Mapping):
         raise ValueError(
@@ -110,6 +112,13 @@ def _validate_raw_priority(raw_priority) -> Dict[str, List[int]]:
         if not bands:
             raise ValueError(
                 f"raw_band_priority {rinex_system} must not be empty"
+            )
+        if (expected_band_count is not None
+                and len(bands) != expected_band_count):
+            raise ValueError(
+                f"raw_band_priority {rinex_system} length must match "
+                f"nf={expected_band_count}: expected exactly "
+                f"{expected_band_count} band(s), got {len(bands)}"
             )
 
         resolved_bands = []
@@ -192,7 +201,14 @@ def resolve_raw_band_priority(gnss_cfg: Mapping) -> Dict[str, List[int]]:
     freq_ix0 = gnss_cfg.get("freq_ix0", {})
     freq_ix1 = gnss_cfg.get("freq_ix1", {})
     raw_priority = gnss_cfg.get("raw_band_priority")
-    explicit = {} if raw_priority is None else _validate_raw_priority(raw_priority)
+    if raw_priority is None:
+        explicit = {}
+    else:
+        nf = gnss_cfg.get("nf")
+        expected_band_count = None if nf is None else int(nf)
+        explicit = _validate_raw_priority(
+            raw_priority, expected_band_count=expected_band_count
+        )
     resolved: Dict[str, List[int]] = dict(explicit)
 
     for system in _legacy_systems(freq_ix0, freq_ix1):
