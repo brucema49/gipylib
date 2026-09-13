@@ -113,6 +113,37 @@ _INITIALIZATION_INPUT_APPEND_FIELDS = (
     "derived_attitude_source", "derived_attitude_provenance", "derived_attitude_frame",
     "derived_attitude_order", "derived_attitude_units", "derived_attitude_definition",
     "derived_attitude_roll", "derived_attitude_pitch", "derived_attitude_yaw",
+    # Explicit initialization-source operands.  These are append-only audit
+    # fields and never participate in the estimator path.
+    "initialization_gnss_week", "initialization_gnss_sow",
+    "initialization_gnss_time_available", "initialization_gnss_time_source",
+    "rtk_rr_ecef_available", "rtk_rr_ecef_x", "rtk_rr_ecef_y",
+    "rtk_rr_ecef_z", "rtk_antenna_ecef_available", "rtk_antenna_ecef_x",
+    "rtk_antenna_ecef_y", "rtk_antenna_ecef_z",
+    "velocity_diff_start_position_ecef_0", "velocity_diff_start_position_ecef_1",
+    "velocity_diff_start_position_ecef_2", "velocity_diff_end_position_ecef_0",
+    "velocity_diff_end_position_ecef_1", "velocity_diff_end_position_ecef_2",
+    "velocity_diff_start_position_ecef_x", "velocity_diff_start_position_ecef_y",
+    "velocity_diff_start_position_ecef_z", "velocity_diff_end_position_ecef_x",
+    "velocity_diff_end_position_ecef_y", "velocity_diff_end_position_ecef_z",
+    "raw_imu_prev_available", "raw_imu_prev_status", "raw_imu_prev",
+    "raw_imu_prev_timestamp_unix_s", "raw_imu_prev_week", "raw_imu_prev_sow",
+    "raw_imu_prev_form", "raw_imu_prev_dt_s", "raw_imu_prev_gyro_x",
+    "raw_imu_prev_gyro_y", "raw_imu_prev_gyro_z", "raw_imu_prev_accel_x",
+    "raw_imu_prev_accel_y", "raw_imu_prev_accel_z", "raw_imu_prev_dtheta_x",
+    "raw_imu_prev_dtheta_y", "raw_imu_prev_dtheta_z", "raw_imu_prev_dvel_x",
+    "raw_imu_prev_dvel_y", "raw_imu_prev_dvel_z",
+    "raw_imu_curr_available", "raw_imu_curr_status", "raw_imu_curr",
+    "raw_imu_curr_timestamp_unix_s", "raw_imu_curr_week", "raw_imu_curr_sow",
+    "raw_imu_curr_form", "raw_imu_curr_dt_s", "raw_imu_curr_gyro_x",
+    "raw_imu_curr_gyro_y", "raw_imu_curr_gyro_z", "raw_imu_curr_accel_x",
+    "raw_imu_curr_accel_y", "raw_imu_curr_accel_z", "raw_imu_curr_dtheta_x",
+    "raw_imu_curr_dtheta_y", "raw_imu_curr_dtheta_z", "raw_imu_curr_dvel_x",
+    "raw_imu_curr_dvel_y", "raw_imu_curr_dvel_z", "body_frame", "body_order",
+    "nav_frame", "nav_order", "state_time_unix_s", "state_time_sow",
+    "state_time_source", "imu_update_applied", "imu_update_time_unix_s",
+    "imu_update_time_sow", "imu_consumed", "imu_consumed_time_unix_s",
+    "imu_consumed_time_sow",
 )
 _INITIALIZATION_INPUT_APPEND_FIELDS = tuple(dict.fromkeys(
     field for field in _INITIALIZATION_INPUT_APPEND_FIELDS
@@ -345,6 +376,57 @@ def _initialization_input_scalar(value):
     return result if np.isfinite(result) else None
 
 
+def _initialization_input_imu_row(value):
+    """Serialize one untouched IMU input row for the opt-in audit.
+
+    Rate and increment payloads are kept distinct.  A missing row is returned
+    as ``None`` instead of being reconstructed from another timestamp or from
+    a converted rate, so the trace cannot imply an input that was not present.
+    """
+    if value is None:
+        return None
+    try:
+        timestamp = _initialization_input_scalar(value.timestamp)
+        week = int(value.week)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if timestamp is None:
+        return None
+    row = {
+        "timestamp_unix_s": timestamp,
+        "week": week,
+        "sow": None,
+        "form": None,
+        "dt_s": None,
+        "gyro": None,
+        "accel": None,
+        "dtheta": None,
+        "dvel": None,
+    }
+    try:
+        if value.is_increment():
+            payload = value.increment_view()
+            row.update({
+                "form": "increment",
+                "sow": _initialization_input_scalar(payload.sow),
+                "dt_s": _initialization_input_scalar(payload.dt),
+                "dtheta": _initialization_input_vector(payload.dtheta),
+                "dvel": _initialization_input_vector(payload.dvel),
+            })
+        elif value.is_rate():
+            payload = value.rate_view()
+            row.update({
+                "form": "rate",
+                "gyro": _initialization_input_vector(payload.gyro),
+                "accel": _initialization_input_vector(payload.accel),
+            })
+        else:
+            return None
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return row
+
+
 def _enu_to_ecef(lat: float, lon: float) -> np.ndarray:
     """Build the canonical ENU -> ECEF rotation from the existing NED basis."""
     C_e_n = cal_Ce2n(lat, lon)
@@ -430,7 +512,25 @@ def build_initialization_input_record(*, timestamp: float | None = None,
                                       derived_attitude_units: str | None = None,
                                       velocity_diff_start_sow: float | None = None,
                                       velocity_diff_end_sow: float | None = None,
-                                      velocity_diff_source: str | None = None) -> dict:
+                                      velocity_diff_source: str | None = None,
+                                      velocity_diff_start_position_ecef=None,
+                                      velocity_diff_end_position_ecef=None,
+                                      initialization_gnss_week: int | None = None,
+                                      initialization_gnss_sow: float | None = None,
+                                      rtk_rr_ecef=None,
+                                      rtk_antenna_ecef=None,
+                                      raw_imu_prev=None,
+                                      raw_imu_curr=None,
+                                      body_frame: str | None = None,
+                                      body_order: str | None = None,
+                                      nav_frame: str | None = None,
+                                      nav_order: str | None = None,
+                                      state_time_unix_s: float | None = None,
+                                      state_time_source: str | None = None,
+                                      imu_update_applied: bool | None = None,
+                                      imu_update_time_unix_s: float | None = None,
+                                      imu_consumed: bool | None = None,
+                                      imu_consumed_time_unix_s: float | None = None) -> dict:
     """Build the common, observational initialization-input record.
 
     Raw values retain the convention in which they entered initialization;
@@ -446,6 +546,14 @@ def build_initialization_input_record(*, timestamp: float | None = None,
     raw_lev = _initialization_input_vector(raw_lever)
     derived_vel = _initialization_input_vector(derived_velocity)
     derived_att = _initialization_input_vector(derived_attitude)
+    rtk_rr = _initialization_input_vector(rtk_rr_ecef)
+    rtk_antenna = _initialization_input_vector(rtk_antenna_ecef)
+    diff_start_pos = _initialization_input_vector(
+        velocity_diff_start_position_ecef)
+    diff_end_pos = _initialization_input_vector(
+        velocity_diff_end_position_ecef)
+    imu_prev = _initialization_input_imu_row(raw_imu_prev)
+    imu_curr = _initialization_input_imu_row(raw_imu_curr)
     position_frame = str(position_frame or "").strip().upper() or None
     velocity_frame = str(velocity_frame or "").strip().upper() or None
     attitude_frame = str(attitude_frame or "").strip().upper() or None
@@ -538,6 +646,15 @@ def build_initialization_input_record(*, timestamp: float | None = None,
             np.asarray(actual_pos) + np.asarray(actual_C) @ np.asarray(lever_frd)
         ).tolist()
     exact_sow = _initialization_input_scalar(source_sow)
+    init_sow = _initialization_input_scalar(
+        exact_sow if initialization_gnss_sow is None
+        else initialization_gnss_sow)
+    init_week = None
+    if initialization_gnss_week is not None:
+        try:
+            init_week = int(initialization_gnss_week)
+        except (TypeError, ValueError):
+            init_week = None
     diff_start_sow = _initialization_input_scalar(velocity_diff_start_sow)
     diff_end_sow = _initialization_input_scalar(velocity_diff_end_sow)
     diff_dt = (None if diff_start_sow is None or diff_end_sow is None
@@ -550,6 +667,35 @@ def build_initialization_input_record(*, timestamp: float | None = None,
             week = int(week)
             state_sow = float(state_sow)
         except Exception:
+            pass
+    if init_week is None and init_sow is not None:
+        # A source SOW without a source week is not enough to manufacture a
+        # week.  Preserve the existing timestamp-derived week only as a
+        # state-time convenience, while the explicit initialization fields
+        # remain unavailable.
+        init_week = None
+    state_time = _initialization_input_scalar(
+        timestamp if state_time_unix_s is None else state_time_unix_s)
+    state_time_sow = None
+    if state_time is not None:
+        try:
+            _state_week, state_time_sow = unix_to_gpst(state_time)
+            state_time_sow = float(state_time_sow)
+        except (TypeError, ValueError, OverflowError):
+            state_time_sow = None
+    update_time = _initialization_input_scalar(imu_update_time_unix_s)
+    consumed_time = _initialization_input_scalar(imu_consumed_time_unix_s)
+    update_time_sow = consumed_time_sow = None
+    for value, name in ((update_time, "update"), (consumed_time, "consumed")):
+        if value is None:
+            continue
+        try:
+            _week, sow = unix_to_gpst(value)
+            if name == "update":
+                update_time_sow = float(sow)
+            else:
+                consumed_time_sow = float(sow)
+        except (TypeError, ValueError, OverflowError):
             pass
 
     position_definition = {
@@ -677,6 +823,43 @@ def build_initialization_input_record(*, timestamp: float | None = None,
         "converted_velocity_definition": "ECEF velocity in [x,y,z] m/s",
         "converted_attitude_definition": "C_b^e body/FRD to ECEF",
         "converted_quaternion_definition": "[w,x,y,z] equivalent to converted C_b_e",
+        "initialization_gnss_week": init_week,
+        "initialization_gnss_sow": init_sow,
+        "initialization_gnss_time_available": (
+            init_week is not None and init_sow is not None),
+        "initialization_gnss_time_source": (
+            "explicit_initialization_source" if
+            initialization_gnss_week is not None or
+            initialization_gnss_sow is not None else
+            "source_sow_only_week_unavailable" if exact_sow is not None else
+            "unavailable"),
+        "rtk_rr_ecef_available": rtk_rr is not None,
+        "rtk_rr_ecef": rtk_rr,
+        "rtk_antenna_ecef_available": rtk_antenna is not None,
+        "rtk_antenna_ecef": rtk_antenna,
+        "velocity_diff_start_position_ecef": diff_start_pos,
+        "velocity_diff_end_position_ecef": diff_end_pos,
+        "raw_imu_prev_available": imu_prev is not None,
+        "raw_imu_prev_status": "available" if imu_prev is not None else "unavailable",
+        "raw_imu_prev": imu_prev,
+        "raw_imu_curr_available": imu_curr is not None,
+        "raw_imu_curr_status": "available" if imu_curr is not None else "unavailable",
+        "raw_imu_curr": imu_curr,
+        "body_frame": body_frame,
+        "body_order": body_order,
+        "nav_frame": nav_frame,
+        "nav_order": nav_order,
+        "state_time_unix_s": state_time,
+        "state_time_sow": state_time_sow,
+        "state_time_source": (state_time_source or
+                               ("state.timestamp" if state_time is not None
+                                else "unavailable")),
+        "imu_update_applied": imu_update_applied,
+        "imu_update_time_unix_s": update_time,
+        "imu_update_time_sow": update_time_sow,
+        "imu_consumed": imu_consumed,
+        "imu_consumed_time_unix_s": consumed_time,
+        "imu_consumed_time_sow": consumed_time_sow,
     }
     # Flat aliases make the row joinable with the existing GREAT stage trace.
     for prefix, value in (("raw_position", raw_pos),
@@ -776,6 +959,16 @@ def build_initialization_input_record(*, timestamp: float | None = None,
                           ("derived_attitude", derived_att)):
         for index, name in enumerate(("x", "y", "z")):
             record[f"{prefix}_{name}"] = _component(value, index)
+    for prefix, value in (("rtk_rr_ecef", rtk_rr),
+                          ("rtk_antenna_ecef", rtk_antenna)):
+        for index, name in enumerate(("x", "y", "z")):
+            record[f"{prefix}_{name}"] = _component(value, index)
+    for prefix, value in (("velocity_diff_start_position_ecef", diff_start_pos),
+                          ("velocity_diff_end_position_ecef", diff_end_pos)):
+        for index in range(3):
+            record[f"{prefix}_{index}"] = _component(value, index)
+        for index, name in enumerate(("x", "y", "z")):
+            record[f"{prefix}_{name}"] = _component(value, index)
     record["raw_attitude_roll"] = _component(raw_att, 0)
     record["raw_attitude_pitch"] = _component(raw_att, 1)
     record["raw_attitude_yaw"] = _component(raw_att, 2)
@@ -784,6 +977,15 @@ def build_initialization_input_record(*, timestamp: float | None = None,
     record["derived_attitude_yaw"] = _component(derived_att, 2)
     for index, item in enumerate(lever_frd or (None, None, None)):
         record[f"lever_frd_{index}"] = item
+    for prefix, value in (("raw_imu_prev", imu_prev),
+                          ("raw_imu_curr", imu_curr)):
+        for field in ("timestamp_unix_s", "week", "sow", "form", "dt_s"):
+            record[f"{prefix}_{field}"] = (
+                None if value is None else value.get(field))
+        for name in ("gyro", "accel", "dtheta", "dvel"):
+            vector = None if value is None else value.get(name)
+            for index, axis in enumerate(("x", "y", "z")):
+                record[f"{prefix}_{name}_{axis}"] = _component(vector, index)
     return record
 
 

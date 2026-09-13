@@ -361,12 +361,28 @@ class TcIntegration:
 
     def _emit_initialization_input_trace(self, state, *, source_sow=None,
                                          raw_position=None,
+                                         rtk_rr_ecef=None,
+                                         rtk_antenna_ecef=None,
                                          raw_velocity=None,
                                          raw_attitude=None,
                                          derived_velocity=None,
                                          derived_attitude=None,
+                                         velocity_diff_start_position_ecef=None,
+                                         velocity_diff_end_position_ecef=None,
                                          velocity_diff_start_sow=None,
-                                         velocity_diff_end_sow=None) -> None:
+                                         velocity_diff_end_sow=None,
+                                         initialization_gnss_week=None,
+                                         initialization_gnss_sow=None,
+                                         raw_imu_prev=None,
+                                         raw_imu_curr=None,
+                                         body_frame=None, body_order=None,
+                                         nav_frame=None, nav_order=None,
+                                         state_time_unix_s=None,
+                                         state_time_source=None,
+                                         imu_update_applied=None,
+                                         imu_update_time_unix_s=None,
+                                         imu_consumed=None,
+                                         imu_consumed_time_unix_s=None) -> None:
         """Emit the raw-to-canonical initialization handoff, if requested."""
         sink = self._initialization_input_trace_sink
         if sink is None:
@@ -377,12 +393,22 @@ class TcIntegration:
                 build_initialization_input_record(
                     timestamp=getattr(state, "timestamp", None),
                     source_sow=source_sow,
+                    initialization_gnss_week=initialization_gnss_week,
+                    initialization_gnss_sow=initialization_gnss_sow,
                     raw_position=raw_position,
+                    rtk_rr_ecef=rtk_rr_ecef,
+                    rtk_antenna_ecef=rtk_antenna_ecef,
                     raw_velocity=raw_velocity,
                     raw_attitude=raw_attitude,
                     derived_velocity=derived_velocity,
                     derived_attitude=derived_attitude,
+                    velocity_diff_start_position_ecef=(
+                        velocity_diff_start_position_ecef),
+                    velocity_diff_end_position_ecef=(
+                        velocity_diff_end_position_ecef),
                     raw_lever=ins_cfg.get("leverarm"),
+                    raw_imu_prev=raw_imu_prev,
+                    raw_imu_curr=raw_imu_curr,
                     state=state,
                     position_frame="ECEF",
                     position_order="x,y,z",
@@ -393,6 +419,10 @@ class TcIntegration:
                     attitude_frame="NED",
                     attitude_order="roll,pitch,yaw",
                     attitude_units="rad",
+                    body_frame=body_frame,
+                    body_order=body_order,
+                    nav_frame=nav_frame,
+                    nav_order=nav_order,
                     lever_frame="FRD",
                     lever_order="front,right,down",
                     lever_units="m",
@@ -433,6 +463,12 @@ class TcIntegration:
                     velocity_diff_start_sow=velocity_diff_start_sow,
                     velocity_diff_end_sow=velocity_diff_end_sow,
                     velocity_diff_source="gnss_position_difference",
+                    state_time_unix_s=state_time_unix_s,
+                    state_time_source=state_time_source,
+                    imu_update_applied=imu_update_applied,
+                    imu_update_time_unix_s=imu_update_time_unix_s,
+                    imu_consumed=imu_consumed,
+                    imu_consumed_time_unix_s=imu_consumed_time_unix_s,
                 )
             )
         except Exception as exc:
@@ -846,6 +882,42 @@ class TcIntegration:
         return float(sow)
 
     @staticmethod
+    def _explicit_gnss_week(obsr) -> int | None:
+        """Return the source GNSS week, or null when the source lacks it."""
+        source_time = getattr(obsr, "t", None)
+        if source_time is None:
+            return None
+        try:
+            from src.core.gnss.rtklib.rtkcmn import time2gpst
+
+            week, _sow = time2gpst(source_time)
+            return int(week)
+        except (AttributeError, TypeError, ValueError, OverflowError, ImportError):
+            return None
+
+    def _initialization_imu_bracket(self, target_timestamp: float):
+        """Find buffered raw IMU rows bracketing the init source epoch.
+
+        This helper is used only by the opt-in initialization trace.  It does
+        not interpolate, convert, or consume samples; unavailable sides stay
+        ``None`` so the trace cannot claim a synthetic input row.
+        """
+        valid = []
+        for imu in self._init_imu:
+            try:
+                if np.isfinite(float(imu.timestamp)):
+                    valid.append(imu)
+            except (AttributeError, TypeError, ValueError):
+                continue
+        if not valid:
+            return None, None
+        previous = [imu for imu in valid if imu.timestamp <= target_timestamp]
+        current = [imu for imu in valid if imu.timestamp >= target_timestamp]
+        prev = max(previous, key=lambda imu: imu.timestamp) if previous else None
+        curr = min(current, key=lambda imu: imu.timestamp) if current else None
+        return prev, curr
+
+    @staticmethod
     def _explicit_gnss_sow(obsr) -> float | None:
         """Return SOW from the GNSS source epoch, never Unix-time fallback.
 
@@ -1172,6 +1244,14 @@ class TcIntegration:
         # 首尾位置差分计算速度矢量 (5 秒窗口)
         vel_e = (pos_last - pos_first) / span
 
+        # Keep the exact buffered source rows used to bracket the initialization
+        # epoch in the opt-in trace.  This is observational metadata only; the
+        # initializer has never consumed these rows as a mechanization update.
+        if self._initialization_input_trace_sink is not None:
+            raw_imu_prev, raw_imu_curr = self._initialization_imu_bracket(t_gnss)
+        else:
+            raw_imu_prev, raw_imu_curr = None, None
+
         # 平面速度 (EN) 检查
         lat, lon, _ = ecef2llh(pos_last)
         C_e_n = cal_Ce2n(lat, lon)
@@ -1221,15 +1301,39 @@ class TcIntegration:
         self._last_ns = ns
         self._last_gnss_t = init_state.timestamp
 
-        self._emit_initialization_input_trace(
-            init_state,
-            source_sow=self._explicit_gnss_sow(obsr),
-            raw_position=pos_for_state,
-            derived_velocity=vel_e,
-            derived_attitude=att_rpy,
-            velocity_diff_start_sow=velocity_diff_start_sow,
-            velocity_diff_end_sow=velocity_diff_end_sow,
-        )
+        if self._initialization_input_trace_sink is not None:
+            self._emit_initialization_input_trace(
+                init_state,
+                source_sow=self._explicit_gnss_sow(obsr),
+                raw_position=pos_for_state,
+                rtk_rr_ecef=rtk_rr,
+                # RTKLIB's ``Sol.rr`` is the rover antenna ECEF solution.
+                # Keep both semantic labels explicit for cross-implementation
+                # audits; no lever-arm conversion is inferred here.
+                rtk_antenna_ecef=rtk_rr,
+                derived_velocity=vel_e,
+                derived_attitude=att_rpy,
+                velocity_diff_start_position_ecef=pos_first,
+                velocity_diff_end_position_ecef=pos_last,
+                velocity_diff_start_sow=velocity_diff_start_sow,
+                velocity_diff_end_sow=velocity_diff_end_sow,
+                initialization_gnss_week=self._explicit_gnss_week(obsr),
+                initialization_gnss_sow=self._explicit_gnss_sow(obsr),
+                raw_imu_prev=raw_imu_prev,
+                raw_imu_curr=raw_imu_curr,
+                body_frame="FRD",
+                body_order="front,right,down",
+                nav_frame="NED",
+                nav_order="north,east,down",
+                state_time_unix_s=init_state.timestamp,
+                state_time_source="initialization_state.timestamp",
+                # Initialization assembles the state from GNSS/PVA and has
+                # not applied or consumed an estimator IMU update at this row.
+                imu_update_applied=False,
+                imu_update_time_unix_s=None,
+                imu_consumed=False,
+                imu_consumed_time_unix_s=None,
+            )
 
         # Initialization is GNSS-assisted in this pipeline.  The optional
         # propagation audit starts a deep-copied, GNSS-free mechanization fork
