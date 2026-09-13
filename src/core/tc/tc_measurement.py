@@ -434,12 +434,6 @@ class _DdBase(TcMeasurement):
         self.use_code = True
         # 用于决定 ref sat 的 sig_n0 (与 rtklib ddres 一致)
         self._sig_n0 = float(config.get("gnss", {}).get("sig_n0", 30.0))
-        tc = config.get("tc", {}) if isinstance(config, Mapping) else {}
-        if trace_sink is None:
-            trace_sink = tc.get("measurement_trace_sink", tc.get("trace_sink"))
-        if trace_callback is None:
-            trace_callback = tc.get(
-                "measurement_trace_callback", tc.get("trace_callback"))
         self._measurement_trace = trace_from(
             sink=trace_sink, callback=trace_callback)
         self._trace_epoch = 0

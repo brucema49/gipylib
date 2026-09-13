@@ -75,10 +75,12 @@ class TcIntegration:
       - 运动: NHC (需非剧烈转弯)
     """
 
-    def __init__(self, config: dict, mode: str = "spp", output_callback=None):
+    def __init__(self, config: dict, mode: str = "spp", output_callback=None,
+                 measurement_trace_sink=None):
         self._cfg = config
         self._mode = mode
         self._output_callback = output_callback
+        self._measurement_trace_sink = measurement_trace_sink
         self._initializer = InsInitializer(config)
         ins_cfg = config.get("ins", {})
         # 初始化模式选择 (与 LcStream 一致)
@@ -191,6 +193,13 @@ class TcIntegration:
 
     def set_writer(self, writer) -> None:
         self._writer = writer
+
+    def _build_measurement_builder(self):
+        """Create the selected builder with the optional RTK trace sink."""
+        builder_cls = _MEAS_BUILDERS.get(self._mode, SppTcMeas)
+        if self._mode == "rtk" and self._measurement_trace_sink is not None:
+            return builder_cls(self._cfg, trace_sink=self._measurement_trace_sink)
+        return builder_cls(self._cfg)
 
     def close(self) -> None:
         """Close optional diagnostic output without affecting the filter."""
@@ -750,8 +759,7 @@ class TcIntegration:
 
         # 创建估计器 + 量测构造器
         self._est = TcEstimator(init_state, init_P, self._cfg, self._mode)
-        builder_cls = _MEAS_BUILDERS.get(self._mode, SppTcMeas)
-        self._meas_builder = builder_cls(self._cfg)
+        self._meas_builder = self._build_measurement_builder()
         # 用 SPP 钟差初始化 direct clk estimate (加速收敛, 否则需 150s+ 收敛)
         si = self._est.si
         if si.clk_bias >= 0 and len(x_spp) >= 6:
@@ -1407,8 +1415,7 @@ class TcIntegration:
         self._degrade._rebooted = False
 
         # 重置量测构造器到初始模式
-        builder_cls = _MEAS_BUILDERS.get(self._mode, SppTcMeas)
-        self._meas_builder = builder_cls(self._cfg)
+        self._meas_builder = self._build_measurement_builder()
 
         # 重置模糊度管理器
         self._ambiguity.reset()

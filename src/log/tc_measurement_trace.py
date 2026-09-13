@@ -179,15 +179,16 @@ class TcMeasurementTraceWriter:
 
     def close(self) -> None:
         fp = self._fp
-        self._fp = None
-        self._csv_writer = None
-        self._csv_fields = None
         if fp is None:
             return
         try:
             fp.close()
         except Exception as exc:
             self._disable(exc, "close")
+        else:
+            self._fp = None
+            self._csv_writer = None
+            self._csv_fields = None
 
     @classmethod
     def _record(cls, record: dict) -> dict:

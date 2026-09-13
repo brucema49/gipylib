@@ -15,6 +15,7 @@ SUPPORTED_RB_FORMATS = {"xyz", "llh"}
 SUPPORTED_POS_FORMATS = {"llh", "xyz"}
 SUPPORTED_TIME_FORMATS = {"gpst", "datetime"}
 SUPPORTED_TRACE_LEVELS = {0, 1, 2, 3}
+SUPPORTED_MEASUREMENT_TRACE_FORMATS = {"jsonl", "csv"}
 
 _WGS84_A = 6378137.0
 _WGS84_F = 1 / 298.257223563
@@ -94,6 +95,33 @@ def _validate_output(output_cfg: dict) -> None:
         )
 
 
+def _validate_measurement_trace(tc_cfg: dict) -> None:
+    """Normalize the opt-in TC measurement graph trace configuration."""
+    trace_cfg = tc_cfg.setdefault("measurement_trace", {})
+    if trace_cfg is None:
+        trace_cfg = {}
+        tc_cfg["measurement_trace"] = trace_cfg
+    if not isinstance(trace_cfg, dict):
+        raise ValueError("tc.measurement_trace must be a mapping")
+
+    trace_cfg["enabled"] = _parse_bool(
+        trace_cfg.get("enabled", False), "tc.measurement_trace.enabled")
+    fmt = str(trace_cfg.get("format", "jsonl")).strip().lower()
+    if fmt not in SUPPORTED_MEASUREMENT_TRACE_FORMATS:
+        raise ValueError(
+            "tc.measurement_trace.format must be one of "
+            f"{SUPPORTED_MEASUREMENT_TRACE_FORMATS}, got '{fmt}'"
+        )
+    trace_cfg["format"] = fmt
+    default_name = f"tc-measurement-trace.{fmt}"
+    filename = str(trace_cfg.get("filename", default_name))
+    if (not filename or filename in (".", "..") or
+            Path(filename).name != filename or "/" in filename or
+            "\\" in filename or Path(filename).is_absolute()):
+        raise ValueError("tc.measurement_trace.filename must be a basename")
+    trace_cfg["filename"] = filename
+
+
 def load_config(path) -> dict:
     """加载 YAML 配置并做必要校验。
 
@@ -154,6 +182,10 @@ def load_config(path) -> dict:
     # output 段格式校验
     output_cfg = cfg.setdefault("output", {})
     _validate_output(output_cfg)
+    tc_cfg = cfg.setdefault("tc", {})
+    if not isinstance(tc_cfg, dict):
+        raise ValueError("tc must be a mapping")
+    _validate_measurement_trace(tc_cfg)
 
     # ``imu_data_form`` 描述传感器文件的数值语义，``rate_to_increment`` 描述
     # 是否在机械编排边界把 rate 一次性转成增量。``imu_data_process_form`` 是
