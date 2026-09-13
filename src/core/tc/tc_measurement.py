@@ -16,6 +16,7 @@
 """
 import math
 from copy import copy
+from collections.abc import Mapping
 import numpy as np
 
 from src.core.data_types import InsState
@@ -31,6 +32,7 @@ from src.core.gnss.rtklib.rtkpos import (
     zdres, selsat, ddcov, IB, udbias, varerr as rtk_varerr,
 )
 from src.core.gnss.rtklib import rCST
+from src.log.tc_measurement_trace import trace_from
 
 
 # Same alpha=0.001 critical values used by ignav's rtkcmn::chisqr.
@@ -361,6 +363,59 @@ def _sys_gnss(sat):
     return sys
 
 
+_TRACE_SYSTEM_NAMES = {
+    uGNSS.GPS: "G",
+    uGNSS.GLO: "R",
+    uGNSS.GAL: "E",
+    uGNSS.BDS: "C",
+    uGNSS.QZS: "J",
+    uGNSS.SBS: "S",
+}
+
+
+def _trace_system_name(system):
+    """Return the compact constellation name used by observation traces."""
+    return _TRACE_SYSTEM_NAMES.get(system, str(system))
+
+
+def _trace_observation_time(obs):
+    """Read an observation timestamp without requiring a concrete Obs type."""
+    timestamp = getattr(obs, "timestamp", None)
+    if timestamp is not None:
+        return float(timestamp)
+    t = getattr(obs, "t", None)
+    if t is None:
+        return 0.0
+    return float(getattr(t, "time", 0.0)) + float(getattr(t, "sec", 0.0))
+
+
+def _trace_mapping_metadata(*observations):
+    """Return optional mapping identity exposed by an observation payload."""
+    values = {"mapping_hash": None, "mapping_owner": None}
+    for observation in observations:
+        if observation is None:
+            continue
+        sources = [observation, getattr(observation, "mapping_trace", None)]
+        metadata = getattr(observation, "metadata", None)
+        if isinstance(metadata, Mapping):
+            sources.append(metadata)
+        for source in sources:
+            if source is None:
+                continue
+            for field in values:
+                if values[field] is not None:
+                    continue
+                if isinstance(source, Mapping):
+                    value = source.get(field)
+                else:
+                    value = getattr(source, field, None)
+                if value is not None:
+                    values[field] = str(value)
+        if values["mapping_hash"] is not None and values["mapping_owner"] is not None:
+            break
+    return values
+
+
 class _DdBase(TcMeasurement):
     """RTK/RTD 双差量测共用骨架。
 
@@ -371,13 +426,104 @@ class _DdBase(TcMeasurement):
       - 维护 ambiguity 槽位 (RTK 才有)
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, *, trace_sink=None, trace_callback=None):
+        config = config or {}
         gnss = config.get("gnss", {}) if config else {}
         self.elmin = math.radians(gnss.get("elmin", 15.0))
         self.use_phase = True     # RTK=True, RTD=False
         self.use_code = True
         # 用于决定 ref sat 的 sig_n0 (与 rtklib ddres 一致)
         self._sig_n0 = float(config.get("gnss", {}).get("sig_n0", 30.0))
+        tc = config.get("tc", {}) if isinstance(config, Mapping) else {}
+        if trace_sink is None:
+            trace_sink = tc.get("measurement_trace_sink", tc.get("trace_sink"))
+        if trace_callback is None:
+            trace_callback = tc.get(
+                "measurement_trace_callback", tc.get("trace_callback"))
+        self._measurement_trace = trace_from(
+            sink=trace_sink, callback=trace_callback)
+        self._trace_epoch = 0
+        self._active_trace_context = None
+
+    def _trace_begin(self, obsr, obsb, nav):
+        """Create a trace context only when an explicit sink is enabled."""
+        if self._measurement_trace is None:
+            return None
+        metadata = _trace_mapping_metadata(obsr, obsb, nav)
+        systems = [_trace_system_name(system) for system in nav.gnss_t]
+        context = {
+            "epoch": self._trace_epoch,
+            "time": _trace_observation_time(obsr),
+            "mapping_hash": metadata["mapping_hash"],
+            "mapping_owner": metadata["mapping_owner"],
+            "constellation": systems,
+            "candidate_sats": {system: [] for system in systems},
+            "exclusion_reasons": [],
+            "_selected_ref_sats": {system: [] for system in systems},
+            "dd_keys": [],
+            "n_code": 0,
+            "n_phase": 0,
+            "float_state_counter": 0,
+            "ar_call_counter": 0,
+        }
+        self._trace_epoch += 1
+        return context
+
+    @staticmethod
+    def _trace_candidates(context, sat, nav):
+        """Snapshot the common-view candidates before slot filtering."""
+        if context is None:
+            return
+        for system in nav.gnss_t:
+            name = _trace_system_name(system)
+            idx = _DdBase._sys_idx(sat, system)
+            context["candidate_sats"][name] = [int(sat[i]) for i in idx]
+
+    @staticmethod
+    def _trace_exclusion(context, sat, system, index, slot, kind, reason):
+        if context is None:
+            return
+        context["exclusion_reasons"].append({
+            "sat": int(sat[index]),
+            "constellation": _trace_system_name(system),
+            "slot": int(slot),
+            "kind": kind,
+            "reason": reason,
+        })
+
+    def _trace_finish(self, context, v, H, nav, si, amb_init_target=None):
+        """Complete and emit one immutable epoch-level summary."""
+        if context is None:
+            return
+        selected = context.pop("_selected_ref_sats")
+        references = {}
+        for system, refs in selected.items():
+            if refs:
+                # The normal nf=2 path selects one highest-elevation reference
+                # for every slot.  Preserve a scalar for that common case and
+                # retain per-slot values if data quality requires divergence.
+                references[system] = refs[0] if all(ref == refs[0] for ref in refs) else refs
+        context["reference_sats"] = references
+        context["selected_ref_sats"] = selected
+        context["n_total"] = int(len(v))
+        context["residual"] = {
+            "shape": list(np.asarray(v).shape),
+            "rank": 0 if len(v) == 0 else 1,
+            "norm": float(np.linalg.norm(v)) if len(v) else 0.0,
+        }
+        context["jacobian"] = {
+            "shape": list(np.asarray(H).shape),
+            "rank": int(np.linalg.matrix_rank(H)) if H.size else 0,
+        }
+        # Keep these aliases convenient for line-oriented consumers.
+        context["residual_shape"] = context["residual"]["shape"]
+        context["jacobian_shape"] = context["jacobian"]["shape"]
+        context["jacobian_rank"] = context["jacobian"]["rank"]
+        if amb_init_target is not None:
+            context["float_state_counter"] = int(
+                getattr(amb_init_target, "_meas_count", 0))
+        context["ar_call_counter"] = int(getattr(nav, "nb_ar", 0))
+        self._measurement_trace.emit(context)
 
     # ---- 子类重写 ----
     def _amb_idx(self, sat, freq, si):
@@ -403,7 +549,8 @@ class _DdBase(TcMeasurement):
                 return i
         return i_el[0]  # 全 reset 时用最高
 
-    def _build_dd(self, nav, x, P, yr, er, yu, eu, sat, el, dt, obsr, si, state):
+    def _build_dd(self, nav, x, P, yr, er, yu, eu, sat, el, dt, obsr, si, state,
+                  trace_context=None):
         """构造双差 v / H / R (H 为 [m, si.dim])。
 
         与 rtklib ddres 数学等价, 但:
@@ -411,6 +558,8 @@ class _DdBase(TcMeasurement):
           - 位置列重映射到 si.pos
           - ambiguity 列重映射到 si.amb_idx(sat, freq) (RTK) 或忽略 (RTD)
         """
+        if trace_context is None:
+            trace_context = self._active_trace_context
         _c = rCST.CLIGHT
         nf = nav.nf
         ns = len(el)
@@ -422,6 +571,7 @@ class _DdBase(TcMeasurement):
         n_code_att = n_code_acc = n_code_rej = 0
         P_diag = np.diag(P) if P is not None else None
         sig_n0_sq = self._sig_n0 ** 2
+        self._trace_candidates(trace_context, sat, nav)
 
         # 用于 amb 索引: 当 si.amb_idx 返回 -1 (RTD) 时跳过 ambiguity 列
         for sys in nav.gnss_t:
@@ -429,11 +579,18 @@ class _DdBase(TcMeasurement):
             for f in frequencies:
                 frq = f % nf
                 code = 1 if f >= nf else 0
+                kind = "code" if code else "phase"
                 # 该 sys 内的 sat 索引
-                idx = self._sys_idx(sat, sys)
+                all_idx = self._sys_idx(sat, sys)
+                idx = all_idx
                 # 同时要求 yr/yu 非零 (有 base+rover 残差)
                 nozero = np.where((yr[:, f] != 0) & (yu[:, f] != 0))[0]
                 idx = np.intersect1d(idx, nozero)
+                if trace_context is not None:
+                    for missing in np.setdiff1d(all_idx, idx):
+                        self._trace_exclusion(
+                            trace_context, sat, sys, missing, frq, kind,
+                            "missing_observation")
                 if len(idx) == 0:
                     continue
                 # 选参考卫星 (最高仰角, 非刚 reset)
@@ -444,6 +601,11 @@ class _DdBase(TcMeasurement):
                 else:
                     i_el = idx[np.argsort(el[idx])]
                     ref_i = i_el[-1]
+                self._trace_exclusion(
+                    trace_context, sat, sys, ref_i, frq, kind, "reference")
+                if trace_context is not None:
+                    trace_context["_selected_ref_sats"][
+                        _trace_system_name(sys)].append(int(sat[ref_i]))
                 freqi = sat2freq(sat[ref_i], frq, nav)
                 lami = _c / freqi
                 block_count = 0
@@ -507,6 +669,8 @@ class _DdBase(TcMeasurement):
                             n_code_rej += 1
                         else:
                             n_phase_rej += 1
+                        self._trace_exclusion(
+                            trace_context, sat, sys, j, frq, kind, "outlier")
                         continue
                     # 单差方差
                     si_idx = sat[ref_i] - 1
@@ -532,6 +696,14 @@ class _DdBase(TcMeasurement):
                     Ri_list.append(Ri)
                     Rj_list.append(Rj)
                     used_pairs.append((int(sat[ref_i]), int(sat[j]), frq, code))
+                    if trace_context is not None:
+                        trace_context["dd_keys"].append({
+                            "ref": int(sat[ref_i]),
+                            "target": int(sat[j]),
+                            "slot": int(frq),
+                            "kind": kind,
+                        })
+                        trace_context["n_code" if code else "n_phase"] += 1
                     block_count += 1
                 if block_count > 0:
                     nb_per_block.append(block_count)
@@ -579,8 +751,9 @@ class RtkTcMeas(_DdBase):
     v[k] = (yu[i,f]-yr[i,f]) - (yu[j,f]-yr[j,f])                       (code)
     """
 
-    def __init__(self, config: dict):
-        super().__init__(config)
+    def __init__(self, config: dict, *, trace_sink=None, trace_callback=None):
+        super().__init__(config, trace_sink=trace_sink,
+                         trace_callback=trace_callback)
         self.use_phase = True
         self.use_code = True
 
@@ -601,8 +774,12 @@ class RtkTcMeas(_DdBase):
         previous_obs_t: 上一 GNSS 历元时刻 (``gtime_t``), 供 ``udbias``
         计算历元间隔 (随机游走步长 + 失锁计时)。
         """
+        trace_context = self._trace_begin(obsr, obsb, nav)
         if obsb is None:
-            return np.array([]), np.zeros((0, si.dim)), np.zeros((0, 0)), {}
+            v = np.array([])
+            H = np.zeros((0, si.dim))
+            self._trace_finish(trace_context, v, H, nav, si)
+            return v, H, np.zeros((0, 0)), {}
         # 1. 卫星位置 / 钟差
         rs, var, dts, svh = satposs(obsr, nav)
         rsb, varb, dtsb, svhb = satposs(obsb, nav)
@@ -623,7 +800,10 @@ class RtkTcMeas(_DdBase):
             # common satellite.  Save LLI history and clear that mask before
             # the next epoch can regain common observations.
             save_tc_phase_state(nav, obsb, obsr, iu, ir)
-            return np.array([]), np.zeros((0, si.dim)), np.zeros((0, 0)), {}
+            v = np.array([])
+            H = np.zeros((0, si.dim))
+            self._trace_finish(trace_context, v, H, nav, si)
+            return v, H, np.zeros((0, 0)), {}
         # 4. rover zdres (使用 INS 天线位置)
         rr = state.pos_e + state.C_b_e @ state.leverarm
         yu, eu, azel = zdres(nav, obsr, rs, dts, svh, var, rr, 1)
@@ -652,13 +832,22 @@ class RtkTcMeas(_DdBase):
             x = amb_init_target.effective_x()
         # P 用于 ref sat 选择 (选择非刚 reset 的卫星作参考)
         # 9. 构造双差
-        v, H, R, info = self._build_dd(
-            nav, x, P, yr, er, yu, eu, sats, els, dt, obsr, si, state)
+        self._active_trace_context = trace_context
+        try:
+            # Keep the historical call shape intact for diagnostic/test
+            # subclasses that replace _build_dd; the real implementation
+            # reads the active context above.
+            v, H, R, info = self._build_dd(
+                nav, x, P, yr, er, yu, eu, sats, els, dt, obsr, si, state)
+        finally:
+            self._active_trace_context = None
         # 10. 失锁计数重置 + 相位/LLI 状态保存 (与 relpos 尾部一致)
         for f in range(nav.nf):
             ix = np.where(nav.vsat[:, f] > 0)[0]
             nav.outc[ix, f] = 0
         save_tc_phase_state(nav, obsb, obsr, iu, ir)
+        self._trace_finish(trace_context, v, H, nav, si,
+                           amb_init_target=amb_init_target)
         return v, H, R, info
 
 
