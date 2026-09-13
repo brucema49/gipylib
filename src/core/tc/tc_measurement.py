@@ -536,7 +536,7 @@ class _DdBase(TcMeasurement):
                 if not np.all(np.isfinite(H)):
                     raise ValueError("non_finite")
                 jacobian["rank"] = int(np.linalg.matrix_rank(H))
-            except (np.linalg.LinAlgError, TypeError, ValueError) as exc:
+            except Exception as exc:
                 jacobian["rank"] = "unavailable"
                 jacobian["rank_error"] = str(exc)
         context["jacobian"] = jacobian
