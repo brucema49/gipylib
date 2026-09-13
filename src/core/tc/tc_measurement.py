@@ -25,7 +25,7 @@ from src.core.tc.tc_state_index import TcStateIndex
 from src.core.gnss.rtklib.rtkcmn import (geodist, satazel, ecef2pos,
                                           satexclude, ionmodel, tropmodel,
                                           tropmapf, sat2freq, uGNSS,
-                                          sat2prn, timediff)
+                                          sat2prn, sat2id, timediff)
 from src.core.gnss.rtklib.ephemeris import satposs
 from src.core.gnss.rtklib.pntpos import varerr as spp_varerr, prange, gettgd, REL_HUMI
 from src.core.gnss.rtklib.rtkpos import (
@@ -448,13 +448,19 @@ class _DdBase(TcMeasurement):
         context = {
             "epoch": self._trace_epoch,
             "time": _trace_observation_time(obsr),
+            "_obsr": obsr,
+            "_obsb": obsb,
             "mapping_hash": metadata["mapping_hash"],
             "mapping_owner": metadata["mapping_owner"],
             "constellation": systems,
             "candidate_sats": {system: [] for system in systems},
+            "candidate_prns": {system: [] for system in systems},
             "exclusion_reasons": [],
             "_selected_ref_sats": {system: [] for system in systems},
             "dd_keys": [],
+            "dd_rows": [],
+            "_dd_attempt_counter": 0,
+            "_covariance_blocks": [],
             "n_code": 0,
             "n_phase": 0,
             "_code_attempted": 0,
@@ -476,6 +482,7 @@ class _DdBase(TcMeasurement):
             name = _trace_system_name(system)
             idx = _DdBase._sys_idx(sat, system)
             context["candidate_sats"][name] = [int(sat[i]) for i in idx]
+            context["candidate_prns"][name] = [sat2id(int(sat[i])) for i in idx]
 
     @staticmethod
     def _trace_exclusion(context, sat, system, index, slot, kind, reason):
@@ -489,7 +496,89 @@ class _DdBase(TcMeasurement):
             "reason": reason,
         })
 
-    def _trace_finish(self, context, v, H, nav, si, amb_init_target=None):
+    @staticmethod
+    def _trace_h_nonzero(row):
+        """Return a JSON-safe sparse H row without rounding its values."""
+        return {
+            str(index): float(value)
+            for index, value in enumerate(np.asarray(row, dtype=float))
+            if value != 0.0
+        }
+
+    @staticmethod
+    def _trace_raw_signal_fields(obsr, obsb, sat, slot):
+        """Read only explicit upstream raw-signal metadata, never infer it.
+
+        The current Obs object stores decoded slot arrays but not the source
+        RINEX signal identity per satellite.  A future reader may attach a
+        ``raw_signal_by_slot`` mapping; accepting it here keeps the diagnostic
+        schema forward-compatible while preventing legacy ``freq_ix`` values
+        from being mislabeled as raw bands.
+        """
+        for observation in (obsr, obsb):
+            table = getattr(observation, "raw_signal_by_slot", None)
+            if not isinstance(table, Mapping):
+                continue
+            entry = table.get((int(sat), int(slot)))
+            if entry is None:
+                entry = table.get(f"{int(sat)}:{int(slot)}")
+            if not isinstance(entry, Mapping):
+                continue
+            raw_band = entry.get("raw_band")
+            track = entry.get("track")
+            return (
+                None if raw_band is None else int(raw_band),
+                None if track is None else str(track),
+                "available",
+            )
+        return None, None, "unavailable"
+
+    def _trace_dd_row(self, context, *, obsr, obsb, system, ref_sat,
+                      target_sat, slot, kind, observed_minus_geometry,
+                      predicted_state_term, innovation, h_row, status,
+                      row_index=None, covariance_block=None,
+                      covariance_row=None, ref_variance=None,
+                      target_variance=None):
+        """Append one attempted DD row to the observational trace."""
+        if context is None:
+            return
+        raw_band, track, raw_status = self._trace_raw_signal_fields(
+            obsr, obsb, target_sat, slot)
+        row = {
+            "attempt_index": int(context["_dd_attempt_counter"]),
+            "row_index": None if row_index is None else int(row_index),
+            "status": str(status),
+            "system": _trace_system_name(system),
+            "ref_sat": int(ref_sat),
+            "target_sat": int(target_sat),
+            "ref_prn": sat2id(int(ref_sat)),
+            "target_prn": sat2id(int(target_sat)),
+            "slot": int(slot),
+            "kind": str(kind),
+            "raw_band": raw_band,
+            "track": track,
+            "raw_signal_status": raw_status,
+            "dd_observation_minus_geometry": float(observed_minus_geometry),
+            "predicted_state_term": float(predicted_state_term),
+            "innovation": float(innovation),
+            "residual": float(innovation),
+            "h_nonzero": self._trace_h_nonzero(h_row),
+            "h_norm": float(np.linalg.norm(h_row)),
+            "covariance_block": (
+                None if covariance_block is None else int(covariance_block)),
+            "covariance_row": (
+                None if covariance_row is None else int(covariance_row)),
+            "r_ref": None if ref_variance is None else float(ref_variance),
+            "r_target": None if target_variance is None else float(target_variance),
+            "r_diag": (
+                None if ref_variance is None or target_variance is None
+                else float(ref_variance + target_variance)),
+        }
+        context["dd_rows"].append(row)
+        context["_dd_attempt_counter"] += 1
+
+    def _trace_finish(self, context, v, H, nav, si, amb_init_target=None,
+                      R=None):
         """Complete and emit one immutable epoch-level summary."""
         if context is None:
             return
@@ -517,6 +606,30 @@ class _DdBase(TcMeasurement):
             },
         }
         context["n_total"] = int(len(v))
+        matrix_shape = list(np.asarray(R).shape) if R is not None else [
+            int(len(v)), int(len(v))]
+        covariance_rows = [
+            {
+                "row_index": row["row_index"],
+                "block": row["covariance_block"],
+                "block_row": row["covariance_row"],
+                "reference_variance": row["r_ref"],
+                "target_variance": row["r_target"],
+                "diagonal": row["r_diag"],
+            }
+            for row in context["dd_rows"]
+            if row["status"] == "accepted"
+        ]
+        context["covariance"] = {
+            "representation": "dd_shared_reference",
+            "matrix_shape": matrix_shape,
+            "row_count": int(len(v)),
+            "rows": covariance_rows,
+            "blocks": context.pop("_covariance_blocks", []),
+        }
+        context.pop("_dd_attempt_counter", None)
+        context.pop("_obsr", None)
+        context.pop("_obsb", None)
         context["residual"] = {
             "shape": list(np.asarray(v).shape),
             "rank": 0 if len(v) == 0 else 1,
@@ -626,6 +739,8 @@ class _DdBase(TcMeasurement):
                 freqi = sat2freq(sat[ref_i], frq, nav)
                 lami = _c / freqi
                 block_count = 0
+                block_start = len(v_list)
+                covariance_block = len(nb_per_block)
                 for j in idx:
                     if j == ref_i:
                         continue
@@ -640,7 +755,10 @@ class _DdBase(TcMeasurement):
                     # 与 GINav ddres_rtkins / GREAT-MSF gsppflt 一致
                     # rtklib zdres 返回 y = P - rho (observed - predicted),
                     # 故 DD_y = (yu_i - yr_i) - (yu_j - yr_j) 已是 innovation
-                    v_nv = (yu[ref_i, f] - yr[ref_i, f]) - (yu[j, f] - yr[j, f])
+                    dd_observation_minus_geometry = (
+                        (yu[ref_i, f] - yr[ref_i, f])
+                        - (yu[j, f] - yr[j, f]))
+                    v_nv = dd_observation_minus_geometry
                     # H 行: d(rho_i - rho_j)/d(rr) = -e_i + e_j (几何观测方程)
                     # INS 误差状态 ε (pos_true = pos_nominal - ε):
                     #   dh/d(ε) = -dh/d(pos) = e_i - e_j
@@ -695,6 +813,18 @@ class _DdBase(TcMeasurement):
                                 trace_context["_phase_rejected"] += 1
                         self._trace_exclusion(
                             trace_context, sat, sys, j, frq, kind, "outlier")
+                        self._trace_dd_row(
+                            trace_context,
+                            obsr=(trace_context.get("_obsr")
+                                  if trace_context is not None else None),
+                            obsb=(trace_context.get("_obsb")
+                                  if trace_context is not None else None),
+                            system=sys, ref_sat=sat[ref_i], target_sat=sat[j],
+                            slot=frq, kind=kind,
+                            observed_minus_geometry=dd_observation_minus_geometry,
+                            predicted_state_term=(
+                                dd_observation_minus_geometry - v_nv),
+                            innovation=v_nv, h_row=H_row, status="rejected")
                         continue
                     # 单差方差
                     si_idx = sat[ref_i] - 1
@@ -728,9 +858,37 @@ class _DdBase(TcMeasurement):
                             "kind": kind,
                         })
                         trace_context["n_code" if code else "n_phase"] += 1
+                        self._trace_dd_row(
+                            trace_context,
+                            obsr=(trace_context.get("_obsr")
+                                  if trace_context is not None else None),
+                            obsb=(trace_context.get("_obsb")
+                                  if trace_context is not None else None),
+                            system=sys, ref_sat=sat[ref_i], target_sat=sat[j],
+                            slot=frq, kind=kind,
+                            observed_minus_geometry=dd_observation_minus_geometry,
+                            predicted_state_term=(
+                                dd_observation_minus_geometry - v_nv),
+                            innovation=v_nv, h_row=H_row, status="accepted",
+                            row_index=len(v_list) - 1,
+                            covariance_block=covariance_block,
+                            covariance_row=block_count,
+                            ref_variance=Ri, target_variance=Rj)
                     block_count += 1
                 if block_count > 0:
                     nb_per_block.append(block_count)
+                    if trace_context is not None:
+                        trace_context["_covariance_blocks"].append({
+                            "block": int(covariance_block),
+                            "system": _trace_system_name(sys),
+                            "kind": kind,
+                            "slot": int(frq),
+                            "ref_sat": int(sat[ref_i]),
+                            "ref_prn": sat2id(int(sat[ref_i])),
+                            "row_start": int(block_start),
+                            "row_count": int(block_count),
+                            "off_diagonal": "reference_variance",
+                        })
         info = {"pairs": used_pairs, "n": len(v_list),
                 "ref_sats": sorted({p[0] for p in used_pairs}),
                 "n_phase_att": n_phase_att, "n_phase_acc": n_phase_acc,
@@ -802,7 +960,8 @@ class RtkTcMeas(_DdBase):
         if obsb is None:
             v = np.array([])
             H = np.zeros((0, si.dim))
-            self._trace_finish(trace_context, v, H, nav, si)
+            self._trace_finish(
+                trace_context, v, H, nav, si, R=np.zeros((0, 0)))
             return v, H, np.zeros((0, 0)), {}
         # 1. 卫星位置 / 钟差
         rs, var, dts, svh = satposs(obsr, nav)
@@ -826,7 +985,8 @@ class RtkTcMeas(_DdBase):
             save_tc_phase_state(nav, obsb, obsr, iu, ir)
             v = np.array([])
             H = np.zeros((0, si.dim))
-            self._trace_finish(trace_context, v, H, nav, si)
+            self._trace_finish(
+                trace_context, v, H, nav, si, R=np.zeros((0, 0)))
             return v, H, np.zeros((0, 0)), {}
         # 4. rover zdres (使用 INS 天线位置)
         rr = state.pos_e + state.C_b_e @ state.leverarm
@@ -871,7 +1031,7 @@ class RtkTcMeas(_DdBase):
             nav.outc[ix, f] = 0
         save_tc_phase_state(nav, obsb, obsr, iu, ir)
         self._trace_finish(trace_context, v, H, nav, si,
-                           amb_init_target=amb_init_target)
+                           amb_init_target=amb_init_target, R=R)
         return v, H, R, info
 
 
