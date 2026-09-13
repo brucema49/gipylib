@@ -15,7 +15,7 @@
     - GNSS 直接状态: effective_x = stored + x, feedback stored += x (加修正)
 """
 import math
-from copy import copy
+from copy import copy, deepcopy
 from collections.abc import Mapping
 import numpy as np
 
@@ -32,6 +32,7 @@ from src.core.gnss.rtklib.rtkpos import (
     zdres, selsat, ddcov, IB, udbias, varerr as rtk_varerr,
 )
 from src.core.gnss.rtklib import rCST
+from src.core.time_utils import unix_to_gpst
 from src.log.tc_measurement_trace import trace_from
 
 
@@ -445,8 +446,173 @@ class _DdBase(TcMeasurement):
             f"{type(self).__name__}-{type(self)._trace_instance_sequence}")
         self._trace_epoch = 0
         self._active_trace_context = None
+        # The last complete pre-measurement record is retained only while an
+        # explicit trace sink is enabled.  TcIntegration uses it to append a
+        # post-measurement snapshot with the same event identity; it is never
+        # consulted by the measurement builder.
+        self._last_trace_record = None
 
-    def _trace_begin(self, obsr, obsb, nav):
+    @staticmethod
+    def _trace_state_snapshot(state, si=None, x=None, stage=None, P=None):
+        """Return a JSON-safe nominal-state snapshot for stage auditing.
+
+        Values are copied from the already available state/direct-state
+        objects.  Missing optional values are explicitly ``None`` rather than
+        inferred from another convention.  This helper is reached only when
+        tracing is enabled.
+        """
+        def vector(value, size):
+            try:
+                result = np.asarray(value, dtype=float).reshape(-1)
+                if result.size != size or not np.all(np.isfinite(result)):
+                    return None
+                return [float(item) for item in result]
+            except Exception:
+                return None
+
+        def matrix(value):
+            try:
+                result = np.asarray(value, dtype=float)
+                if result.shape != (3, 3) or not np.all(np.isfinite(result)):
+                    return None
+                return [[float(item) for item in row] for row in result]
+            except Exception:
+                return None
+
+        timestamp = None
+        sow = None
+        if state is not None:
+            try:
+                timestamp = float(state.timestamp)
+                if not np.isfinite(timestamp):
+                    timestamp = None
+                if timestamp is not None:
+                    _week, sow = unix_to_gpst(timestamp)
+                    sow = float(sow)
+            except Exception:
+                timestamp = None
+
+        pos = vector(getattr(state, "pos_e", None), 3)
+        vel = vector(getattr(state, "vel_e", None), 3)
+        C_b_e = matrix(getattr(state, "C_b_e", None))
+        q_b_e = vector(getattr(state, "q_b_e", None), 4)
+        att_rpy = vector(getattr(state, "att_rpy", None), 3)
+        lever_body = vector(getattr(state, "leverarm", None), 3)
+        antenna = None
+        if pos is not None and C_b_e is not None and lever_body is not None:
+            try:
+                antenna = [
+                    float(pos[i] + sum(C_b_e[i][j] * lever_body[j]
+                                      for j in range(3)))
+                    for i in range(3)
+                ]
+            except Exception:
+                antenna = None
+
+        clock = {
+            "available": False,
+            "units": "m",
+            "definition": "effective direct clock state = stored + error",
+            "values": None,
+        }
+        if si is not None and x is not None:
+            try:
+                clk0 = int(getattr(si, "clk_bias", -1))
+                values = np.asarray(x, dtype=float).reshape(-1)
+                if clk0 >= 0 and values.size >= clk0 + 4:
+                    clock["available"] = bool(np.all(np.isfinite(values[clk0:clk0 + 4])))
+                    if clock["available"]:
+                        clock["values"] = [float(item) for item in values[clk0:clk0 + 4]]
+            except Exception:
+                pass
+
+        ambiguity = {
+            "available": False,
+            "units": "cycles",
+            "definition": "effective ambiguity state = stored + error; satellite-major slots",
+            "count": 0,
+            "finite_count": 0,
+            "nonzero_count": 0,
+            "min": None,
+            "max": None,
+            "mean": None,
+        }
+        if si is not None and x is not None:
+            try:
+                if bool(si.has_ambiguity()):
+                    start = int(si.amb_start)
+                    count = int(si.n_amb)
+                    values = np.asarray(x, dtype=float).reshape(-1)[start:start + count]
+                    finite = values[np.isfinite(values)]
+                    ambiguity["available"] = True
+                    ambiguity["count"] = count
+                    ambiguity["finite_count"] = int(finite.size)
+                    ambiguity["nonzero_count"] = int(np.count_nonzero(finite))
+                    if finite.size:
+                        ambiguity["min"] = float(np.min(finite))
+                        ambiguity["max"] = float(np.max(finite))
+                        ambiguity["mean"] = float(np.mean(finite))
+            except Exception:
+                pass
+
+        snapshot = {
+            "state_stage": None if stage is None else str(stage),
+            "state_timestamp": timestamp,
+            "state_sow": sow,
+            "ins_pos_ecef": pos,
+            "ins_pos_ecef_x": None if pos is None else pos[0],
+            "ins_pos_ecef_y": None if pos is None else pos[1],
+            "ins_pos_ecef_z": None if pos is None else pos[2],
+            "ins_vel_ecef": vel,
+            "ins_vel_ecef_x": None if vel is None else vel[0],
+            "ins_vel_ecef_y": None if vel is None else vel[1],
+            "ins_vel_ecef_z": None if vel is None else vel[2],
+            "antenna_pos_ecef": antenna,
+            "antenna_pos_ecef_x": None if antenna is None else antenna[0],
+            "antenna_pos_ecef_y": None if antenna is None else antenna[1],
+            "antenna_pos_ecef_z": None if antenna is None else antenna[2],
+            "antenna_definition": "pos_ecef + C_body_to_ecef @ lever_body",
+            "attitude_repr": "C_body_to_ecef",
+            "attitude_C_body_to_ecef": C_b_e,
+            "attitude_q0": None if q_b_e is None else q_b_e[0],
+            "attitude_q1": None if q_b_e is None else q_b_e[1],
+            "attitude_q2": None if q_b_e is None else q_b_e[2],
+            "attitude_q3": None if q_b_e is None else q_b_e[3],
+            "attitude_rpy_rad": att_rpy,
+            "attitude_rpy_units": "rad; C_body_to_ecef is authoritative",
+            "lever_body": lever_body,
+            "lever_frame": "body",
+            "lever_units": "m",
+            "lever_ecef": None if antenna is None or pos is None else [
+                float(antenna[i] - pos[i]) for i in range(3)
+            ],
+            "clock_summary": clock,
+            "ambiguity_summary": ambiguity,
+        }
+        if P is not None:
+            try:
+                covariance = np.asarray(P, dtype=float)
+                diag = np.diag(covariance)
+                finite = diag[np.isfinite(diag)]
+                snapshot["covariance_summary"] = {
+                    "available": bool(finite.size == diag.size),
+                    "dimension": int(covariance.shape[0])
+                    if covariance.ndim == 2 and covariance.shape[0] == covariance.shape[1]
+                    else None,
+                    "diag_min": float(np.min(finite)) if finite.size else None,
+                    "diag_max": float(np.max(finite)) if finite.size else None,
+                    "trace": float(np.trace(covariance))
+                    if covariance.ndim == 2 and covariance.shape[0] == covariance.shape[1]
+                    else None,
+                }
+            except Exception:
+                snapshot["covariance_summary"] = {
+                    "available": False, "dimension": None,
+                    "diag_min": None, "diag_max": None, "trace": None,
+                }
+        return snapshot
+
+    def _trace_begin(self, obsr, obsb, nav, state=None, si=None, x=None):
         """Create a trace context only when an explicit sink is enabled."""
         if self._measurement_trace is None:
             return None
@@ -458,6 +624,13 @@ class _DdBase(TcMeasurement):
             "_obsr": obsr,
             "_obsb": obsb,
             "trace_instance_id": self._trace_instance_id,
+            "trace_event_id": f"{self._trace_instance_id}:{self._trace_epoch}",
+            "stage_schema": "NOMINAL_STATE_STAGE_AUDIT_V1",
+            "stage": "pre_measurement",
+            "state_stage": "pre_measurement",
+            "_pre_state": state,
+            "_pre_si": si,
+            "_pre_x": x,
             "mapping_hash": metadata["mapping_hash"],
             "mapping_owner": metadata["mapping_owner"],
             "constellation": systems,
@@ -541,6 +714,84 @@ class _DdBase(TcMeasurement):
         }
 
     @staticmethod
+    def _trace_set_geometry(context, obsr, obsb, rs, rsb,
+                            rover_ecef, base_ecef):
+        """Attach the pure geometric ranges used by the audit trace.
+
+        ``zdres`` also applies satellite clock, troposphere and antenna
+        corrections.  The fields below intentionally identify only the pure
+        ECEF range term, so a consumer cannot mistake it for the complete
+        computed observation model.
+        """
+        if context is None:
+            return
+        try:
+            rover_positions = {
+                int(sat): np.asarray(rs[index, :3], dtype=float).copy()
+                for index, sat in enumerate(obsr.sat)
+            }
+            base_positions = {
+                int(sat): np.asarray(rsb[index, :3], dtype=float).copy()
+                for index, sat in enumerate(obsb.sat)
+            }
+            context["_geometry"] = {
+                "rover_ecef": np.asarray(rover_ecef, dtype=float).copy(),
+                "base_ecef": np.asarray(base_ecef, dtype=float).copy(),
+                "rover_sat_ecef": rover_positions,
+                "base_sat_ecef": base_positions,
+            }
+        except Exception:
+            # A diagnostic-only decomposition may be unavailable for a custom
+            # test payload; never make the solver depend on it.
+            context["_geometry"] = None
+
+    @staticmethod
+    def _trace_geometry_terms(context, ref_sat, target_sat,
+                              los_ref=None, los_target=None):
+        geometry = context.get("_geometry") if context is not None else None
+        result = {
+            "geometry_dd": None,
+            "sat_ref_ecef": None,
+            "sat_target_ecef": None,
+            "los_ref": None,
+            "los_target": None,
+            "los_dd": None,
+        }
+        for key, value in (("los_ref", los_ref), ("los_target", los_target)):
+            try:
+                item = np.asarray(value, dtype=float).reshape(-1)
+                if item.size == 3 and np.all(np.isfinite(item)):
+                    result[key] = [float(entry) for entry in item]
+            except Exception:
+                pass
+        if result["los_ref"] is not None and result["los_target"] is not None:
+            result["los_dd"] = [
+                float(a - b)
+                for a, b in zip(result["los_ref"], result["los_target"])
+            ]
+        if not isinstance(geometry, Mapping):
+            return result
+        try:
+            rover = np.asarray(geometry["rover_ecef"], dtype=float)
+            base = np.asarray(geometry["base_ecef"], dtype=float)
+            rr = np.asarray(geometry["rover_sat_ecef"][int(ref_sat)], dtype=float)
+            rt = np.asarray(geometry["rover_sat_ecef"][int(target_sat)], dtype=float)
+            br = np.asarray(geometry["base_sat_ecef"][int(ref_sat)], dtype=float)
+            bt = np.asarray(geometry["base_sat_ecef"][int(target_sat)], dtype=float)
+            if any(item.shape != (3,) or not np.all(np.isfinite(item))
+                   for item in (rover, base, rr, rt, br, bt)):
+                return result
+            result["sat_ref_ecef"] = [float(item) for item in rr]
+            result["sat_target_ecef"] = [float(item) for item in rt]
+            result["geometry_dd"] = float(
+                np.linalg.norm(rr - rover) - np.linalg.norm(br - base)
+                - np.linalg.norm(rt - rover) + np.linalg.norm(bt - base)
+            )
+        except Exception:
+            pass
+        return result
+
+    @staticmethod
     def _trace_raw_signal_fields(obsr, obsb, sat, slot, kind=None):
         """Read only explicit upstream raw-signal metadata, never infer it.
 
@@ -615,7 +866,7 @@ class _DdBase(TcMeasurement):
                       predicted_state_term, innovation, h_row, status,
                       row_index=None, covariance_block=None,
                       covariance_row=None, ref_variance=None,
-                      target_variance=None):
+                      target_variance=None, los_ref=None, los_target=None):
         """Append one attempted DD row to the observational trace."""
         if context is None:
             return
@@ -631,6 +882,9 @@ class _DdBase(TcMeasurement):
                  else None)
         both_comparable = bool(
             raw_signal["comparable"] and ref_raw_signal["comparable"])
+        geometry_terms = self._trace_geometry_terms(
+            context, ref_sat, target_sat, los_ref=los_ref,
+            los_target=los_target)
         if both_comparable:
             row_raw_status = "comparable"
         elif (raw_signal["status"] == "unavailable"
@@ -646,6 +900,7 @@ class _DdBase(TcMeasurement):
             "row_index": None if row_index is None else int(row_index),
             "status": str(status),
             "system": _trace_system_name(system),
+            "state_stage": "pre_measurement",
             "ref_sat": int(ref_sat),
             "target_sat": int(target_sat),
             "ref_prn": sat2id(int(ref_sat)),
@@ -677,10 +932,35 @@ class _DdBase(TcMeasurement):
             "raw_signal_comparable": both_comparable,
             "raw_signal_status": row_raw_status,
             "dd_observation_minus_geometry": float(observed_minus_geometry),
+            "observation_minus_computed_model": float(observed_minus_geometry),
+            "observation_minus_geometry_units": "m",
+            "prefit_innovation": float(innovation),
+            "prefit_definition": "l = DD(observation - computed_model) [m]",
+            "postfit_definition": "postfit_residual = l - A*dx [m]",
+            "postfit_residual": None,
+            "geometry_dd": geometry_terms["geometry_dd"],
+            "geometry_units": "m",
+            "geometry_definition": (
+                "rho_rover(ref)-rho_base(ref)-rho_rover(target)+"
+                "rho_base(target); pure ECEF range term, ref-target"
+            ),
+            "sat_ref_ecef": geometry_terms["sat_ref_ecef"],
+            "sat_target_ecef": geometry_terms["sat_target_ecef"],
+            "los_ref": geometry_terms["los_ref"],
+            "los_target": geometry_terms["los_target"],
+            "los_dd": geometry_terms["los_dd"],
+            "linearized_prediction_correction": float(predicted_state_term),
+            "prediction_definition": (
+                "phase: lambda_ref*N_ref-lambda_target*N_target plus "
+                "optional GLO HW term; code: 0 [m]"
+            ),
             "predicted_state_term": float(predicted_state_term),
             "innovation": float(innovation),
             "residual": float(innovation),
             "h_nonzero": self._trace_h_nonzero(h_row),
+            "design_row": self._trace_h_nonzero(h_row),
+            "design_row_definition": "A = d(computed_model)/d(state_error)",
+            "design_row_units": "mixed SI derivatives per state component",
             "h_norm": float(np.linalg.norm(h_row)),
             "covariance_block": (
                 None if covariance_block is None else int(covariance_block)),
@@ -699,7 +979,7 @@ class _DdBase(TcMeasurement):
         context["_dd_attempt_counter"] += 1
 
     def _trace_finish(self, context, v, H, nav, si, amb_init_target=None,
-                      R=None):
+                      R=None, P=None):
         """Complete and emit one immutable epoch-level summary."""
         if context is None:
             return
@@ -788,6 +1068,22 @@ class _DdBase(TcMeasurement):
         context["residual_shape"] = context["residual"]["shape"]
         context["jacobian_shape"] = context["jacobian"]["shape"]
         context["jacobian_rank"] = context["jacobian"]["rank"]
+        pre_state = context.pop("_pre_state", None)
+        pre_si = context.pop("_pre_si", si)
+        pre_x = context.pop("_pre_x", None)
+        context.pop("_geometry", None)
+        snapshot = self._trace_state_snapshot(
+            pre_state, pre_si, pre_x, stage="pre_measurement", P=P)
+        context.update(snapshot)
+        context["state_stage"] = "pre_measurement"
+        context["stage"] = "pre_measurement"
+        context["nominal_state"] = deepcopy(snapshot)
+        context["update"] = {
+            "attempted": True,
+            "accepted": None,
+            "status": "pending",
+            "definition": "pre_measurement snapshot precedes EKF/Joseph update",
+        }
         if amb_init_target is not None:
             context["float_update_count"] = int(
                 getattr(amb_init_target, "_meas_count", 0))
@@ -797,7 +1093,69 @@ class _DdBase(TcMeasurement):
         # reported as one.
         context["ambiguity_resolution_calls"] = 0
         context["ar_call_counter"] = context["ambiguity_resolution_calls"]
-        self._measurement_trace.emit(context)
+        # Materialize a distinct pre record before emitting.  The post-stage
+        # record is derived from this immutable diagnostic snapshot later.
+        self._last_trace_record = deepcopy(context)
+        self._measurement_trace.emit(self._last_trace_record)
+
+    def emit_trace_stage(self, stage, *, state, si, x=None, P=None,
+                         update=None):
+        """Emit a post-measurement stage for the last RTK event.
+
+        This method is observational and intentionally no-ops without an
+        enabled trace or a completed pre record.  ``update`` is a diagnostic
+        payload supplied by the integration boundary; it is never fed back
+        into the estimator.
+        """
+        if self._measurement_trace is None or self._last_trace_record is None:
+            return
+        stage = str(stage)
+        if stage not in {"pre_measurement", "post_measurement"}:
+            raise ValueError("trace stage must be pre_measurement or post_measurement")
+        record = deepcopy(self._last_trace_record)
+        record["stage"] = stage
+        record["state_stage"] = stage
+        snapshot = self._trace_state_snapshot(state, si, x, stage=stage, P=P)
+        record.update(snapshot)
+        record["nominal_state"] = deepcopy(snapshot)
+        update_record = dict(update or {})
+        feedback_x = update_record.get("feedback_x")
+        try:
+            feedback_values = np.asarray(feedback_x, dtype=float).reshape(-1)
+        except Exception:
+            feedback_values = np.zeros(0, dtype=float)
+        postfit = update_record.get("postfit")
+        try:
+            postfit_values = np.asarray(postfit, dtype=float).reshape(-1)
+        except Exception:
+            postfit_values = np.zeros(0, dtype=float)
+        for row in record.get("dd_rows", []):
+            row["state_stage"] = stage
+            index = row.get("row_index")
+            if index is None:
+                continue
+            if index < postfit_values.size and np.isfinite(postfit_values[index]):
+                row["postfit_residual"] = float(postfit_values[index])
+            elif feedback_values.size:
+                try:
+                    predicted = sum(
+                        float(feedback_values[int(key)]) * float(value)
+                        for key, value in row.get("design_row", {}).items()
+                    )
+                    row["postfit_residual"] = float(
+                        row["prefit_innovation"] - predicted)
+                except Exception:
+                    row["postfit_residual"] = None
+        update_record["stage"] = stage
+        update_record.setdefault("attempted", True)
+        update_record.setdefault("accepted", None)
+        update_record.setdefault("status", "completed")
+        update_record.setdefault(
+            "postfit_definition", "postfit_residual = l - A*dx [m]")
+        update_record.pop("feedback_x", None)
+        update_record.pop("postfit", None)
+        record["update"] = update_record
+        self._measurement_trace.emit(record)
 
     # ---- 子类重写 ----
     def _amb_idx(self, sat, freq, si):
@@ -973,7 +1331,8 @@ class _DdBase(TcMeasurement):
                             observed_minus_geometry=dd_observation_minus_geometry,
                             predicted_state_term=(
                                 dd_observation_minus_geometry - v_nv),
-                            innovation=v_nv, h_row=H_row, status="rejected")
+                            innovation=v_nv, h_row=H_row, status="rejected",
+                            los_ref=eu[ref_i], los_target=eu[j])
                         continue
                     # 单差方差
                     si_idx = sat[ref_i] - 1
@@ -1022,7 +1381,8 @@ class _DdBase(TcMeasurement):
                             row_index=len(v_list) - 1,
                             covariance_block=covariance_block,
                             covariance_row=block_count,
-                            ref_variance=Ri, target_variance=Rj)
+                            ref_variance=Ri, target_variance=Rj,
+                            los_ref=eu[ref_i], los_target=eu[j])
                     block_count += 1
                 if block_count > 0:
                     nb_per_block.append(block_count)
@@ -1125,12 +1485,13 @@ class RtkTcMeas(_DdBase):
         previous_obs_t: 上一 GNSS 历元时刻 (``gtime_t``), 供 ``udbias``
         计算历元间隔 (随机游走步长 + 失锁计时)。
         """
-        trace_context = self._trace_begin(obsr, obsb, nav)
+        trace_context = self._trace_begin(
+            obsr, obsb, nav, state=state, si=si, x=x)
         if obsb is None:
             v = np.array([])
             H = np.zeros((0, si.dim))
             self._trace_finish(
-                trace_context, v, H, nav, si, R=np.zeros((0, 0)))
+                trace_context, v, H, nav, si, R=np.zeros((0, 0)), P=P)
             return v, H, np.zeros((0, 0)), {}
         # 1. 卫星位置 / 钟差
         rs, var, dts, svh = satposs(obsr, nav)
@@ -1155,10 +1516,12 @@ class RtkTcMeas(_DdBase):
             v = np.array([])
             H = np.zeros((0, si.dim))
             self._trace_finish(
-                trace_context, v, H, nav, si, R=np.zeros((0, 0)))
+                trace_context, v, H, nav, si, R=np.zeros((0, 0)), P=P)
             return v, H, np.zeros((0, 0)), {}
         # 4. rover zdres (使用 INS 天线位置)
         rr = state.pos_e + state.C_b_e @ state.leverarm
+        self._trace_set_geometry(
+            trace_context, obsr, obsb, rs, rsb, rr, nav.rb)
         yu, eu, azel = zdres(nav, obsr, rs, dts, svh, var, rr, 1)
         # decode stdevs
         from src.core.gnss.rtklib import rinex as rn
@@ -1183,6 +1546,8 @@ class RtkTcMeas(_DdBase):
         #     (stored 可能已被 udbias 周期滑/重初始化更新)
         if amb_init_target is not None:
             x = amb_init_target.effective_x()
+        if trace_context is not None:
+            trace_context["_pre_x"] = np.asarray(x, dtype=float).copy()
         # P 用于 ref sat 选择 (选择非刚 reset 的卫星作参考)
         # 9. 构造双差
         self._active_trace_context = trace_context
@@ -1200,7 +1565,7 @@ class RtkTcMeas(_DdBase):
             nav.outc[ix, f] = 0
         save_tc_phase_state(nav, obsb, obsr, iu, ir)
         self._trace_finish(trace_context, v, H, nav, si,
-                           amb_init_target=amb_init_target, R=R)
+                           amb_init_target=amb_init_target, R=R, P=P)
         return v, H, R, info
 
 

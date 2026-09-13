@@ -269,6 +269,29 @@ class TcIntegration:
         except (OSError, TypeError, ValueError) as exc:
             self._disable_matrix_diagnostics(exc)
 
+    def _emit_measurement_trace_stage(self, stage: str, *, update=None,
+                                       state=None, P=None, x=None) -> None:
+        """Append an opt-in nominal-state stage without touching the filter."""
+        builder = self._meas_builder
+        if builder is None or not hasattr(builder, "emit_trace_stage"):
+            return
+        try:
+            if state is None:
+                state = self._est.state if self._est is not None else None
+            if P is None:
+                P = self._est.P if self._est is not None else None
+            if x is None and self._est is not None:
+                x = self._est.effective_x()
+            builder.emit_trace_stage(
+                stage, state=state,
+                si=self._est.si if self._est is not None else None,
+                x=x, P=P, update=update,
+            )
+        except Exception as exc:
+            # Stage trace is observational.  A malformed optional snapshot
+            # must never alter update acceptance or stream ordering.
+            logger.debug("TC measurement stage trace unavailable: %s", exc)
+
     def _emit_output(self, qins: int) -> None:
         """Emit a state at an exact fusion boundary when a stream is attached."""
         if self._output_callback is not None:
@@ -857,8 +880,18 @@ class TcIntegration:
             logger.debug(f"TC no_meas (mode={mode}, t={t_gnss:.3f}): "
                          f"obsr sats={len(obsr.sat)}, obsb sats={len(obsb.sat) if obsb is not None else 0}")
             if self._spp_fallback_update(obsr, obsb, nav, t_gnss):
+                self._emit_measurement_trace_stage(
+                    "post_measurement",
+                    update={"attempted": False, "accepted": False,
+                            "status": "no_dd_measurement"},
+                )
                 return
             self._on_meas_failure(obsr, obsb, nav, t_gnss)
+            self._emit_measurement_trace_stage(
+                "post_measurement",
+                update={"attempted": False, "accepted": False,
+                        "status": "no_dd_measurement"},
+            )
             return
 
         # 更新 num_sv / quality
@@ -881,8 +914,18 @@ class TcIntegration:
                          f"n_meas={n_meas} < {min_meas}, try SPP fallback, "
                          f"obsr={len(obsr.sat)}, obsb={len(obsb.sat) if obsb is not None else 0}")
             if self._spp_fallback_update(obsr, obsb, nav, t_gnss):
+                self._emit_measurement_trace_stage(
+                    "post_measurement",
+                    update={"attempted": False, "accepted": False,
+                            "status": "dd_measurement_below_minimum"},
+                )
                 return
             self._on_meas_failure(obsr, obsb, nav, t_gnss, recover=False)
+            self._emit_measurement_trace_stage(
+                "post_measurement",
+                update={"attempted": False, "accepted": False,
+                        "status": "dd_measurement_below_minimum"},
+            )
             return
 
         # 收敛期保护: 前 _convergence_warmup 个历元禁用跳变检验
@@ -954,6 +997,14 @@ class TcIntegration:
             # overwrite it with a 20-30 m position correction and defeat the
             # post-fit gate.
             self._on_meas_failure(obsr, obsb, nav, t_gnss)
+            self._emit_measurement_trace_stage(
+                "post_measurement",
+                state=self._est.state, P=self._est.P, x=pre_x,
+                update={"attempted": True, "accepted": False,
+                        "status": "postfit_rejected",
+                        "feedback_x": np.zeros_like(self._est.x),
+                        "postfit": np.asarray(v) - H @ pre_x},
+            )
             return
         update_info = dict(info)
         postfit = np.asarray(v) - H @ feedback_x
@@ -1045,10 +1096,25 @@ class TcIntegration:
                 self._amb_fixed = False
                 self._ambiguity.reset()
                 # 不降级: 回滚位置 + 重置模糊度即可, 降级到 imu_only 更危险
+                self._emit_measurement_trace_stage(
+                    "post_measurement",
+                    state=self._est.state, P=self._est.P, x=feedback_x,
+                    update={"attempted": True, "accepted": False,
+                            "status": "position_jump_rolled_back",
+                            "feedback_x": feedback_x,
+                            "postfit": postfit},
+                )
                 return
 
         self._last_meas_pos = self._est.state.pos_e.copy()
         self._maybe_align_yaw(t_gnss)
+        self._emit_measurement_trace_stage(
+            "post_measurement",
+            state=self._est.state, P=self._est.P, x=feedback_x,
+            update={"attempted": True, "accepted": True,
+                    "status": "accepted", "feedback_x": feedback_x,
+                    "postfit": postfit},
+        )
 
     def _maybe_align_yaw(self, t_gnss: float) -> None:
         """一次性 yaw 航向对齐 (等价 ignav ant2inins/vel2head 语义)。
