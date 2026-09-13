@@ -7,6 +7,7 @@ Copyright (c) 2022 Tim Everett
 
 import numpy as np
 from copy import deepcopy
+from collections.abc import MutableMapping
 from .rtkcmn import uGNSS, rSIG, Eph, Geph, prn2sat, gpst2time, time2gpst, Obs, \
                     epoch2time, timediff, timeadd, utc2gpst
 from . import rtkcmn as gn
@@ -18,6 +19,7 @@ from src.stream.gnss_band_mapping import (
 )
 from src.log.observation_mapping_trace import (
     ObservationMappingError,
+    mapping_hash,
     trace_from,
 )
 
@@ -63,6 +65,13 @@ class rnx_decode:
             sensor_id = "rnx_decode"
         if instance_id is None:
             instance_id = f"{sensor_id}:{rnx_decode._instance_sequence}"
+        if mapping_owner is None:
+            # The owner identifies the stream role (for example rover/base),
+            # while instance_id remains unique for this decoder object.
+            mapping_owner = str(sensor_id)
+        self.mapping_hash = mapping_hash(raw_band_priority)
+        self.mapping_owner = str(mapping_owner)
+        self.mapping_instance_id = str(instance_id)
         if not trace_enabled:
             mapping_trace = None
         elif mapping_trace is None:
@@ -358,6 +367,7 @@ class rnx_decode:
             if line[0] != '>':
                 continue
             obs = Obs()
+            self._attach_mapping_metadata(obs)
             nsat = int(line[32:35])
             year = int(line[2:6])
             month = int(line[7:9])
@@ -534,6 +544,23 @@ class rnx_decode:
                 break
         self.index = 0
         self.fobs.close()
+
+    def _attach_mapping_metadata(self, obs):
+        """Attach decoder identity without replacing pre-existing metadata."""
+        obs.mapping_hash = self.mapping_hash
+        obs.mapping_owner = self.mapping_owner
+        obs.instance_id = self.mapping_instance_id
+        metadata = getattr(obs, "metadata", None)
+        if metadata is None:
+            metadata = {}
+            obs.metadata = metadata
+        elif not isinstance(metadata, MutableMapping):
+            # Preserve application-owned metadata objects that are not
+            # mutable mappings; the direct attributes above remain canonical.
+            return
+        metadata.setdefault("mapping_hash", self.mapping_hash)
+        metadata.setdefault("mapping_owner", self.mapping_owner)
+        metadata.setdefault("instance_id", self.mapping_instance_id)
 
     def _trace_mapping(self, *, epoch, time, constellation,
                        input_obs_code, raw_band, disposition,
