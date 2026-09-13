@@ -52,7 +52,10 @@ from src.core.tc.tc_ambiguity import TcAmbiguity
 from src.core.tc.tc_degrade import TcDegradeManager
 from src.core.tc.tc_estimator import TcEstimator
 from src.core.tc.tc_measurement import SppTcMeas, RtkTcMeas, RtdTcMeas
-from src.log.tc_init_propagation_trace import build_trace_record
+from src.log.tc_init_propagation_trace import (
+    build_initialization_input_record,
+    build_trace_record,
+)
 from src.log.tc_matrix_diagnostics import TcMatrixDiagnosticWriter
 
 logger = logging.getLogger(__name__)
@@ -82,12 +85,14 @@ class TcIntegration:
 
     def __init__(self, config: dict, mode: str = "spp", output_callback=None,
                  measurement_trace_sink=None,
-                 init_propagation_trace_sink=None):
+                 init_propagation_trace_sink=None,
+                 initialization_input_trace_sink=None):
         self._cfg = config
         self._mode = mode
         self._output_callback = output_callback
         self._measurement_trace_sink = measurement_trace_sink
         self._init_propagation_trace_sink = init_propagation_trace_sink
+        self._initialization_input_trace_sink = initialization_input_trace_sink
         # The interval is deliberately bounded by the first post-init GNSS
         # update.  This documents that these samples are not a GNSS-free run:
         # initialization itself already consumed GNSS observations.
@@ -355,6 +360,66 @@ class TcIntegration:
             self._deliver_init_propagation_trace(record)
         except Exception as exc:
             logger.debug("TC initialization trace unavailable: %s", exc)
+
+    def _emit_initialization_input_trace(self, state, *, source_sow=None,
+                                         raw_position=None,
+                                         raw_velocity=None,
+                                         raw_attitude=None) -> None:
+        """Emit the raw-to-canonical initialization handoff, if requested."""
+        sink = self._initialization_input_trace_sink
+        if sink is None:
+            return
+        try:
+            ins_cfg = self._cfg.get("ins", {})
+            self._deliver_initialization_input_trace(
+                build_initialization_input_record(
+                    timestamp=getattr(state, "timestamp", None),
+                    source_sow=source_sow,
+                    raw_position=raw_position,
+                    raw_velocity=raw_velocity,
+                    raw_attitude=raw_attitude,
+                    raw_lever=ins_cfg.get("leverarm"),
+                    state=state,
+                    position_frame="ECEF",
+                    position_order="x,y,z",
+                    position_units="m",
+                    velocity_frame="ECEF",
+                    velocity_order="x,y,z",
+                    velocity_units="m/s",
+                    attitude_frame="NED",
+                    attitude_order="roll,pitch,yaw",
+                    attitude_units="rad",
+                    lever_frame="FRD",
+                    lever_order="front,right,down",
+                    lever_units="m",
+                    lever_applied=True,
+                    state_source="tc_integration_initialization",
+                    position_source="tc_initialization_position_ecef",
+                    velocity_source="tc_initialization_position_difference_ecef",
+                    attitude_source="tc_initialization_ned_rpy_zyx",
+                )
+            )
+        except Exception as exc:
+            # A diagnostic serialization failure must not alter initialization.
+            logger.debug("TC initialization input trace unavailable: %s", exc)
+
+    def _deliver_initialization_input_trace(self, record: dict) -> None:
+        sink = self._initialization_input_trace_sink
+        if sink is None:
+            return
+        writer = getattr(sink, "write", None)
+        appender = getattr(sink, "append", None)
+        if writer is not None:
+            writer(record)
+        elif appender is not None:
+            appender(record)
+        elif callable(sink):
+            sink(record)
+        else:
+            raise TypeError(
+                "initialization input trace sink must be callable, writable, "
+                "or appendable"
+            )
 
     def _start_init_propagation_clone(self, *, sow=None) -> None:
         """Start the opt-in GNSS-free mechanization diagnostic fork.
@@ -1068,6 +1133,14 @@ class TcIntegration:
         self._last_q = quality
         self._last_ns = ns
         self._last_gnss_t = init_state.timestamp
+
+        self._emit_initialization_input_trace(
+            init_state,
+            source_sow=self._raw_gnss_sow(obsr, t_gnss),
+            raw_position=pos_for_state,
+            raw_velocity=vel_e,
+            raw_attitude=att_rpy,
+        )
 
         # Initialization is GNSS-assisted in this pipeline.  The optional
         # propagation audit starts a deep-copied, GNSS-free mechanization fork

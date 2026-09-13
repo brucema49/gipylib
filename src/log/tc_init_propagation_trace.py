@@ -14,6 +14,8 @@ from pathlib import Path
 
 import numpy as np
 
+from src.core.ins.attitude import dcm2quat, euler2dcm
+from src.core.ins.earth_param import cal_Ce2n, cal_Cn2e, ecef2llh, llh2ecef
 from src.core.time_utils import unix_to_gpst
 
 
@@ -21,9 +23,14 @@ logger = logging.getLogger(__name__)
 
 
 SCHEMA = "GREAT_GIPY_INIT_PROPAGATION_TRACE_V1"
+INITIALIZATION_INPUT_SCHEMA = "GREAT_GIPY_INITIALIZATION_INPUT_TRACE_V1"
 DEFAULT_FILENAMES = {
     "jsonl": "tc-init-propagation-trace.jsonl",
     "csv": "tc-init-propagation-trace.csv",
+}
+INITIALIZATION_INPUT_DEFAULT_FILENAMES = {
+    "jsonl": "tc-initialization-input-trace.jsonl",
+    "csv": "tc-initialization-input-trace.csv",
 }
 
 
@@ -183,18 +190,317 @@ def build_trace_record(event: str, state, *, sow: float | None = None,
     return record
 
 
+def _initialization_input_vector(value, size=3):
+    """Return a finite JSON vector, or an honest null for unavailable input."""
+    try:
+        result = np.asarray(value, dtype=np.float64).reshape(-1)
+        if result.size != size or not np.all(np.isfinite(result)):
+            return None
+        return [float(item) for item in result]
+    except Exception:
+        return None
+
+
+def _initialization_input_matrix(value):
+    """Return a finite 3x3 JSON matrix, or null when it is unavailable."""
+    try:
+        result = np.asarray(value, dtype=np.float64)
+        if result.shape != (3, 3) or not np.all(np.isfinite(result)):
+            return None
+        return [[float(item) for item in row] for row in result]
+    except Exception:
+        return None
+
+
+def _enu_to_ecef(lat: float, lon: float) -> np.ndarray:
+    """Build the canonical ENU -> ECEF rotation from the existing NED basis."""
+    C_e_n = cal_Ce2n(lat, lon)
+    # ENU rows are E, N, Up; NED rows are N, E, Down.
+    C_e_enu = np.array([C_e_n[1], C_e_n[0], -C_e_n[2]], dtype=np.float64)
+    return C_e_enu.T
+
+
+def _navigation_to_ecef(frame: str, lat: float, lon: float) -> np.ndarray | None:
+    frame = str(frame or "").strip().upper()
+    if frame == "NED":
+        return cal_Cn2e(lat, lon)
+    if frame == "ENU":
+        return _enu_to_ecef(lat, lon)
+    return None
+
+
+def build_initialization_input_record(*, timestamp: float | None = None,
+                                      source_sow: float | None = None,
+                                      raw_position=None,
+                                      raw_velocity=None,
+                                      raw_attitude=None,
+                                      raw_lever=None,
+                                      state=None,
+                                      position_frame: str = "ECEF",
+                                      position_order: str | None = None,
+                                      position_units: str = "m",
+                                      velocity_frame: str = "ECEF",
+                                      velocity_order: str | None = None,
+                                      velocity_units: str = "m/s",
+                                      attitude_frame: str = "NED",
+                                      attitude_order: str = "roll,pitch,yaw",
+                                      attitude_units: str = "rad",
+                                      lever_frame: str = "FRD",
+                                      lever_order: str = "front,right,down",
+                                      lever_units: str = "m",
+                                      lever_applied: bool = True,
+                                      state_source: str | None = None,
+                                      position_source: str | None = None,
+                                      velocity_source: str | None = None,
+                                      attitude_source: str | None = None) -> dict:
+    """Build the common, observational initialization-input record.
+
+    Raw values retain the convention in which they entered initialization;
+    canonical values are independently derived as ECEF position/velocity and
+    body-to-ECEF ``C_b_e``.  A supplied ``state`` is recorded as the actual
+    converted state, while ``canonical_*`` fields preserve the transparent
+    conversion result for comparison.  Unsupported or missing fields remain
+    null and retain their definitions instead of being guessed.
+    """
+    raw_pos = _initialization_input_vector(raw_position)
+    raw_vel = _initialization_input_vector(raw_velocity)
+    raw_att = _initialization_input_vector(raw_attitude)
+    raw_lev = _initialization_input_vector(raw_lever)
+    position_frame = str(position_frame or "").strip().upper() or None
+    velocity_frame = str(velocity_frame or "").strip().upper() or None
+    attitude_frame = str(attitude_frame or "").strip().upper() or None
+    lever_frame = str(lever_frame or "").strip().upper() or None
+
+    pos_ecef = None
+    if raw_pos is not None and position_frame == "ECEF":
+        pos_ecef = raw_pos
+    elif raw_pos is not None and position_frame == "LLH":
+        try:
+            pos_ecef = llh2ecef(
+                np.radians(raw_pos[0]), np.radians(raw_pos[1]), raw_pos[2]
+            ).tolist()
+        except Exception:
+            pos_ecef = None
+
+    lat = lon = None
+    if pos_ecef is not None:
+        try:
+            lat, lon, _height = ecef2llh(np.asarray(pos_ecef, dtype=np.float64))
+        except Exception:
+            lat = lon = None
+
+    vel_ecef = None
+    if raw_vel is not None and velocity_frame == "ECEF":
+        vel_ecef = raw_vel
+    elif raw_vel is not None and lat is not None and velocity_frame in {"NED", "ENU"}:
+        try:
+            vel_ecef = (_navigation_to_ecef(velocity_frame, lat, lon)
+                        @ np.asarray(raw_vel, dtype=np.float64)).tolist()
+        except Exception:
+            vel_ecef = None
+
+    C_b_e = None
+    if raw_att is not None and lat is not None and attitude_frame in {"NED", "ENU"}:
+        try:
+            attitude = np.asarray(raw_att, dtype=np.float64)
+            if str(attitude_units or "").strip().lower() in {"deg", "degree", "degrees"}:
+                attitude = np.radians(attitude)
+            C_b_n = euler2dcm(attitude)
+            C_n_e = _navigation_to_ecef(attitude_frame, lat, lon)
+            C_b_e = (C_n_e @ C_b_n).tolist()
+        except Exception:
+            C_b_e = None
+
+    lever_frd = None
+    if raw_lev is not None and lever_frame == "FRD":
+        lever_frd = raw_lev
+    elif raw_lev is not None and lever_frame == "RFU":
+        # Keep the existing reader convention explicit; this is diagnostic
+        # conversion only and does not alter the sensor or estimator path.
+        lever_frd = [raw_lev[1], raw_lev[0], -raw_lev[2]]
+    lever_ecef = None
+    if lever_frd is not None and C_b_e is not None:
+        lever_ecef = (np.asarray(C_b_e) @ np.asarray(lever_frd)).tolist()
+    canonical_pos = None
+    if pos_ecef is not None:
+        canonical_pos = list(pos_ecef)
+        if lever_applied and lever_ecef is not None:
+            canonical_pos = (np.asarray(canonical_pos) - np.asarray(lever_ecef)).tolist()
+    canonical_q = None if C_b_e is None else dcm2quat(np.asarray(C_b_e)).tolist()
+
+    actual_pos = _initialization_input_vector(getattr(state, "pos_e", None)) if state is not None else canonical_pos
+    actual_vel = _initialization_input_vector(getattr(state, "vel_e", None)) if state is not None else vel_ecef
+    actual_C = _initialization_input_matrix(getattr(state, "C_b_e", None)) if state is not None else _initialization_input_matrix(C_b_e)
+    actual_q = _initialization_input_vector(getattr(state, "q_b_e", None), 4) if state is not None else _initialization_input_vector(canonical_q, 4)
+    if source_sow is None and timestamp is not None:
+        try:
+            _week, source_sow = unix_to_gpst(float(timestamp))
+        except Exception:
+            source_sow = None
+    exact_sow = None if source_sow is None else float(source_sow)
+    week = None
+    state_sow = None
+    if timestamp is not None:
+        try:
+            week, state_sow = unix_to_gpst(float(timestamp))
+            week = int(week)
+            state_sow = float(state_sow)
+        except Exception:
+            pass
+
+    if position_order is None:
+        position_order = "latitude_deg,longitude_deg,height_m" if position_frame == "LLH" else "x,y,z"
+    if velocity_order is None:
+        velocity_order = {
+            "NED": "north,east,down",
+            "ENU": "east,north,up",
+        }.get(velocity_frame, "x,y,z")
+    position_definition = {
+        "ECEF": "raw [x,y,z] in Earth-fixed Cartesian coordinates",
+        "LLH": "raw [latitude_deg,longitude_deg,height_m] converted with WGS84",
+    }.get(position_frame, "raw position frame unavailable or unsupported")
+    velocity_definition = {
+        "ECEF": "raw [x,y,z] velocity in ECEF",
+        "NED": "raw [north,east,down] velocity; converted with C_n^e",
+        "ENU": "raw [east,north,up] velocity; converted with C_enu^e",
+    }.get(velocity_frame, "raw velocity frame unavailable or unsupported")
+    attitude_definition = (
+        "raw roll,pitch,yaw in navigation frame; ZYX yaw-pitch-roll; "
+        "C_b^e = C_nav^e @ C_b^nav"
+    )
+    lever_definition = (
+        "raw IMU-to-GNSS lever in FRD [front,right,down] meters; "
+        "lever_ecef = C_b^e @ lever_frd"
+    )
+    record = {
+        "schema": INITIALIZATION_INPUT_SCHEMA,
+        "event_seq": None,
+        "event": "initialization_input",
+        "stage": "initialization_input",
+        "timestamp": None if timestamp is None else float(timestamp),
+        "gps_week": week,
+        "week": week,
+        "sow": exact_sow if exact_sow is not None else state_sow,
+        "source_sow": exact_sow,
+        "exact_sow": exact_sow,
+        "state_sow": state_sow,
+        "timestamp_unix_s": None if timestamp is None else float(timestamp),
+        "state_source": state_source,
+        "position_source": position_source,
+        "velocity_source": velocity_source,
+        "attitude_source": attitude_source,
+        "raw_position": raw_pos,
+        "raw_position_frame": position_frame,
+        "raw_position_order": position_order,
+        "raw_position_units": position_units,
+        "raw_position_definition": position_definition,
+        "position_definition": position_definition,
+        "raw_velocity": raw_vel,
+        "raw_velocity_frame": velocity_frame,
+        "raw_velocity_order": velocity_order,
+        "raw_velocity_units": velocity_units,
+        "raw_velocity_definition": velocity_definition,
+        "raw_attitude": raw_att,
+        "raw_attitude_frame": attitude_frame,
+        "raw_attitude_order": attitude_order,
+        "raw_attitude_units": attitude_units,
+        "raw_attitude_definition": attitude_definition,
+        "attitude_definition": attitude_definition,
+        "raw_lever": raw_lev,
+        "raw_lever_frame": lever_frame,
+        "raw_lever_order": lever_order,
+        "raw_lever_units": lever_units,
+        "raw_lever_definition": lever_definition,
+        "lever_applied": bool(lever_applied),
+        "lever_frd": lever_frd,
+        "lever_ecef": lever_ecef,
+        "canonical_position_ecef": canonical_pos,
+        "canonical_pos_ecef": canonical_pos,
+        "canonical_velocity_ecef": vel_ecef,
+        "canonical_vel_ecef": vel_ecef,
+        "canonical_C_b_e": _initialization_input_matrix(C_b_e),
+        "canonical_quaternion_b_e": canonical_q,
+        "canonical_quaternion": canonical_q,
+        "converted_position_ecef": actual_pos,
+        "converted_pos_ecef": actual_pos,
+        "converted_velocity_ecef": actual_vel,
+        "converted_vel_ecef": actual_vel,
+        "converted_C_b_e": actual_C,
+        "converted_quaternion_b_e": actual_q,
+        "converted_quaternion": actual_q,
+        "converted_position_definition": (
+            "ECEF IMU reference position after optional antenna lever subtraction"
+        ),
+        "converted_velocity_definition": "ECEF velocity in [x,y,z] m/s",
+        "converted_attitude_definition": "C_b^e body/FRD to ECEF",
+        "converted_quaternion_definition": "[w,x,y,z] equivalent to converted C_b_e",
+    }
+    # Flat aliases make the row joinable with the existing GREAT stage trace.
+    for prefix, value in (("raw_position", raw_pos),
+                          ("raw_velocity", raw_vel),
+                          ("raw_attitude", raw_att),
+                          ("raw_lever", raw_lev),
+                          ("converted_position_ecef", actual_pos),
+                          ("converted_velocity_ecef", actual_vel),
+                          ("lever_ecef", lever_ecef)):
+        if value is not None:
+            for index, item in enumerate(value):
+                record[f"{prefix}_{index}"] = item
+        else:
+            size = 4 if "quaternion" in prefix else 3
+            for index in range(size):
+                record[f"{prefix}_{index}"] = None
+    for prefix, value in (("raw_position", raw_pos),
+                          ("raw_velocity", raw_vel),
+                          ("raw_attitude", raw_att),
+                          ("raw_lever", raw_lev)):
+        record[prefix.removeprefix("raw_")] = value
+    for prefix, value in (("canonical_pos_ecef", canonical_pos),
+                          ("canonical_vel_ecef", vel_ecef)):
+        if value is not None:
+            for index, item in enumerate(value):
+                record[f"{prefix}_{index}"] = item
+        else:
+            for index in range(3):
+                record[f"{prefix}_{index}"] = None
+    for prefix, value in (("canonical_pos_ecef", canonical_pos),
+                          ("canonical_vel_ecef", vel_ecef),
+                          ("converted_pos_ecef", actual_pos),
+                          ("converted_vel_ecef", actual_vel)):
+        axis_names = ("x", "y", "z")
+        for axis, item in zip(axis_names, value or (None, None, None)):
+            record[f"{prefix}_{axis}"] = item
+    for row in range(3):
+        for col in range(3):
+            record[f"converted_C_b_e_{row}{col}"] = (
+                None if actual_C is None else actual_C[row][col]
+            )
+            record[f"canonical_C_b_e_{row}{col}"] = (
+                None if C_b_e is None else C_b_e[row][col]
+            )
+    for index in range(4):
+        record[f"converted_quaternion_q{index}"] = (
+            None if actual_q is None else actual_q[index]
+        )
+        record[f"canonical_quaternion_q{index}"] = (
+            None if canonical_q is None else canonical_q[index]
+        )
+    return record
+
+
 class TcInitPropagationTraceWriter:
     """Persist initialization/propagation records only when explicitly enabled."""
 
     SCHEMA = SCHEMA
     DEFAULT_FILENAMES = DEFAULT_FILENAMES
+    CONFIG_KEY = "init_propagation_trace"
 
     def __init__(self, config: dict | str | Path | None = None, *,
                  output_dir=None, filename=None, format=None, enabled=None):
         if isinstance(config, dict):
             output = config.get("output", {})
             tc = config.get("tc", {})
-            trace_cfg = tc.get("init_propagation_trace", {})
+            trace_cfg = tc.get(self.CONFIG_KEY, {})
         else:
             output = {}
             trace_cfg = {}
@@ -205,7 +511,7 @@ class TcInitPropagationTraceWriter:
         if trace_cfg is None:
             trace_cfg = {}
         if not isinstance(trace_cfg, dict):
-            raise ValueError("tc.init_propagation_trace must be a mapping")
+            raise ValueError(f"tc.{self.CONFIG_KEY} must be a mapping")
         if output_dir is None:
             output_dir = output.get("output_dir", "output")
         if enabled is None:
@@ -218,14 +524,14 @@ class TcInitPropagationTraceWriter:
                 enabled = False
             else:
                 raise ValueError(
-                    "tc.init_propagation_trace.enabled must be boolean")
+                    f"tc.{self.CONFIG_KEY}.enabled must be boolean")
         self.enabled = bool(enabled)
         if format is None:
             format = trace_cfg.get("format", "jsonl")
         self.format = str(format).strip().lower()
         if self.format not in self.DEFAULT_FILENAMES:
             raise ValueError(
-                "tc.init_propagation_trace.format must be 'jsonl' or 'csv'")
+                f"tc.{self.CONFIG_KEY}.format must be 'jsonl' or 'csv'")
         if filename is None:
             filename = trace_cfg.get("filename",
                                      self.DEFAULT_FILENAMES[self.format])
@@ -239,13 +545,13 @@ class TcInitPropagationTraceWriter:
         self._event_seq = 0
         self._failed = False
 
-    @staticmethod
-    def _validate_basename(filename: str) -> None:
+    @classmethod
+    def _validate_basename(cls, filename: str) -> None:
         if (not filename or filename in (".", "..") or
                 Path(filename).name != filename or "/" in filename or
                 "\\" in filename or Path(filename).is_absolute()):
             raise ValueError(
-                "tc.init_propagation_trace.filename must be a basename")
+                f"tc.{cls.CONFIG_KEY}.filename must be a basename")
 
     def open(self) -> None:
         if not self.enabled or self._failed:
@@ -311,6 +617,10 @@ class TcInitPropagationTraceWriter:
             main_run_gnss_update_seen=main_run_gnss_update_seen,
             state_source=state_source,
         ))
+
+    def write_initialization_input(self, **kwargs) -> None:
+        """Write one common initialization-input record when enabled."""
+        self.write(build_initialization_input_record(**kwargs))
 
     def write(self, record: dict) -> None:
         if not self.enabled or self._fp is None or self._failed:
@@ -380,3 +690,11 @@ class TcInitPropagationTraceWriter:
                 pass
         logger.warning("TC init propagation trace %s failed; sink disabled: %s",
                        operation, exc)
+
+
+class TcInitializationInputTraceWriter(TcInitPropagationTraceWriter):
+    """Persist only the common initialization-input audit event."""
+
+    SCHEMA = INITIALIZATION_INPUT_SCHEMA
+    CONFIG_KEY = "initialization_input_trace"
+    DEFAULT_FILENAMES = INITIALIZATION_INPUT_DEFAULT_FILENAMES
