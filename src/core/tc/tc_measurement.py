@@ -466,6 +466,7 @@ class _DdBase(TcMeasurement):
             "candidate_sats_semantics": "common_view_dd_input",
             "common_view_sats": {system: [] for system in systems},
             "common_view_prns": {system: [] for system in systems},
+            "common_view_candidates": {system: {} for system in systems},
             "exclusion_reasons": [],
             "_selected_ref_sats": {system: [] for system in systems},
             "dd_keys": [],
@@ -490,8 +491,7 @@ class _DdBase(TcMeasurement):
         self._trace_epoch += 1
         return context
 
-    @staticmethod
-    def _trace_candidates(context, sat, nav):
+    def _trace_candidates(self, context, sat, nav):
         """Snapshot the common-view candidates before slot filtering."""
         if context is None:
             return
@@ -502,6 +502,22 @@ class _DdBase(TcMeasurement):
             context["candidate_prns"][name] = [sat2id(int(sat[i])) for i in idx]
             context["common_view_sats"][name] = [int(sat[i]) for i in idx]
             context["common_view_prns"][name] = [sat2id(int(sat[i])) for i in idx]
+            context["common_view_candidates"][name] = {
+                str(slot): [
+                    {
+                        "sat": int(sat[i]),
+                        "prn": sat2id(int(sat[i])),
+                        "raw_signal": {
+                            kind: self._trace_raw_signal_fields(
+                                context.get("_obsr"), context.get("_obsb"),
+                                int(sat[i]), slot, kind)
+                            for kind in ("phase", "code")
+                        },
+                    }
+                    for i in idx
+                ]
+                for slot in range(nav.nf)
+            }
 
     @staticmethod
     def _trace_exclusion(context, sat, system, index, slot, kind, reason):
@@ -525,7 +541,7 @@ class _DdBase(TcMeasurement):
         }
 
     @staticmethod
-    def _trace_raw_signal_fields(obsr, obsb, sat, slot):
+    def _trace_raw_signal_fields(obsr, obsb, sat, slot, kind=None):
         """Read only explicit upstream raw-signal metadata, never infer it.
 
         The current Obs object stores decoded slot arrays but not the source
@@ -540,9 +556,16 @@ class _DdBase(TcMeasurement):
                 table = getattr(observation, "raw_signal_by_slot", None)
                 if not isinstance(table, Mapping):
                     return empty
-                entry = table.get((int(sat), int(slot)))
-                if entry is None:
-                    entry = table.get(f"{int(sat)}:{int(slot)}")
+                keys = []
+                if kind is not None:
+                    keys.extend(((int(sat), int(slot), str(kind)),
+                                 f"{int(sat)}:{int(slot)}:{kind}"))
+                keys.extend(((int(sat), int(slot)), f"{int(sat)}:{int(slot)}"))
+                entry = None
+                for key in keys:
+                    entry = table.get(key)
+                    if entry is not None:
+                        break
                 if not isinstance(entry, Mapping):
                     return empty
                 raw_band = entry.get("raw_band")
@@ -579,6 +602,10 @@ class _DdBase(TcMeasurement):
         return {
             "rover": rover,
             "base": base,
+            "completeness": {
+                "rover": all(value is not None for value in rover.values()),
+                "base": all(value is not None for value in base.values()),
+            },
             "status": status,
             "comparable": bool(comparable),
         }
@@ -593,11 +620,27 @@ class _DdBase(TcMeasurement):
         if context is None:
             return
         raw_signal = self._trace_raw_signal_fields(
-            obsr, obsb, target_sat, slot)
+            obsr, obsb, target_sat, slot, kind)
+        ref_raw_signal = self._trace_raw_signal_fields(
+            obsr, obsb, ref_sat, slot, kind)
         raw_band = (raw_signal["rover"]["raw_band"]
-                    if raw_signal["comparable"] else None)
+                    if raw_signal["comparable"] and ref_raw_signal["comparable"]
+                    else None)
         track = (raw_signal["rover"]["track"]
-                 if raw_signal["comparable"] else None)
+                 if raw_signal["comparable"] and ref_raw_signal["comparable"]
+                 else None)
+        both_comparable = bool(
+            raw_signal["comparable"] and ref_raw_signal["comparable"])
+        if both_comparable:
+            row_raw_status = "comparable"
+        elif (raw_signal["status"] == "unavailable"
+              and ref_raw_signal["status"] == "unavailable"):
+            row_raw_status = "unavailable"
+        elif (raw_signal["status"] == "mismatch"
+              or ref_raw_signal["status"] == "mismatch"):
+            row_raw_status = "mismatch"
+        else:
+            row_raw_status = "incomplete"
         row = {
             "attempt_index": int(context["_dd_attempt_counter"]),
             "row_index": None if row_index is None else int(row_index),
@@ -614,10 +657,25 @@ class _DdBase(TcMeasurement):
             "raw_signal": {
                 "rover": raw_signal["rover"],
                 "base": raw_signal["base"],
+                "completeness": raw_signal["completeness"],
                 "status": raw_signal["status"],
             },
-            "raw_signal_comparable": raw_signal["comparable"],
-            "raw_signal_status": raw_signal["status"],
+            "target_raw_signal": {
+                "rover": raw_signal["rover"],
+                "base": raw_signal["base"],
+                "completeness": raw_signal["completeness"],
+                "status": raw_signal["status"],
+            },
+            "target_raw_signal_comparable": raw_signal["comparable"],
+            "ref_raw_signal": {
+                "rover": ref_raw_signal["rover"],
+                "base": ref_raw_signal["base"],
+                "completeness": ref_raw_signal["completeness"],
+                "status": ref_raw_signal["status"],
+            },
+            "ref_raw_signal_comparable": ref_raw_signal["comparable"],
+            "raw_signal_comparable": both_comparable,
+            "raw_signal_status": row_raw_status,
             "dd_observation_minus_geometry": float(observed_minus_geometry),
             "predicted_state_term": float(predicted_state_term),
             "innovation": float(innovation),

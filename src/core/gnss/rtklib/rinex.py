@@ -367,6 +367,10 @@ class rnx_decode:
             if line[0] != '>':
                 continue
             obs = Obs()
+            # Read-only provenance for the TC diagnostic boundary.  The
+            # solver continues to consume the existing numeric slot arrays;
+            # this optional side table is never used by positioning code.
+            obs.raw_signal_by_slot = {}
             self._attach_mapping_metadata(obs)
             nsat = int(line[32:35])
             year = int(line[2:6])
@@ -506,10 +510,20 @@ class rnx_decode:
                         )
                     if self.typeid[sys][i] == 0:  # code
                         obs.P[n, f] = obsval
+                        obs.raw_signal_by_slot[(int(obs.sat[n]), int(f), "code")] = {
+                            "raw_band": int(band),
+                            "track": str(input_obs_code),
+                            "input_obs_code": str(input_obs_code),
+                        }
                         Pstd = line[16*i+18]
                         obs.Pstd[n, f] = int(Pstd) if Pstd != " " else 0
                     elif self.typeid[sys][i] == 1:  # carrier
                         obs.L[n, f] = float(obs_)
+                        obs.raw_signal_by_slot[(int(obs.sat[n]), int(f), "phase")] = {
+                            "raw_band": int(band),
+                            "track": str(input_obs_code),
+                            "input_obs_code": str(input_obs_code),
+                        }
                         lli = line[16*i+17]
                         obs.lli[n, f] = int(lli) if lli != " " else 0
                         Lstd = line[16*i+18]
