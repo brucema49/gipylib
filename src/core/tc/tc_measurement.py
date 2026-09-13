@@ -463,6 +463,10 @@ class _DdBase(TcMeasurement):
             "dd_keys": [],
             "n_code": 0,
             "n_phase": 0,
+            "_code_attempted": 0,
+            "_phase_attempted": 0,
+            "_code_rejected": 0,
+            "_phase_rejected": 0,
             "float_state_counter": 0,
             "ar_call_counter": 0,
         }
@@ -505,16 +509,37 @@ class _DdBase(TcMeasurement):
                 references[system] = refs[0] if all(ref == refs[0] for ref in refs) else refs
         context["reference_sats"] = references
         context["selected_ref_sats"] = selected
+        context["refs"] = references
+        context["counts"] = {
+            "code": {
+                "attempted": int(context.pop("_code_attempted", 0)),
+                "accepted": int(context["n_code"]),
+                "rejected": int(context.pop("_code_rejected", 0)),
+            },
+            "phase": {
+                "attempted": int(context.pop("_phase_attempted", 0)),
+                "accepted": int(context["n_phase"]),
+                "rejected": int(context.pop("_phase_rejected", 0)),
+            },
+        }
         context["n_total"] = int(len(v))
         context["residual"] = {
             "shape": list(np.asarray(v).shape),
             "rank": 0 if len(v) == 0 else 1,
             "norm": float(np.linalg.norm(v)) if len(v) else 0.0,
         }
-        context["jacobian"] = {
-            "shape": list(np.asarray(H).shape),
-            "rank": int(np.linalg.matrix_rank(H)) if H.size else 0,
-        }
+        jacobian = {"shape": list(np.asarray(H).shape)}
+        if not H.size:
+            jacobian["rank"] = 0
+        else:
+            try:
+                if not np.all(np.isfinite(H)):
+                    raise ValueError("non_finite")
+                jacobian["rank"] = int(np.linalg.matrix_rank(H))
+            except (np.linalg.LinAlgError, TypeError, ValueError) as exc:
+                jacobian["rank"] = "unavailable"
+                jacobian["rank_error"] = str(exc)
+        context["jacobian"] = jacobian
         # Keep these aliases convenient for line-oriented consumers.
         context["residual_shape"] = context["residual"]["shape"]
         context["jacobian_shape"] = context["jacobian"]["shape"]
@@ -601,8 +626,6 @@ class _DdBase(TcMeasurement):
                 else:
                     i_el = idx[np.argsort(el[idx])]
                     ref_i = i_el[-1]
-                self._trace_exclusion(
-                    trace_context, sat, sys, ref_i, frq, kind, "reference")
                 if trace_context is not None:
                     trace_context["_selected_ref_sats"][
                         _trace_system_name(sys)].append(int(sat[ref_i]))
@@ -616,6 +639,9 @@ class _DdBase(TcMeasurement):
                         n_code_att += 1
                     else:
                         n_phase_att += 1
+                    if trace_context is not None:
+                        trace_context[
+                            "_code_attempted" if code else "_phase_attempted"] += 1
                     # 双差残差 (innovation: v = y - h(x_est) = observed - predicted)
                     # 与 GINav ddres_rtkins / GREAT-MSF gsppflt 一致
                     # rtklib zdres 返回 y = P - rho (observed - predicted),
@@ -667,8 +693,12 @@ class _DdBase(TcMeasurement):
                         nav.rejc[sat[j] - 1, frq] += 1
                         if code:
                             n_code_rej += 1
+                            if trace_context is not None:
+                                trace_context["_code_rejected"] += 1
                         else:
                             n_phase_rej += 1
+                            if trace_context is not None:
+                                trace_context["_phase_rejected"] += 1
                         self._trace_exclusion(
                             trace_context, sat, sys, j, frq, kind, "outlier")
                         continue
