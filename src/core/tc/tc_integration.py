@@ -25,7 +25,7 @@ import collections
 import csv
 import logging
 import math
-from copy import copy
+from copy import copy, deepcopy
 from pathlib import Path
 from typing import Optional, List
 
@@ -65,6 +65,10 @@ _MEAS_BUILDERS = {"spp": SppTcMeas, "rtk": RtkTcMeas, "rtd": RtdTcMeas}
 # increment, so snap such near-boundary SOW values.  The tolerance stays far
 # below the 1 ms endpoint rule used by ``split_increment_at_gnss``.
 _SOW_ENDPOINT_TOLERANCE_S = 1.0e-6
+_INIT_CLONE_FIRST_SOW = 180634.0
+_INIT_CLONE_LAST_SOW = 180635.0
+_INIT_CLONE_SOW_STEP = 0.01
+_INIT_CLONE_SOW_EPSILON = 1.0e-9
 
 
 class TcIntegration:
@@ -92,6 +96,13 @@ class TcIntegration:
         self._init_propagation_trace_pending = (
             [] if init_propagation_trace_sink is not None else None
         )
+        # Optional diagnostic-only fork.  It is created only with an explicit
+        # trace sink so the default path has no clone or file side effects.
+        self._init_propagation_clone = None
+        self._init_propagation_clone_active = False
+        self._init_propagation_clone_prev_sow = None
+        self._init_propagation_clone_curr_sow = None
+        self._init_propagation_clone_sample_count = 0
         self._initializer = InsInitializer(config)
         ins_cfg = config.get("ins", {})
         # 初始化模式选择 (与 LcStream 一致)
@@ -345,6 +356,102 @@ class TcIntegration:
         except Exception as exc:
             logger.debug("TC initialization trace unavailable: %s", exc)
 
+    def _start_init_propagation_clone(self, *, sow=None) -> None:
+        """Start the opt-in GNSS-free mechanization diagnostic fork.
+
+        The fork is a deep copy of the already initialized ``InsUpdate``.
+        It receives only original IMU samples and is intentionally independent
+        of the TC estimator, GNSS queue, constraints, feedback, and output.
+        """
+        if (self._init_propagation_trace_sink is None or
+                not self._initialized or self._est is None or
+                self._init_propagation_clone is not None):
+            return
+        source = getattr(self._est, "ins_update", None)
+        if source is None:
+            return
+        try:
+            clone = deepcopy(source)
+            if sow is None:
+                _week, sow = unix_to_gpst(float(clone.state.timestamp))
+            sow = float(sow)
+            self._init_propagation_clone = clone
+            self._init_propagation_clone_active = True
+            self._init_propagation_clone_prev_sow = sow
+            self._init_propagation_clone_curr_sow = sow
+            self._init_propagation_clone_sample_count = 0
+            self._deliver_init_propagation_trace(build_trace_record(
+                "initialization_complete", clone.state, sow=sow,
+                gnss_free=True,
+                isolation="gnss_free_clone;no_gnss_measurement",
+                first_gnss_sow=None,
+                imu_sample_count=0,
+                gnss_measurement_inserted=0,
+                main_run_gnss_update_seen=0,
+                state_source="diagnostic_copy_no_gnss",
+            ))
+        except Exception as exc:
+            # Optional diagnostics must never prevent the main run.
+            logger.debug("TC GNSS-free init clone unavailable: %s", exc)
+            self._init_propagation_clone = None
+            self._init_propagation_clone_active = False
+
+    @staticmethod
+    def _init_clone_imu_sow(imu) -> float:
+        if imu.is_increment():
+            return float(imu.increment_view().sow)
+        _week, sow = unix_to_gpst(float(imu.timestamp))
+        sow = float(sow)
+        # Unix↔GPST conversion at campus01 magnitudes is a few ULP away from
+        # the source 100 Hz grid.  Preserve the shared trace's exact SOW
+        # contract without changing the sample or its timestamp.
+        grid = round((sow - _INIT_CLONE_FIRST_SOW) / _INIT_CLONE_SOW_STEP)
+        snapped = _INIT_CLONE_FIRST_SOW + grid * _INIT_CLONE_SOW_STEP
+        if abs(sow - snapped) <= _SOW_ENDPOINT_TOLERANCE_S:
+            return float(snapped)
+        return sow
+
+    def _record_init_propagation_clone(self, imu) -> None:
+        """Feed exactly one original IMU sample to the GNSS-free clone."""
+        clone = self._init_propagation_clone
+        if (clone is None or not self._init_propagation_clone_active):
+            return
+        try:
+            previous_sow = self._init_propagation_clone_curr_sow
+            # This is the only call made on the diagnostic copy.  In
+            # particular, never route it through TcEstimator.time_update().
+            clone.update(imu)
+            if not clone.last_update_accepted:
+                return
+            current_sow = self._init_clone_imu_sow(imu)
+            self._init_propagation_clone_prev_sow = previous_sow
+            self._init_propagation_clone_curr_sow = current_sow
+            self._init_propagation_clone_sample_count = 1
+            if current_sow + _INIT_CLONE_SOW_EPSILON < _INIT_CLONE_FIRST_SOW:
+                return
+            if current_sow - _INIT_CLONE_SOW_EPSILON > _INIT_CLONE_LAST_SOW:
+                self._init_propagation_clone_active = False
+                return
+            source_form = "increment" if imu.is_increment() else "rate"
+            self._deliver_init_propagation_trace(build_trace_record(
+                "imu_propagation_pre_gnss", clone.state, sow=current_sow,
+                dt=clone.last_dt, gnss_free=True,
+                isolation="gnss_free_clone;no_gnss_measurement",
+                first_gnss_sow=None,
+                input_imu_form=source_form,
+                propagation_form=source_form,
+                imu_prev_sow=previous_sow,
+                imu_curr_sow=current_sow,
+                imu_sample_count=1,
+                gnss_measurement_inserted=0,
+                main_run_gnss_update_seen=0,
+                state_source="diagnostic_copy_no_gnss",
+            ))
+            if current_sow + _INIT_CLONE_SOW_EPSILON >= _INIT_CLONE_LAST_SOW:
+                self._init_propagation_clone_active = False
+        except Exception as exc:
+            logger.debug("TC GNSS-free init clone step unavailable: %s", exc)
+
     def _deliver_init_propagation_trace(self, record: dict) -> None:
         sink = self._init_propagation_trace_sink
         if sink is None:
@@ -503,6 +610,11 @@ class TcIntegration:
             if self._init_obs and imu.timestamp >= self._init_obs[-1][3]:
                 self._try_init()
             return
+
+        # Run the diagnostic copy before the normal IMU route.  The original
+        # payload is passed unchanged; the main estimator remains untouched by
+        # this GNSS-free fork.
+        self._record_init_propagation_clone(imu)
 
         # Dispatch before the legacy rate path.  Native increments must never
         # enter rate interpolation, and rate-to-increment is an explicit
@@ -957,22 +1069,12 @@ class TcIntegration:
         self._last_ns = ns
         self._last_gnss_t = init_state.timestamp
 
-        # Initialization is GNSS-assisted in this pipeline.  Keep that fact
-        # explicit in the optional audit output, then bound propagation
-        # records to the real pre-first-update interval during replay.
+        # Initialization is GNSS-assisted in this pipeline.  The optional
+        # propagation audit starts a deep-copied, GNSS-free mechanization fork
+        # at this exact handoff; the main estimator remains on its normal path.
         if self._init_propagation_trace_sink is not None:
-            future_sows = [
-                self._raw_gnss_sow(item[0], item[3])
-                for item in self._init_obs if item[3] > init_state.timestamp
-            ]
-            self._init_propagation_trace_first_gnss_sow = (
-                min(future_sows) if future_sows else None
-            )
-            self._init_propagation_trace_active = True
-            self._emit_initialization_complete_trace(
-                init_state,
-                sow=self._raw_gnss_sow(obsr, t_gnss),
-            )
+            self._start_init_propagation_clone(
+                sow=self._raw_gnss_sow(obsr, t_gnss))
 
         logger.info(
             f"TcIntegration 初始化成功: t={init_state.timestamp:.3f}, "
