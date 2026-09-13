@@ -162,7 +162,7 @@ class TcIntegration:
         self._init_imu: List[ImuMeasurement] = []
         self._init_obs: list = []   # [(obsr, obsb, nav, t_gnss), ...]
         # 5秒 GNSS 位置缓存 (用于动态初始化: 首尾位置差分计算 yaw)
-        self._gnss_pos_cache: list = []  # [(t, pos_ecef), ...]
+        self._gnss_pos_cache: list = []  # [(t, pos_ecef, source_sow), ...]
         self._initialized = False
         self._last_gnss_t: float = 0.0
         self._last_q: int = 5       # 最近 GNSS quality (初值 5=SPP)
@@ -364,7 +364,9 @@ class TcIntegration:
     def _emit_initialization_input_trace(self, state, *, source_sow=None,
                                          raw_position=None,
                                          raw_velocity=None,
-                                         raw_attitude=None) -> None:
+                                         raw_attitude=None,
+                                         velocity_diff_start_sow=None,
+                                         velocity_diff_end_sow=None) -> None:
         """Emit the raw-to-canonical initialization handoff, if requested."""
         sink = self._initialization_input_trace_sink
         if sink is None:
@@ -397,6 +399,20 @@ class TcIntegration:
                     position_source="tc_initialization_position_ecef",
                     velocity_source="tc_initialization_position_difference_ecef",
                     attitude_source="tc_initialization_ned_rpy_zyx",
+                    lever_source="ins.leverarm_config",
+                    position_provenance="tc_initialization;rover_solution_ecef",
+                    velocity_provenance=(
+                        "tc_initialization;gnss_position_difference;"
+                        "source_sow_interval"
+                    ),
+                    attitude_provenance=(
+                        "tc_initialization;derived_from_velocity_difference;"
+                        "ned_rpy_zyx"
+                    ),
+                    lever_provenance="config;fixed_frd;imu_to_gnss",
+                    velocity_diff_start_sow=velocity_diff_start_sow,
+                    velocity_diff_end_sow=velocity_diff_end_sow,
+                    velocity_diff_source="gnss_position_difference",
                 )
             )
         except Exception as exc:
@@ -803,6 +819,37 @@ class TcIntegration:
         _week, sow = unix_to_gpst(timestamp)
         return float(sow)
 
+    @staticmethod
+    def _explicit_gnss_sow(obsr) -> float | None:
+        """Return SOW from the GNSS source epoch, never Unix-time fallback.
+
+        ``Obs`` carries the parser's RTKLIB ``gtime_t`` in ``t``.  Converting
+        that source epoch with ``time2gpst`` preserves the real source SOW;
+        unlike ``unix_to_gpst(timestamp)``, it does not manufacture a trace
+        interval from the integration timestamp.  A source-provided SOW is
+        preferred when an upstream adapter exposes one explicitly.
+        """
+        source_sow = getattr(obsr, "source_sow", None)
+        if source_sow is not None:
+            try:
+                value = float(source_sow)
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and np.isfinite(value) and 0.0 <= value < 604800.0:
+                return value
+
+        source_time = getattr(obsr, "t", None)
+        if source_time is None:
+            return None
+        try:
+            from src.core.gnss.rtklib.rtkcmn import time2gpst
+
+            _week, value = time2gpst(source_time)
+            value = float(value)
+        except (AttributeError, TypeError, ValueError, ImportError):
+            return None
+        return value if np.isfinite(value) and 0.0 <= value < 604800.0 else None
+
     def _add_rate_as_increment_imu(self, imu: ImuMeasurement) -> None:
         """Convert each rate interval once, then use native split handling."""
         if not imu.is_rate():
@@ -1057,7 +1104,12 @@ class TcIntegration:
         self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
 
         # 缓存 GNSS 位置 (5 秒窗口, 用于动态初始化: 首尾位置差分计算 yaw)
-        self._gnss_pos_cache.append((t_gnss, rr.copy()))
+        # Keep source SOW as diagnostic metadata only.  The timestamp remains
+        # the existing initialization/math input; no source SOW is inferred
+        # from Unix time for the trace contract.
+        self._gnss_pos_cache.append(
+            (t_gnss, rr.copy(), self._explicit_gnss_sow(obsr))
+        )
         # 限制缓存大小: 按时间保留最近 6s (span=5s 初始化窗口)
         # 注: 按历元数修剪假设 1Hz GNSS, 5Hz 数据 (如 Data19 ROVE.20O)
         # 6 历元仅覆盖 1.0s, 导致 span<5.0 恒不满足, TC 永远无法初始化
@@ -1070,8 +1122,16 @@ class TcIntegration:
         if len(self._gnss_pos_cache) < 2:
             return
 
-        t_first, pos_first = self._gnss_pos_cache[0]
-        t_last, pos_last = self._gnss_pos_cache[-1]
+        first_entry = self._gnss_pos_cache[0]
+        last_entry = self._gnss_pos_cache[-1]
+        t_first, pos_first = first_entry[:2]
+        t_last, pos_last = last_entry[:2]
+        velocity_diff_start_sow = (
+            first_entry[2] if len(first_entry) > 2 else None
+        )
+        velocity_diff_end_sow = (
+            last_entry[2] if len(last_entry) > 2 else None
+        )
         span = t_last - t_first
         if span < 5.0:
             return  # 不足 5 秒, 继续累积
@@ -1136,10 +1196,12 @@ class TcIntegration:
 
         self._emit_initialization_input_trace(
             init_state,
-            source_sow=self._raw_gnss_sow(obsr, t_gnss),
+            source_sow=self._explicit_gnss_sow(obsr),
             raw_position=pos_for_state,
             raw_velocity=vel_e,
             raw_attitude=att_rpy,
+            velocity_diff_start_sow=velocity_diff_start_sow,
+            velocity_diff_end_sow=velocity_diff_end_sow,
         )
 
         # Initialization is GNSS-assisted in this pipeline.  The optional

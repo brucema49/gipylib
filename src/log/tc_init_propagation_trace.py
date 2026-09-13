@@ -33,6 +33,59 @@ INITIALIZATION_INPUT_DEFAULT_FILENAMES = {
     "csv": "tc-initialization-input-trace.csv",
 }
 
+# The first columns intentionally match GREAT's initialization/propagation
+# trace header byte-for-byte.  Additional columns are append-only diagnostic
+# fields, so a row can be joined by the existing common state columns while
+# retaining the raw initialization provenance.
+GREAT_INIT_PROPAGATION_FIELDS = (
+    "stage", "exact_sow", "imu_prev_sow", "imu_curr_sow",
+    "imu_sample_count", "gnss_measurement_inserted",
+    "main_run_gnss_update_seen", "state_source", "pos_ecef_x",
+    "pos_ecef_y", "pos_ecef_z", "vel_ecef_x", "vel_ecef_y",
+    "vel_ecef_z", "antenna_ecef_x", "antenna_ecef_y", "antenna_ecef_z",
+    "C_b_e_00", "C_b_e_01", "C_b_e_02", "C_b_e_10", "C_b_e_11",
+    "C_b_e_12", "C_b_e_20", "C_b_e_21", "C_b_e_22", "quaternion_q0",
+    "quaternion_q1", "quaternion_q2", "quaternion_q3", "lever_frame",
+    "lever_x", "lever_y", "lever_z",
+)
+INITIALIZATION_INPUT_FIELDS = GREAT_INIT_PROPAGATION_FIELDS + (
+    "source_sow", "source_sow_definition", "timestamp", "state_sow",
+    "raw_position_available", "raw_position_source",
+    "raw_position_provenance", "raw_position_frame", "raw_position_order",
+    "raw_position_units", "raw_position_definition", "raw_position_x",
+    "raw_position_y", "raw_position_z", "raw_velocity_available",
+    "raw_velocity_source", "raw_velocity_provenance", "raw_velocity_frame",
+    "raw_velocity_order", "raw_velocity_units", "raw_velocity_definition",
+    "raw_velocity_x", "raw_velocity_y", "raw_velocity_z",
+    "raw_attitude_available", "raw_attitude_source",
+    "raw_attitude_provenance", "raw_attitude_frame", "raw_attitude_order",
+    "raw_attitude_units", "raw_attitude_definition", "raw_attitude_roll",
+    "raw_attitude_pitch", "raw_attitude_yaw", "raw_lever_available",
+    "raw_lever_source", "raw_lever_provenance", "raw_lever_frame",
+    "raw_lever_order", "raw_lever_units", "raw_lever_definition",
+    "raw_lever_x", "raw_lever_y", "raw_lever_z", "lever_applied",
+    "lever_ecef_x", "lever_ecef_y", "lever_ecef_z",
+    "velocity_diff_start_sow", "velocity_diff_end_sow",
+    "velocity_diff_dt_s", "velocity_diff_source",
+    "velocity_diff_definition", "canonical_pos_ecef_x",
+    "canonical_pos_ecef_y", "canonical_pos_ecef_z", "canonical_vel_ecef_x",
+    "canonical_vel_ecef_y", "canonical_vel_ecef_z", "canonical_C_b_e_00",
+    "canonical_C_b_e_01", "canonical_C_b_e_02", "canonical_C_b_e_10",
+    "canonical_C_b_e_11", "canonical_C_b_e_12", "canonical_C_b_e_20",
+    "canonical_C_b_e_21", "canonical_C_b_e_22", "canonical_quaternion_q0",
+    "canonical_quaternion_q1", "canonical_quaternion_q2",
+    "canonical_quaternion_q3", "converted_pos_ecef_x",
+    "converted_pos_ecef_y", "converted_pos_ecef_z", "converted_vel_ecef_x",
+    "converted_vel_ecef_y", "converted_vel_ecef_z", "converted_C_b_e_00",
+    "converted_C_b_e_01", "converted_C_b_e_02", "converted_C_b_e_10",
+    "converted_C_b_e_11", "converted_C_b_e_12", "converted_C_b_e_20",
+    "converted_C_b_e_21", "converted_C_b_e_22", "converted_quaternion_q0",
+    "converted_quaternion_q1", "converted_quaternion_q2",
+    "converted_quaternion_q3",
+)
+# Public name used by schema-parity tests and CSV consumers.
+INITIALIZATION_INPUT_CSV_FIELDS = INITIALIZATION_INPUT_FIELDS
+
 
 def _vector(value, size):
     try:
@@ -212,6 +265,17 @@ def _initialization_input_matrix(value):
         return None
 
 
+def _initialization_input_scalar(value):
+    """Return a finite diagnostic scalar, or an honest null."""
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if np.isfinite(result) else None
+
+
 def _enu_to_ecef(lat: float, lon: float) -> np.ndarray:
     """Build the canonical ENU -> ECEF rotation from the existing NED basis."""
     C_e_n = cal_Ce2n(lat, lon)
@@ -229,6 +293,31 @@ def _navigation_to_ecef(frame: str, lat: float, lon: float) -> np.ndarray | None
     return None
 
 
+def _normalized_order(order) -> str | None:
+    if order is None:
+        return None
+    return ",".join(part.strip().lower() for part in str(order).split(","))
+
+
+def _order_is(order, *accepted: str) -> bool:
+    return _normalized_order(order) in {
+        _normalized_order(item) for item in accepted
+    }
+
+
+def _rpy_from_order(raw_attitude, order) -> np.ndarray | None:
+    order = _normalized_order(order)
+    if order in {"roll,pitch,yaw", "r,p,y"}:
+        return np.asarray(raw_attitude, dtype=np.float64)
+    if order in {"yaw,pitch,roll", "y,p,r"}:
+        return np.asarray(raw_attitude, dtype=np.float64)[[2, 1, 0]]
+    return None
+
+
+def _component(value, index):
+    return None if value is None else value[index]
+
+
 def build_initialization_input_record(*, timestamp: float | None = None,
                                       source_sow: float | None = None,
                                       raw_position=None,
@@ -236,23 +325,31 @@ def build_initialization_input_record(*, timestamp: float | None = None,
                                       raw_attitude=None,
                                       raw_lever=None,
                                       state=None,
-                                      position_frame: str = "ECEF",
+                                      position_frame: str | None = None,
                                       position_order: str | None = None,
-                                      position_units: str = "m",
-                                      velocity_frame: str = "ECEF",
+                                      position_units: str | None = None,
+                                      position_provenance: str | None = None,
+                                      velocity_frame: str | None = None,
                                       velocity_order: str | None = None,
-                                      velocity_units: str = "m/s",
-                                      attitude_frame: str = "NED",
-                                      attitude_order: str = "roll,pitch,yaw",
-                                      attitude_units: str = "rad",
-                                      lever_frame: str = "FRD",
-                                      lever_order: str = "front,right,down",
-                                      lever_units: str = "m",
+                                      velocity_units: str | None = None,
+                                      velocity_provenance: str | None = None,
+                                      attitude_frame: str | None = None,
+                                      attitude_order: str | None = None,
+                                      attitude_units: str | None = None,
+                                      attitude_provenance: str | None = None,
+                                      lever_frame: str | None = None,
+                                      lever_order: str | None = None,
+                                      lever_units: str | None = None,
+                                      lever_provenance: str | None = None,
                                       lever_applied: bool = True,
                                       state_source: str | None = None,
                                       position_source: str | None = None,
                                       velocity_source: str | None = None,
-                                      attitude_source: str | None = None) -> dict:
+                                      attitude_source: str | None = None,
+                                      lever_source: str | None = None,
+                                      velocity_diff_start_sow: float | None = None,
+                                      velocity_diff_end_sow: float | None = None,
+                                      velocity_diff_source: str | None = None) -> dict:
     """Build the common, observational initialization-input record.
 
     Raw values retain the convention in which they entered initialization;
@@ -272,9 +369,13 @@ def build_initialization_input_record(*, timestamp: float | None = None,
     lever_frame = str(lever_frame or "").strip().upper() or None
 
     pos_ecef = None
-    if raw_pos is not None and position_frame == "ECEF":
+    if (raw_pos is not None and position_frame == "ECEF" and
+            _order_is(position_order, "x,y,z") and
+            str(position_units or "").strip().lower() in {"m", "meter", "meters"}):
         pos_ecef = raw_pos
-    elif raw_pos is not None and position_frame == "LLH":
+    elif (raw_pos is not None and position_frame == "LLH" and
+          _order_is(position_order, "latitude_deg,longitude_deg,height_m") and
+          str(position_units or "").strip().lower() in {"deg,m", "deg/m", "llh_deg_m"}):
         try:
             pos_ecef = llh2ecef(
                 np.radians(raw_pos[0]), np.radians(raw_pos[1]), raw_pos[2]
@@ -290,9 +391,14 @@ def build_initialization_input_record(*, timestamp: float | None = None,
             lat = lon = None
 
     vel_ecef = None
-    if raw_vel is not None and velocity_frame == "ECEF":
+    if (raw_vel is not None and velocity_frame == "ECEF" and
+            _order_is(velocity_order, "x,y,z") and
+            str(velocity_units or "").strip().lower() in {"m/s", "mps"}):
         vel_ecef = raw_vel
-    elif raw_vel is not None and lat is not None and velocity_frame in {"NED", "ENU"}:
+    elif (raw_vel is not None and lat is not None and velocity_frame in {"NED", "ENU"} and
+          ((velocity_frame == "NED" and _order_is(velocity_order, "north,east,down")) or
+           (velocity_frame == "ENU" and _order_is(velocity_order, "east,north,up"))) and
+          str(velocity_units or "").strip().lower() in {"m/s", "mps"}):
         try:
             vel_ecef = (_navigation_to_ecef(velocity_frame, lat, lon)
                         @ np.asarray(raw_vel, dtype=np.float64)).tolist()
@@ -302,9 +408,14 @@ def build_initialization_input_record(*, timestamp: float | None = None,
     C_b_e = None
     if raw_att is not None and lat is not None and attitude_frame in {"NED", "ENU"}:
         try:
-            attitude = np.asarray(raw_att, dtype=np.float64)
-            if str(attitude_units or "").strip().lower() in {"deg", "degree", "degrees"}:
+            attitude = _rpy_from_order(raw_att, attitude_order)
+            if attitude is None:
+                raise ValueError("unsupported attitude order")
+            attitude_unit = str(attitude_units or "").strip().lower()
+            if attitude_unit in {"deg", "degree", "degrees"}:
                 attitude = np.radians(attitude)
+            elif attitude_unit not in {"rad", "radian", "radians"}:
+                raise ValueError("unsupported attitude units")
             C_b_n = euler2dcm(attitude)
             C_n_e = _navigation_to_ecef(attitude_frame, lat, lon)
             C_b_e = (C_n_e @ C_b_n).tolist()
@@ -312,9 +423,15 @@ def build_initialization_input_record(*, timestamp: float | None = None,
             C_b_e = None
 
     lever_frd = None
-    if raw_lev is not None and lever_frame == "FRD":
+    lever_order_normalized = _normalized_order(lever_order)
+    lever_unit = str(lever_units or "").strip().lower()
+    if (raw_lev is not None and lever_frame == "FRD" and
+            lever_order_normalized in {"front,right,down", "f,r,d"} and
+            lever_unit in {"m", "meter", "meters"}):
         lever_frd = raw_lev
-    elif raw_lev is not None and lever_frame == "RFU":
+    elif (raw_lev is not None and lever_frame == "RFU" and
+          lever_order_normalized in {"right,front,up", "r,f,u"} and
+          lever_unit in {"m", "meter", "meters"}):
         # Keep the existing reader convention explicit; this is diagnostic
         # conversion only and does not alter the sensor or estimator path.
         lever_frd = [raw_lev[1], raw_lev[0], -raw_lev[2]]
@@ -332,12 +449,16 @@ def build_initialization_input_record(*, timestamp: float | None = None,
     actual_vel = _initialization_input_vector(getattr(state, "vel_e", None)) if state is not None else vel_ecef
     actual_C = _initialization_input_matrix(getattr(state, "C_b_e", None)) if state is not None else _initialization_input_matrix(C_b_e)
     actual_q = _initialization_input_vector(getattr(state, "q_b_e", None), 4) if state is not None else _initialization_input_vector(canonical_q, 4)
-    if source_sow is None and timestamp is not None:
-        try:
-            _week, source_sow = unix_to_gpst(float(timestamp))
-        except Exception:
-            source_sow = None
-    exact_sow = None if source_sow is None else float(source_sow)
+    antenna_ecef = None
+    if actual_pos is not None and actual_C is not None and lever_frd is not None:
+        antenna_ecef = (
+            np.asarray(actual_pos) + np.asarray(actual_C) @ np.asarray(lever_frd)
+        ).tolist()
+    exact_sow = _initialization_input_scalar(source_sow)
+    diff_start_sow = _initialization_input_scalar(velocity_diff_start_sow)
+    diff_end_sow = _initialization_input_scalar(velocity_diff_end_sow)
+    diff_dt = (None if diff_start_sow is None or diff_end_sow is None
+               else diff_end_sow - diff_start_sow)
     week = None
     state_sow = None
     if timestamp is not None:
@@ -348,13 +469,6 @@ def build_initialization_input_record(*, timestamp: float | None = None,
         except Exception:
             pass
 
-    if position_order is None:
-        position_order = "latitude_deg,longitude_deg,height_m" if position_frame == "LLH" else "x,y,z"
-    if velocity_order is None:
-        velocity_order = {
-            "NED": "north,east,down",
-            "ENU": "east,north,up",
-        }.get(velocity_frame, "x,y,z")
     position_definition = {
         "ECEF": "raw [x,y,z] in Earth-fixed Cartesian coordinates",
         "LLH": "raw [latitude_deg,longitude_deg,height_m] converted with WGS84",
@@ -365,8 +479,8 @@ def build_initialization_input_record(*, timestamp: float | None = None,
         "ENU": "raw [east,north,up] velocity; converted with C_enu^e",
     }.get(velocity_frame, "raw velocity frame unavailable or unsupported")
     attitude_definition = (
-        "raw roll,pitch,yaw in navigation frame; ZYX yaw-pitch-roll; "
-        "C_b^e = C_nav^e @ C_b^nav"
+        "raw attitude uses the explicitly declared order/units in the declared "
+        "navigation frame; ZYX yaw-pitch-roll; C_b^e = C_nav^e @ C_b^nav"
     )
     lever_definition = (
         "raw IMU-to-GNSS lever in FRD [front,right,down] meters; "
@@ -380,8 +494,11 @@ def build_initialization_input_record(*, timestamp: float | None = None,
         "timestamp": None if timestamp is None else float(timestamp),
         "gps_week": week,
         "week": week,
-        "sow": exact_sow if exact_sow is not None else state_sow,
+        "sow": exact_sow,
         "source_sow": exact_sow,
+        "source_sow_definition": (
+            "explicit source GPST SOW; null when the source did not provide SOW"
+        ),
         "exact_sow": exact_sow,
         "state_sow": state_sow,
         "timestamp_unix_s": None if timestamp is None else float(timestamp),
@@ -389,23 +506,35 @@ def build_initialization_input_record(*, timestamp: float | None = None,
         "position_source": position_source,
         "velocity_source": velocity_source,
         "attitude_source": attitude_source,
+        "raw_position_available": raw_pos is not None,
+        "raw_position_source": position_source,
+        "raw_position_provenance": position_provenance,
         "raw_position": raw_pos,
         "raw_position_frame": position_frame,
         "raw_position_order": position_order,
         "raw_position_units": position_units,
         "raw_position_definition": position_definition,
         "position_definition": position_definition,
+        "raw_velocity_available": raw_vel is not None,
+        "raw_velocity_source": velocity_source,
+        "raw_velocity_provenance": velocity_provenance,
         "raw_velocity": raw_vel,
         "raw_velocity_frame": velocity_frame,
         "raw_velocity_order": velocity_order,
         "raw_velocity_units": velocity_units,
         "raw_velocity_definition": velocity_definition,
+        "raw_attitude_available": raw_att is not None,
+        "raw_attitude_source": attitude_source,
+        "raw_attitude_provenance": attitude_provenance,
         "raw_attitude": raw_att,
         "raw_attitude_frame": attitude_frame,
         "raw_attitude_order": attitude_order,
         "raw_attitude_units": attitude_units,
         "raw_attitude_definition": attitude_definition,
         "attitude_definition": attitude_definition,
+        "raw_lever_available": raw_lev is not None,
+        "raw_lever_source": lever_source,
+        "raw_lever_provenance": lever_provenance,
         "raw_lever": raw_lev,
         "raw_lever_frame": lever_frame,
         "raw_lever_order": lever_order,
@@ -414,6 +543,14 @@ def build_initialization_input_record(*, timestamp: float | None = None,
         "lever_applied": bool(lever_applied),
         "lever_frd": lever_frd,
         "lever_ecef": lever_ecef,
+        "velocity_diff_start_sow": diff_start_sow,
+        "velocity_diff_end_sow": diff_end_sow,
+        "velocity_diff_dt_s": diff_dt,
+        "velocity_diff_source": velocity_diff_source,
+        "velocity_diff_definition": (
+            "explicit source SOW interval [start,end] used for velocity="
+            "(position_end-position_start)/(end-start); null when unavailable"
+        ),
         "canonical_position_ecef": canonical_pos,
         "canonical_pos_ecef": canonical_pos,
         "canonical_velocity_ecef": vel_ecef,
@@ -466,7 +603,8 @@ def build_initialization_input_record(*, timestamp: float | None = None,
     for prefix, value in (("canonical_pos_ecef", canonical_pos),
                           ("canonical_vel_ecef", vel_ecef),
                           ("converted_pos_ecef", actual_pos),
-                          ("converted_vel_ecef", actual_vel)):
+                          ("converted_vel_ecef", actual_vel),
+                          ("lever_ecef", lever_ecef)):
         axis_names = ("x", "y", "z")
         for axis, item in zip(axis_names, value or (None, None, None)):
             record[f"{prefix}_{axis}"] = item
@@ -485,6 +623,46 @@ def build_initialization_input_record(*, timestamp: float | None = None,
         record[f"canonical_quaternion_q{index}"] = (
             None if canonical_q is None else canonical_q[index]
         )
+    # Normative common-header aliases (the same spelling/order as GREAT).
+    common_values = {
+        "pos_ecef_x": _component(actual_pos, 0),
+        "pos_ecef_y": _component(actual_pos, 1),
+        "pos_ecef_z": _component(actual_pos, 2),
+        "vel_ecef_x": _component(actual_vel, 0),
+        "vel_ecef_y": _component(actual_vel, 1),
+        "vel_ecef_z": _component(actual_vel, 2),
+        "antenna_ecef_x": _component(antenna_ecef, 0),
+        "antenna_ecef_y": _component(antenna_ecef, 1),
+        "antenna_ecef_z": _component(antenna_ecef, 2),
+        "lever_frame": lever_frame,
+        "lever_x": _component(lever_frd, 0),
+        "lever_y": _component(lever_frd, 1),
+        "lever_z": _component(lever_frd, 2),
+        "imu_prev_sow": None,
+        "imu_curr_sow": None,
+        "imu_sample_count": 0,
+        "gnss_measurement_inserted": 0,
+        "main_run_gnss_update_seen": 0,
+    }
+    for row in range(3):
+        for col in range(3):
+            common_values[f"C_b_e_{row}{col}"] = (
+                None if actual_C is None else actual_C[row][col]
+            )
+    for index in range(4):
+        common_values[f"quaternion_q{index}"] = (
+            None if actual_q is None else actual_q[index]
+        )
+    record.update(common_values)
+    for prefix, value in (("raw_position", raw_pos),
+                          ("raw_velocity", raw_vel),
+                          ("raw_attitude", raw_att),
+                          ("raw_lever", raw_lev)):
+        for index, name in enumerate(("x", "y", "z")):
+            record[f"{prefix}_{name}"] = _component(value, index)
+    record["raw_attitude_roll"] = _component(raw_att, 0)
+    record["raw_attitude_pitch"] = _component(raw_att, 1)
+    record["raw_attitude_yaw"] = _component(raw_att, 2)
     return record
 
 
@@ -494,6 +672,7 @@ class TcInitPropagationTraceWriter:
     SCHEMA = SCHEMA
     DEFAULT_FILENAMES = DEFAULT_FILENAMES
     CONFIG_KEY = "init_propagation_trace"
+    CSV_FIELDS = None
 
     def __init__(self, config: dict | str | Path | None = None, *,
                  output_dir=None, filename=None, format=None, enabled=None):
@@ -661,7 +840,8 @@ class TcInitPropagationTraceWriter:
                           separators=(",", ":"), allow_nan=False)
 
     def _write_csv(self, event: dict) -> None:
-        fields = tuple(event.keys())
+        fields = (tuple(self.CSV_FIELDS) if self.CSV_FIELDS is not None
+                  else tuple(event.keys()))
         if self._csv_writer is None:
             self._csv_fields = fields
             self._csv_writer = csv.DictWriter(
@@ -698,3 +878,4 @@ class TcInitializationInputTraceWriter(TcInitPropagationTraceWriter):
     SCHEMA = INITIALIZATION_INPUT_SCHEMA
     CONFIG_KEY = "initialization_input_trace"
     DEFAULT_FILENAMES = INITIALIZATION_INPUT_DEFAULT_FILENAMES
+    CSV_FIELDS = INITIALIZATION_INPUT_CSV_FIELDS
