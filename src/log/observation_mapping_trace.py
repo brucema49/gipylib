@@ -21,12 +21,22 @@ TRACE_FIELDS = (
     "error_class", "error_code",
 )
 _DISPOSITIONS = frozenset(("decoded", "skip", "reject"))
+_SYSTEM_ALIASES = {
+    "G": "G", "GPS": "G",
+    "R": "R", "GLO": "R", "GLONASS": "R",
+    "E": "E", "GAL": "E", "GALILEO": "E",
+    "C": "C", "BDS": "C", "BEIDOU": "C",
+    "J": "J", "QZS": "J", "QZSS": "J",
+    "S": "S", "SBS": "S", "SBAS": "S",
+}
 
 
 def mapping_hash(raw_band_priority: Mapping[str, Any]) -> str:
     """Return a stable digest of an instance's ordered raw-band mapping."""
     canonical = {}
     for system, bands in raw_band_priority.items():
+        system_name = str(system).strip().upper()
+        system_name = _SYSTEM_ALIASES.get(system_name, system_name)
         if isinstance(bands, Mapping):
             # Accept an already-derived ``raw_band -> slot`` view as a
             # convenience for reader callers.  Sorting by slot preserves the
@@ -35,7 +45,7 @@ def mapping_hash(raw_band_priority: Mapping[str, Any]) -> str:
                 bands.items(), key=lambda item: item[1])]
         else:
             ordered = list(bands)
-        canonical[str(system)] = [int(band) for band in ordered]
+        canonical[system_name] = [int(band) for band in ordered]
     payload = json.dumps(
         canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("ascii")).hexdigest()
