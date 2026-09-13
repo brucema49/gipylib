@@ -19,6 +19,7 @@ import numpy as np
 from src.core.data_types import ImuMeasurement
 from src.core.gnss.rtklib.rtkcmn import sat2prn, uGNSS
 from src.core.tc.tc_integration import TcIntegration
+from src.log.tc_init_propagation_trace import TcInitPropagationTraceWriter
 from src.log.tc_measurement_trace import TcMeasurementTraceWriter
 
 logger = logging.getLogger(__name__)
@@ -61,12 +62,16 @@ class TcStream:
         self._imu_time_offset = float(
             config.get("ins", {}).get("imu_time_offset_s", 0.0))
         self._measurement_trace_writer = TcMeasurementTraceWriter(config)
+        self._init_propagation_trace_writer = TcInitPropagationTraceWriter(config)
         self._integ = TcIntegration(
             config, mode=self._tc_mode,
             output_callback=self._write_integration_output,
             measurement_trace_sink=(self._measurement_trace_writer
                                      if self._measurement_trace_writer.enabled
                                      else None),
+            init_propagation_trace_sink=(
+                self._init_propagation_trace_writer
+                if self._init_propagation_trace_writer.enabled else None),
         )
 
         # 初始化前缓冲
@@ -85,6 +90,7 @@ class TcStream:
         if self.stat_writer is not None:
             self.stat_writer.open()
         self._measurement_trace_writer.open()
+        self._init_propagation_trace_writer.open()
 
     def close(self) -> None:
         try:
@@ -98,6 +104,7 @@ class TcStream:
                     self.writer.close()
                 finally:
                     self._measurement_trace_writer.close()
+                    self._init_propagation_trace_writer.close()
 
     def finalize(self) -> int:
         """流式结束，返回总输出数。"""

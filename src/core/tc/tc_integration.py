@@ -52,6 +52,7 @@ from src.core.tc.tc_ambiguity import TcAmbiguity
 from src.core.tc.tc_degrade import TcDegradeManager
 from src.core.tc.tc_estimator import TcEstimator
 from src.core.tc.tc_measurement import SppTcMeas, RtkTcMeas, RtdTcMeas
+from src.log.tc_init_propagation_trace import build_trace_record
 from src.log.tc_matrix_diagnostics import TcMatrixDiagnosticWriter
 
 logger = logging.getLogger(__name__)
@@ -76,11 +77,21 @@ class TcIntegration:
     """
 
     def __init__(self, config: dict, mode: str = "spp", output_callback=None,
-                 measurement_trace_sink=None):
+                 measurement_trace_sink=None,
+                 init_propagation_trace_sink=None):
         self._cfg = config
         self._mode = mode
         self._output_callback = output_callback
         self._measurement_trace_sink = measurement_trace_sink
+        self._init_propagation_trace_sink = init_propagation_trace_sink
+        # The interval is deliberately bounded by the first post-init GNSS
+        # update.  This documents that these samples are not a GNSS-free run:
+        # initialization itself already consumed GNSS observations.
+        self._init_propagation_trace_active = False
+        self._init_propagation_trace_first_gnss_sow = None
+        self._init_propagation_trace_pending = (
+            [] if init_propagation_trace_sink is not None else None
+        )
         self._initializer = InsInitializer(config)
         ins_cfg = config.get("ins", {})
         # 初始化模式选择 (与 LcStream 一致)
@@ -203,6 +214,10 @@ class TcIntegration:
 
     def close(self) -> None:
         """Close optional diagnostic output without affecting the filter."""
+        self._flush_pending_init_propagation_trace(
+            first_gnss_observed=self._init_propagation_trace_first_gnss_sow
+            is not None
+        )
         if self._matrix_diagnostics is not None:
             try:
                 self._matrix_diagnostics.close()
@@ -217,10 +232,15 @@ class TcIntegration:
 
     def _record_latest_propagation(self) -> None:
         """Write the latest estimator propagation, if diagnostics are enabled."""
-        if self._matrix_diagnostics is None or self._est is None:
+        if (self._est is None or
+                (self._matrix_diagnostics is None and
+                 self._init_propagation_trace_sink is None)):
             return
         snapshot = getattr(self._est, "last_propagation_snapshot", None)
         if snapshot is None:
+            return
+        self._emit_init_propagation_trace(snapshot)
+        if self._matrix_diagnostics is None:
             return
         try:
             self._matrix_diagnostics.write_imu_prop(
@@ -233,6 +253,137 @@ class TcIntegration:
             )
         except (OSError, TypeError, ValueError) as exc:
             self._disable_matrix_diagnostics(exc)
+
+    def _trace_propagation_sow(self, timestamp: float) -> float:
+        """Use source increment SOW when available; otherwise GPST conversion."""
+        current = self.imucur
+        if current is not None:
+            try:
+                if (current.is_increment() and
+                        abs(float(current.timestamp) - float(timestamp)) <= 1e-9):
+                    return float(current.increment_view().sow)
+            except (AttributeError, TypeError, ValueError):
+                pass
+        _week, sow = unix_to_gpst(float(timestamp))
+        return float(sow)
+
+    def _trace_imu_sow(self, imu) -> float | None:
+        if imu is None:
+            return None
+        try:
+            if imu.is_increment():
+                return float(imu.increment_view().sow)
+            _week, sow = unix_to_gpst(float(imu.timestamp))
+            return float(sow)
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _emit_init_propagation_trace(self, snapshot: dict) -> None:
+        """Emit one committed pre-first-GNSS propagation, when explicitly enabled."""
+        if (self._init_propagation_trace_sink is None or
+                not self._init_propagation_trace_active):
+            return
+        try:
+            state = self._est.state
+            current = self.imucur
+            source_form = str(
+                self._cfg.get("ins", {}).get("imu_data_form", "")) or None
+            if source_form is None:
+                source_form = (
+                    "increment" if current is not None and
+                    current.is_increment() else "rate"
+                )
+            propagation_form = (
+                "increment" if current is not None and current.is_increment()
+                else "rate"
+            )
+            record = build_trace_record(
+                "imu_propagation_pre_gnss", state,
+                sow=self._trace_propagation_sow(snapshot["timestamp"]),
+                dt=snapshot["dt"], gnss_free=False,
+                isolation="pre_first_gnss_update;not_gnss_free",
+                first_gnss_sow=self._init_propagation_trace_first_gnss_sow,
+                input_imu_form=source_form,
+                propagation_form=propagation_form,
+                imu_prev_sow=self._trace_imu_sow(self.imupre),
+                imu_curr_sow=self._trace_imu_sow(current),
+                imu_sample_count=1,
+                gnss_measurement_inserted=0,
+                main_run_gnss_update_seen=0,
+                state_source=(
+                    "main_run_gnss_assisted;pre_first_gnss_update;"
+                    "not_gnss_free"
+                ),
+            )
+            if (self._init_propagation_trace_first_gnss_sow is None and
+                    self._init_propagation_trace_pending is not None):
+                # The producer can deliver IMU ahead of the GNSS queue.  Hold
+                # only this bounded diagnostic slice until the first GNSS
+                # timestamp is known, so every row carries an honest bound.
+                self._init_propagation_trace_pending.append(record)
+            else:
+                self._deliver_init_propagation_trace(record)
+        except Exception as exc:
+            # Diagnostics are strictly observational.  A malformed optional
+            # snapshot must not change propagation or update ordering.
+            logger.debug("TC init propagation trace unavailable: %s", exc)
+
+    def _emit_initialization_complete_trace(self, state, *, sow=None) -> None:
+        """Emit the real initialization handoff, explicitly GNSS-assisted."""
+        if self._init_propagation_trace_sink is None:
+            return
+        try:
+            record = build_trace_record(
+                "initialization_complete", state, sow=sow, gnss_free=False,
+                isolation="gnss_assisted_initialization;not_gnss_free",
+                first_gnss_sow=self._init_propagation_trace_first_gnss_sow,
+                state_source=(
+                    "main_run_gnss_assisted_initialization;not_gnss_free"
+                ),
+            )
+            self._deliver_init_propagation_trace(record)
+        except Exception as exc:
+            logger.debug("TC initialization trace unavailable: %s", exc)
+
+    def _deliver_init_propagation_trace(self, record: dict) -> None:
+        sink = self._init_propagation_trace_sink
+        if sink is None:
+            return
+        writer = getattr(sink, "write", None)
+        appender = getattr(sink, "append", None)
+        if writer is not None:
+            writer(record)
+        elif appender is not None:
+            appender(record)
+        elif callable(sink):
+            sink(record)
+        else:
+            raise TypeError(
+                "TC init propagation trace sink must be callable, writable, "
+                "or appendable"
+            )
+
+    def _flush_pending_init_propagation_trace(self, *,
+                                              first_gnss_observed: bool) -> None:
+        pending = self._init_propagation_trace_pending
+        if not pending:
+            return
+        if first_gnss_observed:
+            for record in pending:
+                record["first_gnss_sow"] = float(
+                    self._init_propagation_trace_first_gnss_sow)
+                record["isolation"] = "pre_first_gnss_update;not_gnss_free"
+                record["gnss_isolation"] = record["isolation"]
+                self._deliver_init_propagation_trace(record)
+        else:
+            for record in pending:
+                record["isolation"] = (
+                    "pre_first_gnss_update;first_gnss_not_observed;"
+                    "not_gnss_free"
+                )
+                record["gnss_isolation"] = record["isolation"]
+                self._deliver_init_propagation_trace(record)
+        pending.clear()
 
     def _record_matrix_update_diagnostic(self, timestamp: float, pre_p,
                                          post_p, innovation, s_matrix,
@@ -630,6 +781,14 @@ class TcIntegration:
             return
         self.pending_obs.append((obsr, obsb, nav, t_gnss))
         self._last_gnss_t = t_gnss
+        if (self._init_propagation_trace_active and
+                self._init_propagation_trace_first_gnss_sow is None):
+            self._init_propagation_trace_first_gnss_sow = (
+                self._raw_gnss_sow(obsr, t_gnss)
+            )
+            self._flush_pending_init_propagation_trace(
+                first_gnss_observed=True
+            )
 
     # ===== 初始化 =====
 
@@ -798,6 +957,23 @@ class TcIntegration:
         self._last_ns = ns
         self._last_gnss_t = init_state.timestamp
 
+        # Initialization is GNSS-assisted in this pipeline.  Keep that fact
+        # explicit in the optional audit output, then bound propagation
+        # records to the real pre-first-update interval during replay.
+        if self._init_propagation_trace_sink is not None:
+            future_sows = [
+                self._raw_gnss_sow(item[0], item[3])
+                for item in self._init_obs if item[3] > init_state.timestamp
+            ]
+            self._init_propagation_trace_first_gnss_sow = (
+                min(future_sows) if future_sows else None
+            )
+            self._init_propagation_trace_active = True
+            self._emit_initialization_complete_trace(
+                init_state,
+                sow=self._raw_gnss_sow(obsr, t_gnss),
+            )
+
         logger.info(
             f"TcIntegration 初始化成功: t={init_state.timestamp:.3f}, "
             f"mode={self._mode}, span={span:.1f}s, "
@@ -842,6 +1018,10 @@ class TcIntegration:
             obsr/obsb/nav: GNSS 原始观测
             t_gnss: GNSS 时间戳
         """
+        # A propagation immediately before this call is still part of the
+        # requested pre-GNSS window; subsequent propagation is not.  Flipping
+        # this flag here preserves the existing measurement ordering.
+        self._init_propagation_trace_active = False
         si = self._est.si
         # 重置钟差为白噪声模型 (必须在 effective_x/build 之前)
         # 这样 innovation 用 clk=0 计算, KF 每历元独立估计钟差,

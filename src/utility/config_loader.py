@@ -16,6 +16,7 @@ SUPPORTED_POS_FORMATS = {"llh", "xyz"}
 SUPPORTED_TIME_FORMATS = {"gpst", "datetime"}
 SUPPORTED_TRACE_LEVELS = {0, 1, 2, 3}
 SUPPORTED_MEASUREMENT_TRACE_FORMATS = {"jsonl", "csv"}
+SUPPORTED_INIT_PROPAGATION_TRACE_FORMATS = {"jsonl", "csv"}
 
 _WGS84_A = 6378137.0
 _WGS84_F = 1 / 298.257223563
@@ -122,6 +123,34 @@ def _validate_measurement_trace(tc_cfg: dict) -> None:
     trace_cfg["filename"] = filename
 
 
+def _validate_init_propagation_trace(tc_cfg: dict) -> None:
+    """Normalize the opt-in initialization/propagation trace configuration."""
+    trace_cfg = tc_cfg.setdefault("init_propagation_trace", {})
+    if trace_cfg is None:
+        trace_cfg = {}
+        tc_cfg["init_propagation_trace"] = trace_cfg
+    if not isinstance(trace_cfg, dict):
+        raise ValueError("tc.init_propagation_trace must be a mapping")
+
+    trace_cfg["enabled"] = _parse_bool(
+        trace_cfg.get("enabled", False),
+        "tc.init_propagation_trace.enabled")
+    fmt = str(trace_cfg.get("format", "jsonl")).strip().lower()
+    if fmt not in SUPPORTED_INIT_PROPAGATION_TRACE_FORMATS:
+        raise ValueError(
+            "tc.init_propagation_trace.format must be one of "
+            f"{SUPPORTED_INIT_PROPAGATION_TRACE_FORMATS}, got '{fmt}'")
+    trace_cfg["format"] = fmt
+    default_name = f"tc-init-propagation-trace.{fmt}"
+    filename = str(trace_cfg.get("filename", default_name))
+    if (not filename or filename in (".", "..") or
+            Path(filename).name != filename or "/" in filename or
+            "\\" in filename or Path(filename).is_absolute()):
+        raise ValueError(
+            "tc.init_propagation_trace.filename must be a basename")
+    trace_cfg["filename"] = filename
+
+
 def load_config(path) -> dict:
     """加载 YAML 配置并做必要校验。
 
@@ -186,6 +215,7 @@ def load_config(path) -> dict:
     if not isinstance(tc_cfg, dict):
         raise ValueError("tc must be a mapping")
     _validate_measurement_trace(tc_cfg)
+    _validate_init_propagation_trace(tc_cfg)
 
     # ``imu_data_form`` 描述传感器文件的数值语义，``rate_to_increment`` 描述
     # 是否在机械编排边界把 rate 一次性转成增量。``imu_data_process_form`` 是
