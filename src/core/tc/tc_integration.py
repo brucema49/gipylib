@@ -1521,7 +1521,22 @@ class TcIntegration:
             h_amb_max = 0.0
             k_amb_norm = -1.0
             post_amb_var_median = -1.0
-        feedback_x = self._est.tc_meas_update(v, H, R, source=mode)
+        # The measurement builder is the owner of the current DD trace
+        # identity.  Pass it only when its opt-in sink is enabled; the
+        # estimator then freezes and emits post-fit immediately after Joseph
+        # and before feedback.  The optional kwarg is omitted on the normal
+        # path to preserve compatibility with estimator test doubles.
+        trace_builder = None
+        if (mode == "rtk" and
+                getattr(self._meas_builder, "_measurement_trace", None)
+                is not None and
+                hasattr(self._meas_builder, "emit_trace_stage")):
+            trace_builder = self._meas_builder
+        if trace_builder is None:
+            feedback_x = self._est.tc_meas_update(v, H, R, source=mode)
+        else:
+            feedback_x = self._est.tc_meas_update(
+                v, H, R, source=mode, trace=trace_builder)
         if feedback_x is None:
             reject_info = dict(info)
             reject_info["postfit_norm"] = float(
@@ -1545,14 +1560,15 @@ class TcIntegration:
             # overwrite it with a 20-30 m position correction and defeat the
             # post-fit gate.
             self._on_meas_failure(obsr, obsb, nav, t_gnss)
-            self._emit_measurement_trace_stage(
-                "post_measurement",
-                state=self._est.state, P=self._est.P, x=pre_x,
-                update={"attempted": True, "accepted": False,
-                        "status": "postfit_rejected",
-                        "feedback_x": np.zeros_like(self._est.x),
-                        "postfit": np.asarray(v) - H @ pre_x},
-            )
+            if trace_builder is None:
+                self._emit_measurement_trace_stage(
+                    "post_measurement",
+                    state=self._est.state, P=self._est.P, x=pre_x,
+                    update={"attempted": True, "accepted": False,
+                            "status": "postfit_rejected",
+                            "feedback_x": np.zeros_like(self._est.x),
+                            "postfit": np.asarray(v) - H @ pre_x},
+                )
             return
         update_info = dict(info)
         postfit = np.asarray(v) - H @ feedback_x
@@ -1650,19 +1666,27 @@ class TcIntegration:
                     update={"attempted": True, "accepted": False,
                             "status": "position_jump_rolled_back",
                             "feedback_x": feedback_x,
-                            "postfit": postfit},
+                            "postfit": postfit,
+                            "postfit_definition": "v_minus_H_x_post",
+                            "postfit_scope": (
+                                "measurement_update_post_joseph_pre_feedback"
+                            ),
+                            "postfit_available": True,
+                            "postfit_variance": None,
+                            "postfit_variance_available": False},
                 )
                 return
 
         self._last_meas_pos = self._est.state.pos_e.copy()
         self._maybe_align_yaw(t_gnss)
-        self._emit_measurement_trace_stage(
-            "post_measurement",
-            state=self._est.state, P=self._est.P, x=feedback_x,
-            update={"attempted": True, "accepted": True,
-                    "status": "accepted", "feedback_x": feedback_x,
-                    "postfit": postfit},
-        )
+        if trace_builder is None:
+            self._emit_measurement_trace_stage(
+                "post_measurement",
+                state=self._est.state, P=self._est.P, x=feedback_x,
+                update={"attempted": True, "accepted": True,
+                        "status": "accepted", "feedback_x": feedback_x,
+                        "postfit": postfit},
+            )
 
     def _maybe_align_yaw(self, t_gnss: float) -> None:
         """一次性 yaw 航向对齐 (等价 ignav ant2inins/vel2head 语义)。
