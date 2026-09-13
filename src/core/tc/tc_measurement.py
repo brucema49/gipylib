@@ -451,6 +451,7 @@ class _DdBase(TcMeasurement):
         # post-measurement snapshot with the same event identity; it is never
         # consulted by the measurement builder.
         self._last_trace_record = None
+        self._last_trace_final_emitted = False
 
     @staticmethod
     def _trace_state_snapshot(state, si=None, x=None, stage=None, P=None):
@@ -1118,10 +1119,13 @@ class _DdBase(TcMeasurement):
         # reported as one.
         context["ambiguity_resolution_calls"] = 0
         context["ar_call_counter"] = context["ambiguity_resolution_calls"]
-        # Materialize a distinct pre record before emitting.  The post-stage
-        # record is derived from this immutable diagnostic snapshot later.
+        # Materialize a distinct pre record for the eventual final stage.
+        # The trigger owns the final gate/rollback decision, so no record is
+        # emitted at build time when it requests deferred trace output.
         self._last_trace_record = deepcopy(context)
-        self._measurement_trace.emit(self._last_trace_record)
+        self._last_trace_final_emitted = False
+        if not getattr(self, "_defer_trace_emit", False):
+            self._measurement_trace.emit(self._last_trace_record)
 
     def emit_trace_stage(self, stage, *, state, si, x=None, P=None,
                          update=None):
@@ -1137,13 +1141,22 @@ class _DdBase(TcMeasurement):
         stage = str(stage)
         if stage not in {"pre_measurement", "post_measurement"}:
             raise ValueError("trace stage must be pre_measurement or post_measurement")
+        update = dict(update or {})
+        final = bool(update.get("final", False))
+        if final and self._last_trace_final_emitted:
+            return
         record = deepcopy(self._last_trace_record)
         record["stage"] = stage
         record["state_stage"] = stage
         snapshot = self._trace_state_snapshot(state, si, x, stage=stage, P=P)
         record.update(snapshot)
         record["nominal_state"] = deepcopy(snapshot)
-        update_record = dict(update or {})
+        update_record = update
+        accepted = bool(update_record.get("accepted", False))
+        if final:
+            record["final"] = True
+            record["status"] = str(update_record.get("status", "completed"))
+            record["accepted"] = accepted
         feedback_x = update_record.get("feedback_x")
         try:
             feedback_values = np.asarray(feedback_x, dtype=float).reshape(-1)
@@ -1204,25 +1217,43 @@ class _DdBase(TcMeasurement):
         update_record.setdefault("attempted", True)
         update_record.setdefault("accepted", None)
         update_record.setdefault("status", "completed")
-        update_record.setdefault(
-            "postfit_definition", "postfit_residual = l - A*dx [m]")
-        update_record.setdefault("postfit_scope", None)
-        update_record.setdefault("postfit_available", postfit_values.size > 0)
-        update_record.setdefault("postfit_variance", None)
-        update_record.setdefault("postfit_variance_available", False)
-        if postfit_values.size:
+        if not final or accepted:
+            update_record.setdefault(
+                "postfit_definition", "postfit_residual = l - A*dx [m]"
+            )
+            update_record.setdefault("postfit_scope", None)
+            update_record.setdefault(
+                "postfit_available", postfit_values.size > 0
+            )
+            update_record.setdefault("postfit_variance", None)
+            update_record.setdefault("postfit_variance_available", False)
+        if postfit_values.size and (not final or accepted):
             record["postfit"] = [float(value) for value in postfit_values]
-        else:
+        elif not final:
             record["postfit"] = None
-        record["postfit_available"] = postfit_available
-        record["postfit_definition"] = postfit_definition
-        record["postfit_scope"] = postfit_scope
-        record["postfit_variance"] = postfit_variance
-        record["postfit_variance_available"] = postfit_variance_available
+        if not final or accepted:
+            record["postfit_available"] = postfit_available
+            record["postfit_definition"] = postfit_definition
+            record["postfit_scope"] = postfit_scope
+            record["postfit_variance"] = postfit_variance
+            record["postfit_variance_available"] = postfit_variance_available
+        else:
+            # Rejected final epochs intentionally carry no post-fit value or
+            # definition: no posterior is a valid accepted measurement.
+            record.pop("postfit", None)
+            for row in record.get("dd_rows", []):
+                for key in (
+                    "postfit", "postfit_residual", "postfit_definition",
+                    "postfit_scope", "postfit_available",
+                    "postfit_variance", "postfit_variance_available",
+                ):
+                    row.pop(key, None)
         update_record.pop("feedback_x", None)
         update_record.pop("postfit", None)
         record["update"] = update_record
         self._measurement_trace.emit(record)
+        if final:
+            self._last_trace_final_emitted = True
 
     # ---- 子类重写 ----
     def _amb_idx(self, sat, freq, si):

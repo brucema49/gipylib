@@ -98,6 +98,9 @@ class TcEstimator(LcEstimator):
         self._pending_pos_elapsed = 0.0
         self._pending_pos_start = None
         self._last_propagation_snapshot = None
+        # A trace-only post-fit payload is frozen at the Joseph boundary and
+        # consumed by TcIntegration after its final acceptance/rollback gate.
+        self._pending_tc_postfit_trace = None
 
     @property
     def last_propagation_snapshot(self):
@@ -276,11 +279,18 @@ class TcEstimator(LcEstimator):
 
         ``trace`` is an optional measurement-builder hook.  When present,
         the diagnostic post-fit is frozen immediately after the Joseph
-        update and emitted before closed-loop feedback changes the nominal
-        state.  It is deliberately absent from the solver path by default.
+        update for final emission by the integration boundary.  It is
+        deliberately absent from the solver path by default.
         """
         if len(v) == 0:
             return None
+        if trace is not None:
+            self._pending_tc_postfit_trace = {
+                "trace": trace,
+                "postfit": None,
+                "x_post": None,
+                "P_post": None,
+            }
         P_before = self.P.copy()
         x_before = self.x.copy()
         self.joseph_update(v, H, R)
@@ -292,10 +302,6 @@ class TcEstimator(LcEstimator):
         if source == "rtk":
             postfit = np.asarray(v) - H @ self.x
             if not validate_tc_postfit(postfit, R, n_parameters=3):
-                self._emit_tc_postfit_trace(
-                    trace, v, H, self.x, self.P, postfit,
-                    accepted=False, status="postfit_rejected",
-                )
                 self.P = P_before
                 self.x = x_before
                 return None
@@ -304,47 +310,25 @@ class TcEstimator(LcEstimator):
         if trace is not None:
             if postfit is None:
                 postfit = np.asarray(v) - H @ x_post
-            self._emit_tc_postfit_trace(
-                trace, v, H, x_post, P_post, postfit,
-                accepted=True, status="accepted",
-            )
+            self._pending_tc_postfit_trace = {
+                "trace": trace,
+                "postfit": np.asarray(postfit, dtype=float).copy(),
+                "x_post": x_post.copy(),
+                "P_post": P_post.copy(),
+            }
         feedback_x = x_post
         self.feedback()
         return feedback_x
 
-    def _emit_tc_postfit_trace(self, trace, v, H, x_post, P_post,
-                               postfit, *, accepted: bool, status: str):
-        """Emit the frozen linear post-fit through an optional trace hook."""
-        if trace is None:
-            return
-        try:
-            trace.emit_trace_stage(
-                "post_measurement",
-                state=self.state,
-                si=self.si,
-                x=x_post,
-                P=P_post,
-                update={
-                    "attempted": True,
-                    "accepted": bool(accepted),
-                    "status": str(status),
-                    "postfit": np.asarray(postfit, dtype=float).copy(),
-                    "postfit_definition": "v_minus_H_x_post",
-                    "postfit_scope": (
-                        "measurement_update_post_joseph_pre_feedback"
-                    ),
-                    "postfit_available": True,
-                    # Full Cpost/S is intentionally not reconstructed in the
-                    # trace-only path; publishing a made-up variance would
-                    # be less useful than an explicit unavailable marker.
-                    "postfit_variance": None,
-                    "postfit_variance_available": False,
-                },
-            )
-        except Exception:
-            # Optional diagnostics must never affect update acceptance or
-            # feedback ordering.
-            return
+    def take_tc_postfit_trace(self, trace=None):
+        """Consume the frozen TC post-fit payload for final trace emission."""
+        pending = self._pending_tc_postfit_trace
+        if pending is None:
+            return None
+        if trace is not None and pending.get("trace") is not trace:
+            return None
+        self._pending_tc_postfit_trace = None
+        return pending
 
     def feedback(self) -> None:
         """反馈校正: INS 误差减, GNSS 直接状态累积到 stored。

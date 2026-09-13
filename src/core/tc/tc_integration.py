@@ -693,6 +693,71 @@ class TcIntegration:
             # must never alter update acceptance or stream ordering.
             logger.debug("TC measurement stage trace unavailable: %s", exc)
 
+    def _measurement_trace_builder(self):
+        """Return the enabled RTK measurement trace builder, if any."""
+        builder = self._meas_builder
+        if (builder is None
+                or getattr(builder, "_measurement_trace", None) is None
+                or not hasattr(builder, "emit_trace_stage")):
+            return None
+        return builder
+
+    def _emit_final_measurement_trace(self, builder, *, status, accepted,
+                                       state=None, P=None, x=None,
+                                       reason=None, pos_jump_m=None,
+                                       limit_m=None):
+        """Emit exactly one final record after the TC gate/rollback settles."""
+        if builder is None:
+            return
+        pending = None
+        take_pending = getattr(self._est, "take_tc_postfit_trace", None)
+        if take_pending is not None:
+            try:
+                pending = take_pending(builder)
+            except Exception:
+                pending = None
+        update = {
+            "final": True,
+            "status": str(status),
+            "accepted": bool(accepted),
+            "attempted": True,
+        }
+        if reason is not None:
+            update["reason"] = str(reason)
+        if pos_jump_m is not None:
+            update["pos_jump_m"] = float(pos_jump_m)
+        if limit_m is not None:
+            update["limit_m"] = float(limit_m)
+        if accepted and pending is not None:
+            postfit = pending.get("postfit")
+            if postfit is not None:
+                update.update({
+                    "postfit": np.asarray(postfit, dtype=float).copy(),
+                    "postfit_definition": "v_minus_H_x_post",
+                    "postfit_scope": (
+                        "measurement_update_post_joseph_pre_feedback"
+                    ),
+                    "postfit_available": True,
+                    "postfit_variance": None,
+                    "postfit_variance_available": False,
+                })
+        try:
+            if state is None:
+                state = self._est.state if self._est is not None else None
+            if P is None:
+                P = self._est.P if self._est is not None else None
+            if x is None and self._est is not None:
+                x = self._est.effective_x()
+            builder.emit_trace_stage(
+                "post_measurement", state=state,
+                si=self._est.si if self._est is not None else None,
+                x=x, P=P, update=update,
+            )
+        except Exception as exc:
+            # Final trace delivery is observational and must not alter the
+            # already settled update/rollback result.
+            logger.debug("TC final measurement trace unavailable: %s", exc)
+
     def _emit_output(self, qins: int) -> None:
         """Emit a state at an exact fusion boundary when a stream is attached."""
         if self._output_callback is not None:
@@ -1400,6 +1465,10 @@ class TcIntegration:
         x = self._est.effective_x()
         mode = self._degrade.current_mode
         previous_obs_t = self._prev_obs_t
+        trace_builder = self._measurement_trace_builder()
+        defer_trace = trace_builder is not None
+        if defer_trace:
+            self._meas_builder._defer_trace_emit = True
 
         # 按当前模式构造量测
         try:
@@ -1418,6 +1487,9 @@ class TcIntegration:
             logger.warning(f"TC meas build 异常 (mode={mode}): {e}")
             self._degrade.on_fail(self._est, "build_error")
             return
+        finally:
+            if defer_trace:
+                self._meas_builder._defer_trace_emit = False
 
         # udbias 已在 build 内执行 (rtk 模式), 更新上一历元时刻供下一历元
         self._prev_obs_t = copy(obsr.t)
@@ -1428,17 +1500,13 @@ class TcIntegration:
             logger.debug(f"TC no_meas (mode={mode}, t={t_gnss:.3f}): "
                          f"obsr sats={len(obsr.sat)}, obsb sats={len(obsb.sat) if obsb is not None else 0}")
             if self._spp_fallback_update(obsr, obsb, nav, t_gnss):
-                self._emit_measurement_trace_stage(
-                    "post_measurement",
-                    update={"attempted": False, "accepted": False,
-                            "status": "no_dd_measurement"},
+                self._emit_final_measurement_trace(
+                    trace_builder, status="rejected_gate", accepted=False,
                 )
                 return
             self._on_meas_failure(obsr, obsb, nav, t_gnss)
-            self._emit_measurement_trace_stage(
-                "post_measurement",
-                update={"attempted": False, "accepted": False,
-                        "status": "no_dd_measurement"},
+            self._emit_final_measurement_trace(
+                trace_builder, status="rejected_gate", accepted=False,
             )
             return
 
@@ -1462,17 +1530,13 @@ class TcIntegration:
                          f"n_meas={n_meas} < {min_meas}, try SPP fallback, "
                          f"obsr={len(obsr.sat)}, obsb={len(obsb.sat) if obsb is not None else 0}")
             if self._spp_fallback_update(obsr, obsb, nav, t_gnss):
-                self._emit_measurement_trace_stage(
-                    "post_measurement",
-                    update={"attempted": False, "accepted": False,
-                            "status": "dd_measurement_below_minimum"},
+                self._emit_final_measurement_trace(
+                    trace_builder, status="rejected_gate", accepted=False,
                 )
                 return
             self._on_meas_failure(obsr, obsb, nav, t_gnss, recover=False)
-            self._emit_measurement_trace_stage(
-                "post_measurement",
-                update={"attempted": False, "accepted": False,
-                        "status": "dd_measurement_below_minimum"},
+            self._emit_final_measurement_trace(
+                trace_builder, status="rejected_gate", accepted=False,
             )
             return
 
@@ -1526,12 +1590,6 @@ class TcIntegration:
         # estimator then freezes and emits post-fit immediately after Joseph
         # and before feedback.  The optional kwarg is omitted on the normal
         # path to preserve compatibility with estimator test doubles.
-        trace_builder = None
-        if (mode == "rtk" and
-                getattr(self._meas_builder, "_measurement_trace", None)
-                is not None and
-                hasattr(self._meas_builder, "emit_trace_stage")):
-            trace_builder = self._meas_builder
         if trace_builder is None:
             feedback_x = self._est.tc_meas_update(v, H, R, source=mode)
         else:
@@ -1560,15 +1618,11 @@ class TcIntegration:
             # overwrite it with a 20-30 m position correction and defeat the
             # post-fit gate.
             self._on_meas_failure(obsr, obsb, nav, t_gnss)
-            if trace_builder is None:
-                self._emit_measurement_trace_stage(
-                    "post_measurement",
-                    state=self._est.state, P=self._est.P, x=pre_x,
-                    update={"attempted": True, "accepted": False,
-                            "status": "postfit_rejected",
-                            "feedback_x": np.zeros_like(self._est.x),
-                            "postfit": np.asarray(v) - H @ pre_x},
-                )
+            self._emit_final_measurement_trace(
+                trace_builder, status="rejected_gate", accepted=False,
+                state=self._est.state, P=self._est.P, x=pre_x,
+                reason="postfit_gate",
+            )
             return
         update_info = dict(info)
         postfit = np.asarray(v) - H @ feedback_x
@@ -1660,33 +1714,19 @@ class TcIntegration:
                 self._amb_fixed = False
                 self._ambiguity.reset()
                 # 不降级: 回滚位置 + 重置模糊度即可, 降级到 imu_only 更危险
-                self._emit_measurement_trace_stage(
-                    "post_measurement",
+                self._emit_final_measurement_trace(
+                    trace_builder, status="rejected_rollback", accepted=False,
                     state=self._est.state, P=self._est.P, x=feedback_x,
-                    update={"attempted": True, "accepted": False,
-                            "status": "position_jump_rolled_back",
-                            "feedback_x": feedback_x,
-                            "postfit": postfit,
-                            "postfit_definition": "v_minus_H_x_post",
-                            "postfit_scope": (
-                                "measurement_update_post_joseph_pre_feedback"
-                            ),
-                            "postfit_available": True,
-                            "postfit_variance": None,
-                            "postfit_variance_available": False},
+                    reason="pos_jump", pos_jump_m=pos_jump, limit_m=50.0,
                 )
                 return
 
         self._last_meas_pos = self._est.state.pos_e.copy()
         self._maybe_align_yaw(t_gnss)
-        if trace_builder is None:
-            self._emit_measurement_trace_stage(
-                "post_measurement",
-                state=self._est.state, P=self._est.P, x=feedback_x,
-                update={"attempted": True, "accepted": True,
-                        "status": "accepted", "feedback_x": feedback_x,
-                        "postfit": postfit},
-            )
+        self._emit_final_measurement_trace(
+            trace_builder, status="accepted", accepted=True,
+            state=self._est.state, P=self._est.P, x=feedback_x,
+        )
 
     def _maybe_align_yaw(self, t_gnss: float) -> None:
         """一次性 yaw 航向对齐 (等价 ignav ant2inins/vel2head 语义)。
