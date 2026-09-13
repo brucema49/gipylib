@@ -270,8 +270,8 @@ class TcIntegration:
         except (OSError, TypeError, ValueError) as exc:
             self._disable_matrix_diagnostics(exc)
 
-    def _trace_propagation_sow(self, timestamp: float) -> float:
-        """Use source increment SOW when available; otherwise GPST conversion."""
+    def _trace_propagation_sow(self, timestamp: float) -> float | None:
+        """Return only an explicitly carried source increment SOW."""
         current = self.imucur
         if current is not None:
             try:
@@ -280,8 +280,7 @@ class TcIntegration:
                     return float(current.increment_view().sow)
             except (AttributeError, TypeError, ValueError):
                 pass
-        _week, sow = unix_to_gpst(float(timestamp))
-        return float(sow)
+        return None
 
     def _trace_imu_sow(self, imu) -> float | None:
         if imu is None:
@@ -289,10 +288,9 @@ class TcIntegration:
         try:
             if imu.is_increment():
                 return float(imu.increment_view().sow)
-            _week, sow = unix_to_gpst(float(imu.timestamp))
-            return float(sow)
         except (AttributeError, TypeError, ValueError):
             return None
+        return None
 
     def _emit_init_propagation_trace(self, snapshot: dict) -> None:
         """Emit one committed pre-first-GNSS propagation, when explicitly enabled."""
@@ -365,6 +363,8 @@ class TcIntegration:
                                          raw_position=None,
                                          raw_velocity=None,
                                          raw_attitude=None,
+                                         derived_velocity=None,
+                                         derived_attitude=None,
                                          velocity_diff_start_sow=None,
                                          velocity_diff_end_sow=None) -> None:
         """Emit the raw-to-canonical initialization handoff, if requested."""
@@ -380,6 +380,8 @@ class TcIntegration:
                     raw_position=raw_position,
                     raw_velocity=raw_velocity,
                     raw_attitude=raw_attitude,
+                    derived_velocity=derived_velocity,
+                    derived_attitude=derived_attitude,
                     raw_lever=ins_cfg.get("leverarm"),
                     state=state,
                     position_frame="ECEF",
@@ -400,6 +402,24 @@ class TcIntegration:
                     velocity_source="tc_initialization_position_difference_ecef",
                     attitude_source="tc_initialization_ned_rpy_zyx",
                     lever_source="ins.leverarm_config",
+                    derived_velocity_source=(
+                        "tc_initialization_position_difference_ecef"
+                    ),
+                    derived_velocity_provenance=(
+                        "tc_initialization;gnss_position_difference;"
+                        "source_sow_interval"
+                    ),
+                    derived_velocity_frame="ECEF",
+                    derived_velocity_order="x,y,z",
+                    derived_velocity_units="m/s",
+                    derived_attitude_source="tc_initialization_ned_rpy_zyx",
+                    derived_attitude_provenance=(
+                        "tc_initialization;derived_from_velocity_difference;"
+                        "ned_rpy_zyx"
+                    ),
+                    derived_attitude_frame="NED",
+                    derived_attitude_order="roll,pitch,yaw",
+                    derived_attitude_units="rad",
                     position_provenance="tc_initialization;rover_solution_ecef",
                     velocity_provenance=(
                         "tc_initialization;gnss_position_difference;"
@@ -453,11 +473,18 @@ class TcIntegration:
             return
         try:
             clone = deepcopy(source)
-            if sow is None:
-                _week, sow = unix_to_gpst(float(clone.state.timestamp))
-            sow = float(sow)
+            if sow is not None:
+                try:
+                    sow = float(sow)
+                    if not np.isfinite(sow) or not 0.0 <= sow < 604800.0:
+                        sow = None
+                except (TypeError, ValueError):
+                    sow = None
             self._init_propagation_clone = clone
-            self._init_propagation_clone_active = True
+            # A clone without a source SOW cannot be window-bounded.  Emit
+            # its initialization metadata as unavailable, then leave the
+            # optional fork inert instead of inventing a Unix-derived window.
+            self._init_propagation_clone_active = sow is not None
             self._init_propagation_clone_prev_sow = sow
             self._init_propagation_clone_curr_sow = sow
             self._init_propagation_clone_sample_count = 0
@@ -478,19 +505,12 @@ class TcIntegration:
             self._init_propagation_clone_active = False
 
     @staticmethod
-    def _init_clone_imu_sow(imu) -> float:
+    def _init_clone_imu_sow(imu) -> float | None:
         if imu.is_increment():
             return float(imu.increment_view().sow)
-        _week, sow = unix_to_gpst(float(imu.timestamp))
-        sow = float(sow)
-        # Unix↔GPST conversion at campus01 magnitudes is a few ULP away from
-        # the source 100 Hz grid.  Preserve the shared trace's exact SOW
-        # contract without changing the sample or its timestamp.
-        grid = round((sow - _INIT_CLONE_FIRST_SOW) / _INIT_CLONE_SOW_STEP)
-        snapped = _INIT_CLONE_FIRST_SOW + grid * _INIT_CLONE_SOW_STEP
-        if abs(sow - snapped) <= _SOW_ENDPOINT_TOLERANCE_S:
-            return float(snapped)
-        return sow
+        # Rate samples do not carry source SOW.  Their Unix timestamp is not
+        # an acceptable substitute for the source/window trace contract.
+        return None
 
     def _record_init_propagation_clone(self, imu) -> None:
         """Feed exactly one original IMU sample to the GNSS-free clone."""
@@ -505,6 +525,12 @@ class TcIntegration:
             if not clone.last_update_accepted:
                 return
             current_sow = self._init_clone_imu_sow(imu)
+            if current_sow is None:
+                # The clone may still mechanize this sample, but its source
+                # window is unbounded without an increment SOW.  Do not
+                # fabricate one from the Unix timestamp.
+                self._init_propagation_clone_active = False
+                return
             self._init_propagation_clone_prev_sow = previous_sow
             self._init_propagation_clone_curr_sow = current_sow
             self._init_propagation_clone_sample_count = 1
@@ -1008,11 +1034,12 @@ class TcIntegration:
         if (self._init_propagation_trace_active and
                 self._init_propagation_trace_first_gnss_sow is None):
             self._init_propagation_trace_first_gnss_sow = (
-                self._raw_gnss_sow(obsr, t_gnss)
+                self._explicit_gnss_sow(obsr)
             )
-            self._flush_pending_init_propagation_trace(
-                first_gnss_observed=True
-            )
+            if self._init_propagation_trace_first_gnss_sow is not None:
+                self._flush_pending_init_propagation_trace(
+                    first_gnss_observed=True
+                )
 
     # ===== 初始化 =====
 
@@ -1198,8 +1225,8 @@ class TcIntegration:
             init_state,
             source_sow=self._explicit_gnss_sow(obsr),
             raw_position=pos_for_state,
-            raw_velocity=vel_e,
-            raw_attitude=att_rpy,
+            derived_velocity=vel_e,
+            derived_attitude=att_rpy,
             velocity_diff_start_sow=velocity_diff_start_sow,
             velocity_diff_end_sow=velocity_diff_end_sow,
         )
@@ -1209,7 +1236,7 @@ class TcIntegration:
         # at this exact handoff; the main estimator remains on its normal path.
         if self._init_propagation_trace_sink is not None:
             self._start_init_propagation_clone(
-                sow=self._raw_gnss_sow(obsr, t_gnss))
+                sow=self._explicit_gnss_sow(obsr))
 
         logger.info(
             f"TcIntegration 初始化成功: t={init_state.timestamp:.3f}, "

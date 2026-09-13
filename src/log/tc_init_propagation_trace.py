@@ -48,40 +48,78 @@ GREAT_INIT_PROPAGATION_FIELDS = (
     "quaternion_q1", "quaternion_q2", "quaternion_q3", "lever_frame",
     "lever_x", "lever_y", "lever_z",
 )
-INITIALIZATION_INPUT_FIELDS = GREAT_INIT_PROPAGATION_FIELDS + (
-    "source_sow", "source_sow_definition", "timestamp", "state_sow",
-    "raw_position_available", "raw_position_source",
-    "raw_position_provenance", "raw_position_frame", "raw_position_order",
-    "raw_position_units", "raw_position_definition", "raw_position_x",
-    "raw_position_y", "raw_position_z", "raw_velocity_available",
-    "raw_velocity_source", "raw_velocity_provenance", "raw_velocity_frame",
-    "raw_velocity_order", "raw_velocity_units", "raw_velocity_definition",
-    "raw_velocity_x", "raw_velocity_y", "raw_velocity_z",
-    "raw_attitude_available", "raw_attitude_source",
-    "raw_attitude_provenance", "raw_attitude_frame", "raw_attitude_order",
-    "raw_attitude_units", "raw_attitude_definition", "raw_attitude_roll",
-    "raw_attitude_pitch", "raw_attitude_yaw", "raw_lever_available",
-    "raw_lever_source", "raw_lever_provenance", "raw_lever_frame",
-    "raw_lever_order", "raw_lever_units", "raw_lever_definition",
-    "raw_lever_x", "raw_lever_y", "raw_lever_z", "lever_applied",
-    "lever_ecef_x", "lever_ecef_y", "lever_ecef_z",
-    "velocity_diff_start_sow", "velocity_diff_end_sow",
-    "velocity_diff_dt_s", "velocity_diff_source",
-    "velocity_diff_definition", "canonical_pos_ecef_x",
-    "canonical_pos_ecef_y", "canonical_pos_ecef_z", "canonical_vel_ecef_x",
-    "canonical_vel_ecef_y", "canonical_vel_ecef_z", "canonical_C_b_e_00",
-    "canonical_C_b_e_01", "canonical_C_b_e_02", "canonical_C_b_e_10",
-    "canonical_C_b_e_11", "canonical_C_b_e_12", "canonical_C_b_e_20",
-    "canonical_C_b_e_21", "canonical_C_b_e_22", "canonical_quaternion_q0",
-    "canonical_quaternion_q1", "canonical_quaternion_q2",
-    "canonical_quaternion_q3", "converted_pos_ecef_x",
-    "converted_pos_ecef_y", "converted_pos_ecef_z", "converted_vel_ecef_x",
-    "converted_vel_ecef_y", "converted_vel_ecef_z", "converted_C_b_e_00",
+GREAT_INITIALIZATION_INPUT_FIELDS = (
+    "schema", "event_seq", "event", "stage", "gps_week", "week", "sow",
+    "source_sow", "exact_sow", "state_sow", "timestamp", "timestamp_unix_s",
+    "state_source", "position_source", "velocity_source", "attitude_source",
+    "raw_position_x", "raw_position_y", "raw_position_z", "raw_position_frame",
+    "raw_position_order", "raw_position_units", "raw_velocity_x",
+    "raw_velocity_y", "raw_velocity_z", "raw_velocity_frame", "raw_velocity_order",
+    "raw_velocity_units", "raw_attitude_x", "raw_attitude_y", "raw_attitude_z",
+    "raw_attitude_frame", "raw_attitude_order", "raw_attitude_units",
+    "raw_attitude_definition", "raw_lever_0", "raw_lever_1", "raw_lever_2",
+    "raw_lever_frame", "raw_lever_order", "raw_lever_units", "lever_x", "lever_y",
+    "lever_z", "lever_frame", "lever_order", "lever_units", "lever_applied",
+    "lever_frd_0", "lever_frd_1", "lever_frd_2", "lever_ecef_0", "lever_ecef_1",
+    "lever_ecef_2", "raw_position_0", "raw_position_1", "raw_position_2",
+    "raw_velocity_0", "raw_velocity_1", "raw_velocity_2", "raw_attitude_0",
+    "raw_attitude_1", "raw_attitude_2", "pos_ecef_x", "pos_ecef_y", "pos_ecef_z",
+    "vel_ecef_x", "vel_ecef_y", "vel_ecef_z", "converted_position_ecef_0",
+    "converted_position_ecef_1", "converted_position_ecef_2",
+    "converted_velocity_ecef_0", "converted_velocity_ecef_1",
+    "converted_velocity_ecef_2", "C_b_e_00", "C_b_e_01", "C_b_e_02", "C_b_e_10",
+    "C_b_e_11", "C_b_e_12", "C_b_e_20", "C_b_e_21", "C_b_e_22", "quaternion_q0",
+    "quaternion_q1", "quaternion_q2", "quaternion_q3", "converted_C_b_e_00",
     "converted_C_b_e_01", "converted_C_b_e_02", "converted_C_b_e_10",
     "converted_C_b_e_11", "converted_C_b_e_12", "converted_C_b_e_20",
     "converted_C_b_e_21", "converted_C_b_e_22", "converted_quaternion_q0",
-    "converted_quaternion_q1", "converted_quaternion_q2",
-    "converted_quaternion_q3",
+    "converted_quaternion_q1", "converted_quaternion_q2", "converted_quaternion_q3",
+    "canonical_position_ecef_0", "canonical_position_ecef_1",
+    "canonical_position_ecef_2", "canonical_velocity_ecef_0",
+    "canonical_velocity_ecef_1", "canonical_velocity_ecef_2", "canonical_C_b_e_00",
+    "canonical_C_b_e_01", "canonical_C_b_e_02", "canonical_C_b_e_10",
+    "canonical_C_b_e_11", "canonical_C_b_e_12", "canonical_C_b_e_20",
+    "canonical_C_b_e_21", "canonical_C_b_e_22", "canonical_quaternion_q0",
+    "canonical_quaternion_q1", "canonical_quaternion_q2", "canonical_quaternion_q3",
+    "raw_position_definition", "raw_velocity_definition", "raw_attitude_definition",
+    "raw_lever_definition", "converted_position_definition",
+    "converted_velocity_definition", "converted_attitude_definition",
+    "converted_quaternion_definition",
+)
+
+# New audit columns are append-only after the exact GREAT initialization-input
+# header above.  Existing names are deliberately not repeated in the CSV.
+_INITIALIZATION_INPUT_APPEND_FIELDS = (
+    "source_sow_definition", "raw_position_available", "raw_position_source",
+    "raw_position_provenance", "raw_position_provenance", "raw_position_order",
+    "raw_velocity_available", "raw_velocity_source", "raw_velocity_provenance",
+    "raw_attitude_available", "raw_attitude_source", "raw_attitude_provenance",
+    "raw_attitude_roll", "raw_attitude_pitch", "raw_attitude_yaw",
+    "raw_lever_available", "raw_lever_source", "raw_lever_provenance",
+    "raw_lever_x", "raw_lever_y", "raw_lever_z", "velocity_diff_start_sow",
+    "velocity_diff_end_sow", "velocity_diff_dt_s", "velocity_diff_source",
+    "velocity_diff_definition", "antenna_ecef_x", "antenna_ecef_y",
+    "antenna_ecef_z", "imu_prev_sow", "imu_curr_sow", "imu_sample_count",
+    "gnss_measurement_inserted", "main_run_gnss_update_seen",
+    "canonical_pos_ecef_x", "canonical_pos_ecef_y", "canonical_pos_ecef_z",
+    "canonical_vel_ecef_x", "canonical_vel_ecef_y", "canonical_vel_ecef_z",
+    "converted_pos_ecef_x", "converted_pos_ecef_y", "converted_pos_ecef_z",
+    "converted_vel_ecef_x", "converted_vel_ecef_y", "converted_vel_ecef_z",
+    "lever_ecef_x", "lever_ecef_y", "lever_ecef_z",
+    "derived_velocity_available", "derived_velocity_source",
+    "derived_velocity_provenance", "derived_velocity_frame", "derived_velocity_order",
+    "derived_velocity_units", "derived_velocity_definition", "derived_velocity_x",
+    "derived_velocity_y", "derived_velocity_z", "derived_attitude_available",
+    "derived_attitude_source", "derived_attitude_provenance", "derived_attitude_frame",
+    "derived_attitude_order", "derived_attitude_units", "derived_attitude_definition",
+    "derived_attitude_roll", "derived_attitude_pitch", "derived_attitude_yaw",
+)
+_INITIALIZATION_INPUT_APPEND_FIELDS = tuple(dict.fromkeys(
+    field for field in _INITIALIZATION_INPUT_APPEND_FIELDS
+    if field not in GREAT_INITIALIZATION_INPUT_FIELDS
+))
+INITIALIZATION_INPUT_FIELDS = (
+    GREAT_INITIALIZATION_INPUT_FIELDS + _INITIALIZATION_INPUT_APPEND_FIELDS
 )
 # Public name used by schema-parity tests and CSV consumers.
 INITIALIZATION_INPUT_CSV_FIELDS = INITIALIZATION_INPUT_FIELDS
@@ -107,6 +145,17 @@ def _matrix(value):
         return None
 
 
+def _trace_scalar(value):
+    """Normalize an optional trace scalar without manufacturing a value."""
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if np.isfinite(result) else None
+
+
 def build_trace_record(event: str, state, *, sow: float | None = None,
                        dt: float | None = None,
                        gnss_free: bool = False,
@@ -128,16 +177,24 @@ def build_trace_record(event: str, state, *, sow: float | None = None,
     no alternate convention is inferred.
     """
     timestamp = None
-    state_sow = None
-    week = None
     if state is not None:
         try:
             timestamp = float(state.timestamp)
-            week, state_sow = unix_to_gpst(timestamp)
-            week = int(week)
-            state_sow = float(state_sow)
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             timestamp = None
+
+    exact_sow = _trace_scalar(sow)
+    # GPST week/SOW are source metadata.  Do not derive them from the Unix
+    # state timestamp when the source epoch was not supplied explicitly.
+    week = None
+    state_sow = None
+    if exact_sow is not None and timestamp is not None:
+        try:
+            week, _state_sow = unix_to_gpst(timestamp)
+            week = int(week)
+            state_sow = float(_state_sow)
+        except (TypeError, ValueError, OverflowError):
+            week = None
             state_sow = None
 
     pos = _vector(getattr(state, "pos_e", None), 3)
@@ -156,7 +213,11 @@ def build_trace_record(event: str, state, *, sow: float | None = None,
             for i in range(3)
         ]
 
-    exact_sow = None if sow is None else float(sow)
+    first_gnss_sow = _trace_scalar(first_gnss_sow)
+    imu_prev_sow = _trace_scalar(imu_prev_sow)
+    imu_curr_sow = _trace_scalar(imu_curr_sow)
+    source_sow_available = exact_sow is not None
+    window_sow_available = first_gnss_sow is not None
     record = {
         "schema": SCHEMA,
         "event_seq": None,
@@ -165,23 +226,31 @@ def build_trace_record(event: str, state, *, sow: float | None = None,
         "timestamp": timestamp,
         "gps_week": week,
         "week": week,
-        "sow": exact_sow if exact_sow is not None else state_sow,
-        "source_sow": exact_sow if exact_sow is not None else state_sow,
-        "exact_sow": exact_sow if exact_sow is not None else state_sow,
+        "sow": exact_sow,
+        "source_sow": exact_sow,
+        "source_sow_available": source_sow_available,
+        "source_sow_status": (
+            "available" if source_sow_available else "unavailable"
+        ),
+        "source_sow_definition": (
+            "explicit source GPST SOW; null when source is unavailable"
+        ),
+        "exact_sow": exact_sow,
         "state_sow": state_sow,
         "timestamp_unix_s": timestamp,
         "gnss_free": bool(gnss_free),
         "isolation": isolation,
         "gnss_isolation": isolation,
-        "first_gnss_sow": (None if first_gnss_sow is None
-                            else float(first_gnss_sow)),
+        "first_gnss_sow": first_gnss_sow,
+        "window_sow_available": window_sow_available,
+        "window_sow_status": (
+            "available" if window_sow_available else "unavailable"
+        ),
         "dt": None if dt is None else float(dt),
         "input_imu_form": input_imu_form,
         "propagation_form": propagation_form,
-        "imu_prev_sow": (None if imu_prev_sow is None
-                          else float(imu_prev_sow)),
-        "imu_curr_sow": (None if imu_curr_sow is None
-                          else float(imu_curr_sow)),
+        "imu_prev_sow": imu_prev_sow,
+        "imu_curr_sow": imu_curr_sow,
         "imu_sample_count": int(imu_sample_count),
         "gnss_measurement_inserted": int(gnss_measurement_inserted),
         "main_run_gnss_update_seen": int(main_run_gnss_update_seen),
@@ -324,6 +393,8 @@ def build_initialization_input_record(*, timestamp: float | None = None,
                                       raw_velocity=None,
                                       raw_attitude=None,
                                       raw_lever=None,
+                                      derived_velocity=None,
+                                      derived_attitude=None,
                                       state=None,
                                       position_frame: str | None = None,
                                       position_order: str | None = None,
@@ -347,6 +418,16 @@ def build_initialization_input_record(*, timestamp: float | None = None,
                                       velocity_source: str | None = None,
                                       attitude_source: str | None = None,
                                       lever_source: str | None = None,
+                                      derived_velocity_source: str | None = None,
+                                      derived_velocity_provenance: str | None = None,
+                                      derived_velocity_frame: str | None = None,
+                                      derived_velocity_order: str | None = None,
+                                      derived_velocity_units: str | None = None,
+                                      derived_attitude_source: str | None = None,
+                                      derived_attitude_provenance: str | None = None,
+                                      derived_attitude_frame: str | None = None,
+                                      derived_attitude_order: str | None = None,
+                                      derived_attitude_units: str | None = None,
                                       velocity_diff_start_sow: float | None = None,
                                       velocity_diff_end_sow: float | None = None,
                                       velocity_diff_source: str | None = None) -> dict:
@@ -363,6 +444,8 @@ def build_initialization_input_record(*, timestamp: float | None = None,
     raw_vel = _initialization_input_vector(raw_velocity)
     raw_att = _initialization_input_vector(raw_attitude)
     raw_lev = _initialization_input_vector(raw_lever)
+    derived_vel = _initialization_input_vector(derived_velocity)
+    derived_att = _initialization_input_vector(derived_attitude)
     position_frame = str(position_frame or "").strip().upper() or None
     velocity_frame = str(velocity_frame or "").strip().upper() or None
     attitude_frame = str(attitude_frame or "").strip().upper() or None
@@ -478,9 +561,16 @@ def build_initialization_input_record(*, timestamp: float | None = None,
         "NED": "raw [north,east,down] velocity; converted with C_n^e",
         "ENU": "raw [east,north,up] velocity; converted with C_enu^e",
     }.get(velocity_frame, "raw velocity frame unavailable or unsupported")
+    derived_velocity_definition = (
+        "velocity from GNSS position difference; not a raw velocity input"
+    )
     attitude_definition = (
         "raw attitude uses the explicitly declared order/units in the declared "
         "navigation frame; ZYX yaw-pitch-roll; C_b^e = C_nav^e @ C_b^nav"
+    )
+    derived_attitude_definition = (
+        "attitude derived from the GNSS position-difference velocity; "
+        "not a raw attitude input"
     )
     lever_definition = (
         "raw IMU-to-GNSS lever in FRD [front,right,down] meters; "
@@ -523,6 +613,14 @@ def build_initialization_input_record(*, timestamp: float | None = None,
         "raw_velocity_order": velocity_order,
         "raw_velocity_units": velocity_units,
         "raw_velocity_definition": velocity_definition,
+        "derived_velocity_available": derived_vel is not None,
+        "derived_velocity_source": derived_velocity_source,
+        "derived_velocity_provenance": derived_velocity_provenance,
+        "derived_velocity": derived_vel,
+        "derived_velocity_frame": derived_velocity_frame,
+        "derived_velocity_order": derived_velocity_order,
+        "derived_velocity_units": derived_velocity_units,
+        "derived_velocity_definition": derived_velocity_definition,
         "raw_attitude_available": raw_att is not None,
         "raw_attitude_source": attitude_source,
         "raw_attitude_provenance": attitude_provenance,
@@ -532,6 +630,14 @@ def build_initialization_input_record(*, timestamp: float | None = None,
         "raw_attitude_units": attitude_units,
         "raw_attitude_definition": attitude_definition,
         "attitude_definition": attitude_definition,
+        "derived_attitude_available": derived_att is not None,
+        "derived_attitude_source": derived_attitude_source,
+        "derived_attitude_provenance": derived_attitude_provenance,
+        "derived_attitude": derived_att,
+        "derived_attitude_frame": derived_attitude_frame,
+        "derived_attitude_order": derived_attitude_order,
+        "derived_attitude_units": derived_attitude_units,
+        "derived_attitude_definition": derived_attitude_definition,
         "raw_lever_available": raw_lev is not None,
         "raw_lever_source": lever_source,
         "raw_lever_provenance": lever_provenance,
@@ -600,6 +706,10 @@ def build_initialization_input_record(*, timestamp: float | None = None,
         else:
             for index in range(3):
                 record[f"{prefix}_{index}"] = None
+    for prefix, value in (("canonical_position_ecef", canonical_pos),
+                          ("canonical_velocity_ecef", vel_ecef)):
+        for index in range(3):
+            record[f"{prefix}_{index}"] = _component(value, index)
     for prefix, value in (("canonical_pos_ecef", canonical_pos),
                           ("canonical_vel_ecef", vel_ecef),
                           ("converted_pos_ecef", actual_pos),
@@ -635,9 +745,11 @@ def build_initialization_input_record(*, timestamp: float | None = None,
         "antenna_ecef_y": _component(antenna_ecef, 1),
         "antenna_ecef_z": _component(antenna_ecef, 2),
         "lever_frame": lever_frame,
-        "lever_x": _component(lever_frd, 0),
-        "lever_y": _component(lever_frd, 1),
-        "lever_z": _component(lever_frd, 2),
+        "lever_order": lever_order,
+        "lever_units": lever_units,
+        "lever_x": _component(raw_lev, 0),
+        "lever_y": _component(raw_lev, 1),
+        "lever_z": _component(raw_lev, 2),
         "imu_prev_sow": None,
         "imu_curr_sow": None,
         "imu_sample_count": 0,
@@ -660,9 +772,18 @@ def build_initialization_input_record(*, timestamp: float | None = None,
                           ("raw_lever", raw_lev)):
         for index, name in enumerate(("x", "y", "z")):
             record[f"{prefix}_{name}"] = _component(value, index)
+    for prefix, value in (("derived_velocity", derived_vel),
+                          ("derived_attitude", derived_att)):
+        for index, name in enumerate(("x", "y", "z")):
+            record[f"{prefix}_{name}"] = _component(value, index)
     record["raw_attitude_roll"] = _component(raw_att, 0)
     record["raw_attitude_pitch"] = _component(raw_att, 1)
     record["raw_attitude_yaw"] = _component(raw_att, 2)
+    record["derived_attitude_roll"] = _component(derived_att, 0)
+    record["derived_attitude_pitch"] = _component(derived_att, 1)
+    record["derived_attitude_yaw"] = _component(derived_att, 2)
+    for index, item in enumerate(lever_frd or (None, None, None)):
+        record[f"lever_frd_{index}"] = item
     return record
 
 
