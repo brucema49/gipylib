@@ -46,7 +46,8 @@ class rnx_decode:
     def __init__(self, cfg, raw_band_priority=None, *,
                  diagnostic_sink=None, diagnostic_callback=None,
                  trace_sink=None, trace_callback=None, mapping_trace=None,
-                 sensor_id=None, instance_id=None, mapping_owner=None):
+                 sensor_id=None, instance_id=None, mapping_owner=None,
+                 trace_enabled=True):
         self.ver = -1.0
         self.fobs = None
         self.gnss_tbl = {'G': uGNSS.GPS, 'E': uGNSS.GAL, 'R': uGNSS.GLO, 'J': uGNSS.QZS, 'C': uGNSS.BDS}
@@ -62,7 +63,9 @@ class rnx_decode:
             sensor_id = "rnx_decode"
         if instance_id is None:
             instance_id = f"{sensor_id}:{rnx_decode._instance_sequence}"
-        if mapping_trace is None:
+        if not trace_enabled:
+            mapping_trace = None
+        elif mapping_trace is None:
             mapping_trace = trace_from(
                 raw_band_priority,
                 sink=diagnostic_sink if diagnostic_sink is not None else trace_sink,
