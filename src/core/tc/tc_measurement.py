@@ -895,14 +895,28 @@ class _DdBase(TcMeasurement):
             row_raw_status = "mismatch"
         else:
             row_raw_status = "incomplete"
+        dd_key = {
+            "ref": int(ref_sat),
+            "target": int(target_sat),
+            "slot": int(slot),
+            "kind": str(kind),
+        }
         row = {
             "attempt_index": int(context["_dd_attempt_counter"]),
             "row_index": None if row_index is None else int(row_index),
+            "trace_event_id": context["trace_event_id"],
+            "row_key": (
+                f"{context['trace_event_id']}:row:{int(row_index)}"
+                if row_index is not None else
+                f"{context['trace_event_id']}:attempt:{int(context['_dd_attempt_counter'])}"
+            ),
             "status": str(status),
             "system": _trace_system_name(system),
             "state_stage": "pre_measurement",
             "ref_sat": int(ref_sat),
             "target_sat": int(target_sat),
+            "dd_key": dd_key,
+            "key": dict(dd_key),
             "ref_prn": sat2id(int(ref_sat)),
             "target_prn": sat2id(int(target_sat)),
             "slot": int(slot),
@@ -937,6 +951,11 @@ class _DdBase(TcMeasurement):
             "prefit_innovation": float(innovation),
             "prefit_definition": "l = DD(observation - computed_model) [m]",
             "postfit_definition": "postfit_residual = l - A*dx [m]",
+            "postfit_scope": None,
+            "postfit": None,
+            "postfit_available": False,
+            "postfit_variance": None,
+            "postfit_variance_available": False,
             "postfit_residual": None,
             "geometry_dd": geometry_terms["geometry_dd"],
             "geometry_units": "m",
@@ -969,6 +988,8 @@ class _DdBase(TcMeasurement):
                 f"{context['trace_instance_id']}:{context['epoch']}:{covariance_block}"),
             "covariance_row": (
                 None if covariance_row is None else int(covariance_row)),
+            "r_diag_meaning": "measurement_covariance_diagonal",
+            "r_units": "m2",
             "r_ref": None if ref_variance is None else float(ref_variance),
             "r_target": None if target_variance is None else float(target_variance),
             "r_diag": (
@@ -1018,12 +1039,16 @@ class _DdBase(TcMeasurement):
                 "reference_variance": row["r_ref"],
                 "target_variance": row["r_target"],
                 "diagonal": row["r_diag"],
+                "diagonal_meaning": row["r_diag_meaning"],
+                "units": row["r_units"],
             }
             for row in context["dd_rows"]
             if row["status"] == "accepted"
         ]
         context["covariance"] = {
             "representation": "dd_shared_reference",
+            "r_diag_meaning": "measurement_covariance_diagonal",
+            "r_units": "m2",
             "matrix_shape": matrix_shape,
             "row_count": int(len(v)),
             "rows": covariance_rows,
@@ -1129,22 +1154,51 @@ class _DdBase(TcMeasurement):
             postfit_values = np.asarray(postfit, dtype=float).reshape(-1)
         except Exception:
             postfit_values = np.zeros(0, dtype=float)
+        postfit_available = bool(
+            update_record.get("postfit_available", postfit_values.size > 0)
+        )
+        postfit_definition = update_record.get(
+            "postfit_definition", "postfit_residual = l - A*dx [m]"
+        )
+        postfit_scope = update_record.get("postfit_scope")
+        postfit_variance_available = bool(
+            update_record.get("postfit_variance_available", False)
+        )
+        postfit_variance = update_record.get("postfit_variance")
         for row in record.get("dd_rows", []):
             row["state_stage"] = stage
             index = row.get("row_index")
             if index is None:
                 continue
             if index < postfit_values.size and np.isfinite(postfit_values[index]):
-                row["postfit_residual"] = float(postfit_values[index])
+                value = float(postfit_values[index])
+                row["postfit"] = value
+                row["postfit_residual"] = value
+                row["postfit_available"] = postfit_available
+                row["postfit_definition"] = postfit_definition
+                row["postfit_scope"] = postfit_scope
+                row["postfit_variance"] = postfit_variance
+                row["postfit_variance_available"] = (
+                    postfit_variance_available
+                )
             elif feedback_values.size:
                 try:
                     predicted = sum(
                         float(feedback_values[int(key)]) * float(value)
                         for key, value in row.get("design_row", {}).items()
                     )
-                    row["postfit_residual"] = float(
-                        row["prefit_innovation"] - predicted)
+                    value = float(row["prefit_innovation"] - predicted)
+                    row["postfit"] = value
+                    row["postfit_residual"] = value
+                    row["postfit_available"] = postfit_available
+                    row["postfit_definition"] = postfit_definition
+                    row["postfit_scope"] = postfit_scope
+                    row["postfit_variance"] = postfit_variance
+                    row["postfit_variance_available"] = (
+                        postfit_variance_available
+                    )
                 except Exception:
+                    row["postfit"] = None
                     row["postfit_residual"] = None
         update_record["stage"] = stage
         update_record.setdefault("attempted", True)
@@ -1152,6 +1206,19 @@ class _DdBase(TcMeasurement):
         update_record.setdefault("status", "completed")
         update_record.setdefault(
             "postfit_definition", "postfit_residual = l - A*dx [m]")
+        update_record.setdefault("postfit_scope", None)
+        update_record.setdefault("postfit_available", postfit_values.size > 0)
+        update_record.setdefault("postfit_variance", None)
+        update_record.setdefault("postfit_variance_available", False)
+        if postfit_values.size:
+            record["postfit"] = [float(value) for value in postfit_values]
+        else:
+            record["postfit"] = None
+        record["postfit_available"] = postfit_available
+        record["postfit_definition"] = postfit_definition
+        record["postfit_scope"] = postfit_scope
+        record["postfit_variance"] = postfit_variance
+        record["postfit_variance_available"] = postfit_variance_available
         update_record.pop("feedback_x", None)
         update_record.pop("postfit", None)
         record["update"] = update_record

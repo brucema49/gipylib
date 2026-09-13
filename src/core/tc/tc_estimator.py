@@ -271,8 +271,14 @@ class TcEstimator(LcEstimator):
             # Pclk 不重置, 由 time_update 的 Q_clk 随机游走累积
             self.x[clk0:clk0 + 4] = 0.0
 
-    def tc_meas_update(self, v, H, R, source: str = ""):
-        """GNSS 量测更新 (调 joseph_update + feedback)。"""
+    def tc_meas_update(self, v, H, R, source: str = "", trace=None):
+        """GNSS 量测更新 (调 joseph_update + feedback)。
+
+        ``trace`` is an optional measurement-builder hook.  When present,
+        the diagnostic post-fit is frozen immediately after the Joseph
+        update and emitted before closed-loop feedback changes the nominal
+        state.  It is deliberately absent from the solver path by default.
+        """
         if len(v) == 0:
             return None
         P_before = self.P.copy()
@@ -282,15 +288,63 @@ class TcEstimator(LcEstimator):
         # the linearized post-fit residual before closing the INS loop, and
         # make rejection transactional so a bad float epoch cannot corrupt
         # the nominal state or its cross-covariances.
+        postfit = None
         if source == "rtk":
             postfit = np.asarray(v) - H @ self.x
             if not validate_tc_postfit(postfit, R, n_parameters=3):
+                self._emit_tc_postfit_trace(
+                    trace, v, H, self.x, self.P, postfit,
+                    accepted=False, status="postfit_rejected",
+                )
                 self.P = P_before
                 self.x = x_before
                 return None
-        feedback_x = self.x.copy()
+        x_post = self.x.copy()
+        P_post = self.P.copy() if trace is not None else None
+        if trace is not None:
+            if postfit is None:
+                postfit = np.asarray(v) - H @ x_post
+            self._emit_tc_postfit_trace(
+                trace, v, H, x_post, P_post, postfit,
+                accepted=True, status="accepted",
+            )
+        feedback_x = x_post
         self.feedback()
         return feedback_x
+
+    def _emit_tc_postfit_trace(self, trace, v, H, x_post, P_post,
+                               postfit, *, accepted: bool, status: str):
+        """Emit the frozen linear post-fit through an optional trace hook."""
+        if trace is None:
+            return
+        try:
+            trace.emit_trace_stage(
+                "post_measurement",
+                state=self.state,
+                si=self.si,
+                x=x_post,
+                P=P_post,
+                update={
+                    "attempted": True,
+                    "accepted": bool(accepted),
+                    "status": str(status),
+                    "postfit": np.asarray(postfit, dtype=float).copy(),
+                    "postfit_definition": "v_minus_H_x_post",
+                    "postfit_scope": (
+                        "measurement_update_post_joseph_pre_feedback"
+                    ),
+                    "postfit_available": True,
+                    # Full Cpost/S is intentionally not reconstructed in the
+                    # trace-only path; publishing a made-up variance would
+                    # be less useful than an explicit unavailable marker.
+                    "postfit_variance": None,
+                    "postfit_variance_available": False,
+                },
+            )
+        except Exception:
+            # Optional diagnostics must never affect update acceptance or
+            # feedback ordering.
+            return
 
     def feedback(self) -> None:
         """反馈校正: INS 误差减, GNSS 直接状态累积到 stored。
