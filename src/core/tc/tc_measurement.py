@@ -436,6 +436,13 @@ class _DdBase(TcMeasurement):
         self._sig_n0 = float(config.get("gnss", {}).get("sig_n0", 30.0))
         self._measurement_trace = trace_from(
             sink=trace_sink, callback=trace_callback)
+        # This identity is local to one builder/trace stream.  It prevents a
+        # block ordinal from being mistaken for a globally reusable ID after
+        # a recovery rebuilds the measurement builder.
+        type(self)._trace_instance_sequence = getattr(
+            type(self), "_trace_instance_sequence", 0) + 1
+        self._trace_instance_id = (
+            f"{type(self).__name__}-{type(self)._trace_instance_sequence}")
         self._trace_epoch = 0
         self._active_trace_context = None
 
@@ -450,16 +457,21 @@ class _DdBase(TcMeasurement):
             "time": _trace_observation_time(obsr),
             "_obsr": obsr,
             "_obsb": obsb,
+            "trace_instance_id": self._trace_instance_id,
             "mapping_hash": metadata["mapping_hash"],
             "mapping_owner": metadata["mapping_owner"],
             "constellation": systems,
             "candidate_sats": {system: [] for system in systems},
             "candidate_prns": {system: [] for system in systems},
+            "candidate_sats_semantics": "common_view_dd_input",
+            "common_view_sats": {system: [] for system in systems},
+            "common_view_prns": {system: [] for system in systems},
             "exclusion_reasons": [],
             "_selected_ref_sats": {system: [] for system in systems},
             "dd_keys": [],
             "dd_rows": [],
             "_dd_attempt_counter": 0,
+            "_block_counter": 0,
             "_covariance_blocks": [],
             "n_code": 0,
             "n_phase": 0,
@@ -468,7 +480,12 @@ class _DdBase(TcMeasurement):
             "_code_rejected": 0,
             "_phase_rejected": 0,
             "float_state_counter": 0,
+            "float_update_count": 0,
             "ar_call_counter": 0,
+            "ambiguity_resolution_calls": 0,
+            "solution_mode": "float",
+            "float_state_counter_semantics": "deprecated alias of float_update_count",
+            "ar_call_counter_semantics": "deprecated alias of ambiguity_resolution_calls",
         }
         self._trace_epoch += 1
         return context
@@ -483,6 +500,8 @@ class _DdBase(TcMeasurement):
             idx = _DdBase._sys_idx(sat, system)
             context["candidate_sats"][name] = [int(sat[i]) for i in idx]
             context["candidate_prns"][name] = [sat2id(int(sat[i])) for i in idx]
+            context["common_view_sats"][name] = [int(sat[i]) for i in idx]
+            context["common_view_prns"][name] = [sat2id(int(sat[i])) for i in idx]
 
     @staticmethod
     def _trace_exclusion(context, sat, system, index, slot, kind, reason):
@@ -515,23 +534,54 @@ class _DdBase(TcMeasurement):
         schema forward-compatible while preventing legacy ``freq_ix`` values
         from being mislabeled as raw bands.
         """
-        for observation in (obsr, obsb):
-            table = getattr(observation, "raw_signal_by_slot", None)
-            if not isinstance(table, Mapping):
-                continue
-            entry = table.get((int(sat), int(slot)))
-            if entry is None:
-                entry = table.get(f"{int(sat)}:{int(slot)}")
-            if not isinstance(entry, Mapping):
-                continue
-            raw_band = entry.get("raw_band")
-            track = entry.get("track")
-            return (
-                None if raw_band is None else int(raw_band),
-                None if track is None else str(track),
-                "available",
-            )
-        return None, None, "unavailable"
+        def side(observation):
+            empty = {"raw_band": None, "track": None}
+            try:
+                table = getattr(observation, "raw_signal_by_slot", None)
+                if not isinstance(table, Mapping):
+                    return empty
+                entry = table.get((int(sat), int(slot)))
+                if entry is None:
+                    entry = table.get(f"{int(sat)}:{int(slot)}")
+                if not isinstance(entry, Mapping):
+                    return empty
+                raw_band = entry.get("raw_band")
+                track = entry.get("track")
+                # An optional mapping is untrusted observational input.  If
+                # either conversion fails, discard the whole side rather
+                # than allowing diagnostics to affect the solver.
+                if raw_band is not None:
+                    raw_band = int(raw_band)
+                if track is not None:
+                    track = str(track)
+                return {"raw_band": raw_band, "track": track}
+            except Exception:
+                return empty
+
+        rover = side(obsr)
+        base = side(obsb)
+        complete = all(
+            side_value[field] is not None
+            for side_value in (rover, base)
+            for field in ("raw_band", "track")
+        )
+        comparable = complete and rover == base
+        if comparable:
+            status = "comparable"
+        elif not any(value is not None
+                     for item in (rover, base)
+                     for value in item.values()):
+            status = "unavailable"
+        elif not complete:
+            status = "incomplete"
+        else:
+            status = "mismatch"
+        return {
+            "rover": rover,
+            "base": base,
+            "status": status,
+            "comparable": bool(comparable),
+        }
 
     def _trace_dd_row(self, context, *, obsr, obsb, system, ref_sat,
                       target_sat, slot, kind, observed_minus_geometry,
@@ -542,8 +592,12 @@ class _DdBase(TcMeasurement):
         """Append one attempted DD row to the observational trace."""
         if context is None:
             return
-        raw_band, track, raw_status = self._trace_raw_signal_fields(
+        raw_signal = self._trace_raw_signal_fields(
             obsr, obsb, target_sat, slot)
+        raw_band = (raw_signal["rover"]["raw_band"]
+                    if raw_signal["comparable"] else None)
+        track = (raw_signal["rover"]["track"]
+                 if raw_signal["comparable"] else None)
         row = {
             "attempt_index": int(context["_dd_attempt_counter"]),
             "row_index": None if row_index is None else int(row_index),
@@ -557,7 +611,13 @@ class _DdBase(TcMeasurement):
             "kind": str(kind),
             "raw_band": raw_band,
             "track": track,
-            "raw_signal_status": raw_status,
+            "raw_signal": {
+                "rover": raw_signal["rover"],
+                "base": raw_signal["base"],
+                "status": raw_signal["status"],
+            },
+            "raw_signal_comparable": raw_signal["comparable"],
+            "raw_signal_status": raw_signal["status"],
             "dd_observation_minus_geometry": float(observed_minus_geometry),
             "predicted_state_term": float(predicted_state_term),
             "innovation": float(innovation),
@@ -566,6 +626,9 @@ class _DdBase(TcMeasurement):
             "h_norm": float(np.linalg.norm(h_row)),
             "covariance_block": (
                 None if covariance_block is None else int(covariance_block)),
+            "covariance_block_id": (
+                None if covariance_block is None else
+                f"{context['trace_instance_id']}:{context['epoch']}:{covariance_block}"),
             "covariance_row": (
                 None if covariance_row is None else int(covariance_row)),
             "r_ref": None if ref_variance is None else float(ref_variance),
@@ -612,6 +675,7 @@ class _DdBase(TcMeasurement):
             {
                 "row_index": row["row_index"],
                 "block": row["covariance_block"],
+                "block_id": row["covariance_block_id"],
                 "block_row": row["covariance_row"],
                 "reference_variance": row["r_ref"],
                 "target_variance": row["r_target"],
@@ -625,9 +689,24 @@ class _DdBase(TcMeasurement):
             "matrix_shape": matrix_shape,
             "row_count": int(len(v)),
             "rows": covariance_rows,
-            "blocks": context.pop("_covariance_blocks", []),
+            "blocks": [],
         }
+        for block in context.pop("_covariance_blocks", []):
+            block = dict(block)
+            indices = list(block.pop("row_indices", []))
+            block["row_indices"] = indices
+            block["packed_lower"] = []
+            if indices and R is not None:
+                matrix = np.asarray(R, dtype=float)
+                submatrix = matrix[np.ix_(indices, indices)]
+                block["packed_lower"] = [
+                    float(submatrix[i, j])
+                    for i in range(len(indices))
+                    for j in range(i + 1)
+                ]
+            context["covariance"]["blocks"].append(block)
         context.pop("_dd_attempt_counter", None)
+        context.pop("_block_counter", None)
         context.pop("_obsr", None)
         context.pop("_obsb", None)
         context["residual"] = {
@@ -652,9 +731,14 @@ class _DdBase(TcMeasurement):
         context["jacobian_shape"] = context["jacobian"]["shape"]
         context["jacobian_rank"] = context["jacobian"]["rank"]
         if amb_init_target is not None:
-            context["float_state_counter"] = int(
+            context["float_update_count"] = int(
                 getattr(amb_init_target, "_meas_count", 0))
-        context["ar_call_counter"] = int(getattr(nav, "nb_ar", 0))
+            context["float_state_counter"] = context["float_update_count"]
+        # This builder never invokes ambiguity resolution.  ``nav.nb_ar`` is
+        # a number of ambiguity states, not a call counter, and must not be
+        # reported as one.
+        context["ambiguity_resolution_calls"] = 0
+        context["ar_call_counter"] = context["ambiguity_resolution_calls"]
         self._measurement_trace.emit(context)
 
     # ---- 子类重写 ----
@@ -740,7 +824,14 @@ class _DdBase(TcMeasurement):
                 lami = _c / freqi
                 block_count = 0
                 block_start = len(v_list)
-                covariance_block = len(nb_per_block)
+                attempted_block_start = (
+                    trace_context["_dd_attempt_counter"]
+                    if trace_context is not None else None)
+                if trace_context is not None:
+                    covariance_block = trace_context["_block_counter"]
+                    trace_context["_block_counter"] += 1
+                else:
+                    covariance_block = len(nb_per_block)
                 for j in idx:
                     if j == ref_i:
                         continue
@@ -877,18 +968,38 @@ class _DdBase(TcMeasurement):
                     block_count += 1
                 if block_count > 0:
                     nb_per_block.append(block_count)
-                    if trace_context is not None:
-                        trace_context["_covariance_blocks"].append({
-                            "block": int(covariance_block),
-                            "system": _trace_system_name(sys),
-                            "kind": kind,
-                            "slot": int(frq),
-                            "ref_sat": int(sat[ref_i]),
-                            "ref_prn": sat2id(int(sat[ref_i])),
-                            "row_start": int(block_start),
-                            "row_count": int(block_count),
-                            "off_diagonal": "reference_variance",
-                        })
+                if trace_context is not None and attempted_block_start is not None \
+                        and trace_context["_dd_attempt_counter"] > attempted_block_start:
+                    attempt_indices = list(range(
+                        attempted_block_start,
+                        trace_context["_dd_attempt_counter"]))
+                    row_indices = list(range(
+                        block_start, block_start + block_count))
+                    if block_count == len(attempt_indices):
+                        block_status = "accepted"
+                    elif block_count:
+                        block_status = "partial_rejection"
+                    else:
+                        block_status = "all_rejected"
+                    block_id = (
+                        f"{trace_context['trace_instance_id']}:{trace_context['epoch']}"
+                        f":{covariance_block}")
+                    trace_context["_covariance_blocks"].append({
+                        "block": int(covariance_block),
+                        "block_id": block_id,
+                        "system": _trace_system_name(sys),
+                        "kind": kind,
+                        "slot": int(frq),
+                        "ref_sat": int(sat[ref_i]),
+                        "ref_prn": sat2id(int(sat[ref_i])),
+                        "row_start": int(block_start),
+                        "row_count": int(block_count),
+                        "row_indices": row_indices,
+                        "attempt_indices": attempt_indices,
+                        "attempt_count": len(attempt_indices),
+                        "status": block_status,
+                        "off_diagonal": "reference_variance",
+                    })
         info = {"pairs": used_pairs, "n": len(v_list),
                 "ref_sats": sorted({p[0] for p in used_pairs}),
                 "n_phase_att": n_phase_att, "n_phase_acc": n_phase_acc,
