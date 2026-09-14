@@ -206,7 +206,7 @@ class TcEstimator(LcEstimator):
                 # sigma=0.1 → Q_clk=0.01 m²/s, Pclk 平衡 ~0.1m² (远小于 Ppos~0.5)
                 # 使 K[pos] >> K[clk], 位置获得足够修正对抗 IMU 高度漂移
                 q_clk = 0.1 ** 2 * dt   # m² (per IMU step)
-                for k in range(3):
+                for k in range(4):
                     self.P[clk0 + k, clk0 + k] += q_clk
 
             # 模糊度随机游走 (对齐 rtklib udbias: P[j,j] += prnbias²·|tt|)。
