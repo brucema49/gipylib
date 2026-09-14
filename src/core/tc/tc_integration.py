@@ -974,6 +974,13 @@ class TcIntegration:
         # 2. 推进当前 IMU (dt = imu.t - cur.t)
         self.imupre = cur
         self.imucur = imu
+        if imu.timestamp <= cur.timestamp:
+            # When GNSS lands exactly on the current raw-rate endpoint, the
+            # interpolation branch above has already committed this physical
+            # interval.  Do not send the same endpoint through InsUpdate a
+            # second time (which would create a dt=0 propagation attempt).
+            self._check_velocity_divergence()
+            return
         self._est.time_update(imu)
         self._record_latest_propagation()
         self._static_detect.push(imu)
