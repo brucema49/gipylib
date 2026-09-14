@@ -1410,17 +1410,32 @@ class TcIntegration:
         last_entry = self._gnss_pos_cache[-1]
         t_first, pos_first = first_entry[:2]
         t_last, pos_last = last_entry[:2]
+        # The INS state is stamped at the latest GNSS epoch.  Its velocity is
+        # therefore the local derivative at that epoch (the latest adjacent
+        # RTK positions), rather than the average over the whole alignment
+        # baseline.  GREAT POS alignment follows the same endpoint derivative
+        # contract; the full cache span remains the motion/observability gate.
+        velocity_entry = self._gnss_pos_cache[-2]
+        t_velocity, pos_velocity = velocity_entry[:2]
         velocity_diff_start_sow = (
-            first_entry[2] if len(first_entry) > 2 else None
+            velocity_entry[2] if len(velocity_entry) > 2 else None
         )
         velocity_diff_end_sow = (
             last_entry[2] if len(last_entry) > 2 else None
         )
-        cache_sample_start_sow = velocity_diff_start_sow
-        cache_sample_end_sow = velocity_diff_end_sow
+        cache_sample_start_sow = (
+            first_entry[2] if len(first_entry) > 2 else None
+        )
+        cache_sample_end_sow = (
+            last_entry[2] if len(last_entry) > 2 else None
+        )
         span = t_last - t_first
         if span < 5.0:
             return  # 不足 5 秒, 继续累积
+
+        velocity_span = t_last - t_velocity
+        if velocity_span <= 0.0:
+            return
 
         # 动态速度阈值: 基于运动检测所用位置源
         if quality == 1:  # FIX
@@ -1428,8 +1443,8 @@ class TcIntegration:
         else:  # FLOAT / DGPS / SPP
             init_speed_thr = 3.0
 
-        # 首尾位置差分计算速度矢量 (5 秒窗口)
-        vel_e = (pos_last - pos_first) / span
+        # 相邻末端位置差分计算状态时刻的速度矢量。
+        vel_e = (pos_last - pos_velocity) / velocity_span
 
         # Keep the exact buffered source rows used to bracket the initialization
         # epoch in the opt-in trace.  This is observational metadata only; the
