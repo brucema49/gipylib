@@ -123,7 +123,7 @@ class InsInitializer:
         state = self._assemble_state(gnss, att_rpy, vel_e, mode)
 
         # 5. 装配初始协方差
-        P = self._set_initial_variance(mode)
+        P = self._set_initial_variance(mode, position_e=state.pos_e)
 
         return state, P
 
@@ -462,7 +462,8 @@ class InsInitializer:
             accel_scale=accel_scale,
         )
 
-    def _set_initial_variance(self, mode: InitMode) -> np.ndarray:
+    def _set_initial_variance(self, mode: InitMode,
+                              position_e: Optional[np.ndarray] = None) -> np.ndarray:
         """装配初始协方差 P (单滤波, 维度 = si.dim)。
 
         基础 15 维 [pos(3), vel(3), att(3), gyro_bias(3), accel_bias(3)]
@@ -504,7 +505,22 @@ class InsInitializer:
 
         P[0:3, 0:3] = np.diag(pos_std ** 2)
         P[3:6, 3:6] = np.diag(vel_std ** 2)
-        P[6:9, 6:9] = np.diag(att_std ** 2)
+        # The attitude configuration is expressed as NED roll/pitch/yaw,
+        # while the fixed 15-state error block stores the small attitude
+        # vector in ECEF (dpsi^e).  Rotate the covariance at the assembled
+        # position so the filter's P and F/H attitude coordinates agree.
+        att_cov_n = np.diag(att_std ** 2)
+        if position_e is not None:
+            position_e = np.asarray(position_e, dtype=np.float64).reshape(-1)
+            if position_e.size != 3 or not np.all(np.isfinite(position_e)):
+                raise ValueError("position_e must be a finite ECEF 3-vector")
+            lat, lon, _ = ecef2llh(position_e)
+            C_n2e = cal_Cn2e(lat, lon)
+            P[6:9, 6:9] = C_n2e @ att_cov_n @ C_n2e.T
+        else:
+            # Preserve direct callers that do not provide the state position;
+            # all production initialization paths pass position_e above.
+            P[6:9, 6:9] = att_cov_n
         P[9:12, 9:12] = np.diag(gyro_bias_std ** 2)
         P[12:15, 12:15] = np.diag(acce_bias_std ** 2)
 

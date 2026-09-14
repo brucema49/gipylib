@@ -1488,7 +1488,9 @@ class TcIntegration:
         # 装配初始状态 (使用 InsInitializer 的 _assemble_state / _set_initial_variance)
         init_state = self._initializer._assemble_state(
             gnss_sol, att_rpy, vel_e, InitMode.POSITION_DIFF)
-        init_P = self._initializer._set_initial_variance(InitMode.POSITION_DIFF)
+        init_P = self._initializer._set_initial_variance(
+            InitMode.POSITION_DIFF, init_state.pos_e
+        )
 
         # 创建估计器 + 量测构造器
         self._est = TcEstimator(init_state, init_P, self._cfg, self._mode)
