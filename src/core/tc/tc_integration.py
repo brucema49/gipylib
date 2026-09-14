@@ -1567,7 +1567,15 @@ class TcIntegration:
             # the same timestamp likewise seeds rate-to-increment conversion.
             # Dropping either seed would make the first propagated interval
             # span two samples (or drop the first native interval entirely).
-            if imu.timestamp >= init_ts:
+            if imu.timestamp > init_ts:
+                events.append((imu.timestamp, "imu", imu))
+                continue
+            if imu.timestamp != init_ts:
+                continue
+            is_rate = getattr(imu, "is_rate", None)
+            is_increment = getattr(imu, "is_increment", None)
+            if ((callable(is_rate) and is_rate()) or
+                    (callable(is_increment) and is_increment())):
                 events.append((imu.timestamp, "imu", imu))
         for j in range(len(self._init_obs)):
             obsr, obsb, nav, t_gnss = self._init_obs[j]
