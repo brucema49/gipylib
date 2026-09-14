@@ -120,7 +120,6 @@ class LcEstimator:
 
         P: Φ·(P+0.5Q)·Φ^T + 0.5Q (GINav 中间值法)
         """
-        prev_ts = self.ins_update._prev_timestamp
         # KF-GINS forms F/G from the state and attitude at the beginning of
         # the interval (pvapre), while the nominal mechanization then advances
         # to the current IMU epoch.  Keep that same linearization point.
@@ -131,7 +130,10 @@ class LcEstimator:
         if not self.ins_update.last_update_accepted:
             return
 
-        dt = imu.timestamp - prev_ts
+        # InsUpdate is the source of truth for the accepted segment interval:
+        # native increments use payload.dt, while rate inputs retain their
+        # timestamp-delta semantics.
+        dt = float(self.ins_update.last_dt)
         if dt <= 0.0:
             return
 
