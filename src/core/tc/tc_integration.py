@@ -72,6 +72,27 @@ _INIT_CLONE_FIRST_SOW = 180634.0
 _INIT_CLONE_LAST_SOW = 180635.0
 _INIT_CLONE_SOW_STEP = 0.01
 _INIT_CLONE_SOW_EPSILON = 1.0e-9
+_INIT_HEADING_STABILITY_RAD = math.radians(10.0)
+
+
+def _headings_are_stable(headings, *, max_span_rad=_INIT_HEADING_STABILITY_RAD,
+                         minimum_count=3):
+    """Check a short sequence of wrapped headings for stable motion.
+
+    GREAT's POS alignment accepts a position-vector heading only after a
+    subsequent vector agrees within 10 degrees.  The TC initializer keeps a
+    five-second GNSS window, so use the last three endpoint vectors as the
+    equivalent streaming evidence: all wrapped differences must fit inside
+    that same 10-degree GREAT acceptance span.  This is an observability gate
+    only; it does not alter any EKF noise, weighting, or residual threshold.
+    """
+    values = np.asarray(list(headings), dtype=float).reshape(-1)
+    if values.size < int(minimum_count) or not np.all(np.isfinite(values)):
+        return False
+    reference = float(values[0])
+    wrapped = np.arctan2(np.sin(values - reference),
+                         np.cos(values - reference))
+    return float(np.max(wrapped) - np.min(wrapped)) <= float(max_span_rad)
 
 
 class TcIntegration:
@@ -1449,6 +1470,36 @@ class TcIntegration:
             init_speed_thr = 2.0
         else:  # FLOAT / DGPS / SPP
             init_speed_thr = 3.0
+
+        # Match GREAT POS alignment's observability contract.  A long
+        # position span alone is not sufficient while the platform is
+        # turning: the resulting chord heading can be stale by the time the
+        # INS handoff occurs.  Require the last three endpoint displacement
+        # headings to agree within GREAT's 10-degree acceptance span.  The
+        # check is streaming and uses only the already buffered GNSS rows.
+        # The production GNSS stream normally has >=4 buffered epochs once
+        # the five-second span is available.  Keep the historical two-row
+        # RTD/SPP unit-test path valid for synthetic callers that provide only
+        # the endpoint pair; with fewer than three endpoint headings there is
+        # no stability evidence to evaluate.
+        if len(self._gnss_pos_cache) >= 4:
+            heading_samples = []
+            for previous, current in zip(self._gnss_pos_cache[-4:-1],
+                                         self._gnss_pos_cache[-3:]):
+                dt_heading = float(current[0] - previous[0])
+                if dt_heading <= 0.0:
+                    return
+                delta_e = (current[1] - previous[1]) / dt_heading
+                lat_h, lon_h, _ = ecef2llh(current[1])
+                velocity_n_h = cal_Ce2n(lat_h, lon_h) @ delta_e
+                horizontal_norm = math.hypot(
+                    float(velocity_n_h[0]), float(velocity_n_h[1]))
+                if horizontal_norm <= 1.0e-9:
+                    return
+                heading_samples.append(math.atan2(
+                    float(velocity_n_h[1]), float(velocity_n_h[0])))
+            if not _headings_are_stable(heading_samples):
+                return
 
         # 相邻末端位置差分计算状态时刻的速度矢量。
         vel_e = (pos_last - pos_velocity) / velocity_span
