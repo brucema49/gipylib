@@ -1454,28 +1454,13 @@ class TcIntegration:
         else:
             raw_imu_prev, raw_imu_curr = None, None
 
-        # Require every cached adjacent interval to show the declared motion
-        # regime, matching ``InsInitializer._align_motion_displacement``.
-        # Checking only the final derivative can initialize on a transient
-        # outlier and stamp the TC state several seconds too early.
-        planar_speed = 0.0
-        for adjacent in range(1, len(self._gnss_pos_cache)):
-            t_prev, pos_prev = self._gnss_pos_cache[adjacent - 1][:2]
-            t_curr, pos_curr = self._gnss_pos_cache[adjacent][:2]
-            dt_adjacent = t_curr - t_prev
-            if dt_adjacent <= 0.0:
-                return
-            vel_adjacent = (pos_curr - pos_prev) / dt_adjacent
-            lat, lon, _ = ecef2llh(pos_curr)
-            vel_n_adjacent = cal_Ce2n(lat, lon) @ vel_adjacent
-            planar_speed = math.hypot(vel_n_adjacent[0], vel_n_adjacent[1])
-            if planar_speed < init_speed_thr:
-                logger.debug(
-                    f"TC init speed={planar_speed:.2f} < {init_speed_thr} "
-                    f"t={t_gnss:.1f} span={span:.1f}s")
-                return
         lat, lon, _ = ecef2llh(pos_last)
         vel_n = cal_Ce2n(lat, lon) @ vel_e
+        planar_speed = math.hypot(vel_n[0], vel_n[1])
+        if planar_speed < init_speed_thr:
+            logger.debug(f"TC init speed={planar_speed:.2f} < {init_speed_thr} "
+                         f"t={t_gnss:.1f} span={span:.1f}s")
+            return
 
         # yaw = atan2(v_E, v_N), pitch=0, roll=0
         yaw = math.atan2(vel_n[1], vel_n[0])
