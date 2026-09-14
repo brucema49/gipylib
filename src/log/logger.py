@@ -30,6 +30,13 @@ from src.log.aligner import Aligner
 
 logger = logging.getLogger(__name__)
 
+# Unix timestamps around the campus01 epoch are represented with a spacing of
+# roughly 2.4e-7 s.  Treating an IMU sample that is within a few ulps of a
+# GNSS epoch as "before" the epoch would make the published GNSS-time row
+# contain the pre-update state.  This tolerance only orders equal-time
+# events; it does not resample or alter either sensor timestamp.
+_GNSS_IMU_TIME_TOLERANCE_S = 1.0e-6
+
 
 class Logger(Thread):
     """松组合日志记录器线程（统一流式事件循环）。
@@ -230,8 +237,31 @@ class TcLogger(Thread):
         # 同时保证 GNSS 在 t>=gnss.t 的 IMU 之前入队（GVINS 插值触发前提）
         self._tc_imu_buffer: deque = deque()
 
+    def _partition_imu_window(self, t_gnss: float, feed_cutoff: float | None = None):
+        """Split buffered IMU samples around one GNSS epoch.
+
+        Samples within the timestamp representation tolerance are placed in
+        the ``after`` side so the GNSS event is queued before the endpoint
+        IMU.  The remaining samples stay in the buffer for the next epoch.
+        """
+        if feed_cutoff is None:
+            feed_cutoff = t_gnss + self.harvest_window
+        before = []
+        after = []
+        while self._tc_imu_buffer:
+            imu = self._tc_imu_buffer[0]
+            if imu.timestamp > feed_cutoff:
+                break
+            if imu.timestamp < t_gnss - _GNSS_IMU_TIME_TOLERANCE_S:
+                before.append(self._tc_imu_buffer.popleft())
+            else:
+                after.append(self._tc_imu_buffer.popleft())
+        return before, after
+
     def run(self):
         self.tc_stream.open()
+        prefetched_gnss = None
+        have_prefetched_gnss = False
         try:
             while self.control.is_running():
                 # 1. 搬运可用 IMU 到 TC 缓冲
@@ -240,11 +270,16 @@ class TcLogger(Thread):
                     self._tc_imu_buffer.append(imu)
 
                 # 2. 取一个 GNSS 原始观测历元（阻塞，超时 0.1s）
-                try:
-                    gnss = self.gnss_queue.get(timeout=0.1)
-                except Empty:
-                    # 无 GNSS，IMU 已入缓冲，等 GNSS 到来后再按时间顺序喂入
-                    continue
+                if have_prefetched_gnss:
+                    gnss = prefetched_gnss
+                    prefetched_gnss = None
+                    have_prefetched_gnss = False
+                else:
+                    try:
+                        gnss = self.gnss_queue.get(timeout=0.1)
+                    except Empty:
+                        # 无 GNSS，IMU 已入缓冲，等 GNSS 到来后再按时间顺序喂入
+                        continue
 
                 # 3. EOF sentinel
                 if gnss is None:
@@ -264,8 +299,32 @@ class TcLogger(Thread):
                     obsr, obsb, nav = gnss
                 t_gnss = float(obsr.t.time + obsr.t.sec)
 
+                # Keep one GNSS epoch in hand when the producer has already
+                # queued it.  A full one-second harvest window otherwise lets
+                # the current iteration consume the next epoch's endpoint
+                # IMU before that GNSS update is visible to the stream.
+                try:
+                    prefetched_gnss = self.gnss_queue.get_nowait()
+                    have_prefetched_gnss = True
+                except Empty:
+                    prefetched_gnss = None
+                    have_prefetched_gnss = False
+
+                feed_cutoff = t_gnss + self.harvest_window
+                if have_prefetched_gnss and prefetched_gnss is not None:
+                    if isinstance(prefetched_gnss, SensorData):
+                        next_obsr = prefetched_gnss.gnss_raw[0]
+                    else:
+                        next_obsr = prefetched_gnss[0]
+                    next_t = float(next_obsr.t.time + next_obsr.t.sec)
+                    if next_t > t_gnss:
+                        feed_cutoff = min(
+                            feed_cutoff,
+                            next_t - _GNSS_IMU_TIME_TOLERANCE_S,
+                        )
+
                 # 5. 等待 IMU 覆盖 harvest 窗口
-                wait_imus = self._wait_for_imu(t_gnss + self.harvest_window)
+                wait_imus = self._wait_for_imu(feed_cutoff)
                 for imu in wait_imus:
                     self._tc_imu_buffer.append(imu)
 
@@ -274,17 +333,8 @@ class TcLogger(Thread):
                 #    超出的留在缓冲给下一个 GNSS 历元
                 #    同时间戳 GNSS 先于 IMU（与批处理排序一致）
                 #    GNSS 后的 IMU (t >= gnss.t) 触发 GVINS 插值+融合
-                feed_cutoff = t_gnss + self.harvest_window
-                before = []
-                after = []
-                while self._tc_imu_buffer:
-                    imu = self._tc_imu_buffer[0]
-                    if imu.timestamp > feed_cutoff:
-                        break
-                    if imu.timestamp < t_gnss:
-                        before.append(self._tc_imu_buffer.popleft())
-                    else:
-                        after.append(self._tc_imu_buffer.popleft())
+                before, after = self._partition_imu_window(
+                    t_gnss, feed_cutoff=feed_cutoff)
                 for imu in before:
                     self.tc_stream.feed_imu(imu)
                 self.tc_stream.feed_gnss_raw(obsr, obsb, nav)
