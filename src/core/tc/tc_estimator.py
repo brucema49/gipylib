@@ -144,6 +144,13 @@ class TcEstimator(LcEstimator):
         不再每历元重置 Pclk (原 ignav 白噪声模型会导致 Pclk=100 >> Ppos,
         钟差吸收全部 innovation, 位置修正不足, 高度误差累积)。
         """
+        # The nominal mechanization integrates this interval from its
+        # beginning state.  Linearizing F/G (and therefore Phi/Q) at that same
+        # beginning state is required for a consistent discrete EKF; otherwise the
+        # attitude/force and gravity-gradient blocks describe a different
+        # operating point than the state transition just applied.
+        prev_C_b_e = self.ins_update.state.C_b_e.copy()
+        prev_pos_e = self.ins_update.state.pos_e.copy()
         self.ins_update.update(imu)
 
         if not self.ins_update.last_update_accepted:
@@ -164,10 +171,10 @@ class TcEstimator(LcEstimator):
         n_ins = si._gnss_base  # INS + 可选块维度 (clk/amb 之前)
         n_total = si.dim
 
-        C_b_e = self.ins_update.state.C_b_e
+        C_b_e = prev_C_b_e
         f_b = self.ins_update.f_b
         w_b_ib = self.ins_update.w_b_ib
-        pos_e = self.ins_update.state.pos_e
+        pos_e = prev_pos_e
 
         # 仅构建 INS 块的 F/Phi/Q (n_ins × n_ins), 避免全 n×n 矩阵
         F_ins = self.tm.build_F_ins(C_b_e, f_b, w_b_ib, pos_e, n_ins)
