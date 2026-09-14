@@ -1560,14 +1560,14 @@ class TcIntegration:
         """回放初始化缓冲中 init_ts 之后的事件。"""
         events = []
         for imu in self._init_imu:
-            # A rate sample at the handoff timestamp is the left endpoint
-            # needed to form the first interval [init_ts, next_imu].  Native
-            # increments, in contrast, are interval payloads ending at their
-            # timestamp and must remain strictly after the assembled state.
-            # Keeping the distinction here prevents the rate path from
-            # silently integrating its first interval with a doubled dt.
-            keep_rate_endpoint = imu.is_rate() and imu.timestamp == init_ts
-            if imu.timestamp > init_ts or keep_rate_endpoint:
+            # Both payload forms need the sample at the handoff as the
+            # previous boundary/seed.  A native increment at ``init_ts`` is
+            # not integrated again: ``_add_increment_imu`` only stores the
+            # first sample and consumes the next interval.  A rate sample at
+            # the same timestamp likewise seeds rate-to-increment conversion.
+            # Dropping either seed would make the first propagated interval
+            # span two samples (or drop the first native interval entirely).
+            if imu.timestamp >= init_ts:
                 events.append((imu.timestamp, "imu", imu))
         for j in range(len(self._init_obs)):
             obsr, obsb, nav, t_gnss = self._init_obs[j]
