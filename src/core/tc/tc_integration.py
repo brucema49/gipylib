@@ -1861,7 +1861,7 @@ class TcIntegration:
         self._maybe_align_yaw(t_gnss)
         self._emit_final_measurement_trace(
             trace_builder, status="accepted", accepted=True,
-            state=self._est.state, P=self._est.P, x=feedback_x,
+            state=self._est.state, P=self._est.P,
         )
 
     def _maybe_align_yaw(self, t_gnss: float) -> None:
