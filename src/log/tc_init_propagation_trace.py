@@ -33,6 +33,27 @@ INITIALIZATION_INPUT_DEFAULT_FILENAMES = {
     "csv": "tc-initialization-input-trace.csv",
 }
 
+# Append-only provenance tuple shared by the initialization-input and
+# propagation records.  These fields are deliberately flat so CSV and JSONL
+# consumers can join epochs without interpreting nested diagnostic payloads.
+INITIALIZATION_PROVENANCE_FIELDS = (
+    "gnss_measurement_epoch_sow",
+    "gnss_source_epoch_sow",
+    "spp_epoch_sow",
+    "relpos_epoch_sow",
+    "cache_sample_start_sow",
+    "cache_sample_end_sow",
+    "state_epoch_sow",
+    "published_event_epoch_sow",
+    "propagation_interval_start_sow",
+    "propagation_interval_end_sow",
+    "propagation_interval_dt_s",
+    "position_frame_id",
+    "velocity_frame_id",
+    "attitude_frame_id",
+    "velocity_provenance",
+)
+
 # The first columns intentionally match GREAT's initialization/propagation
 # trace header byte-for-byte.  Additional columns are append-only diagnostic
 # fields, so a row can be joined by the existing common state columns while
@@ -144,6 +165,9 @@ _INITIALIZATION_INPUT_APPEND_FIELDS = (
     "state_time_source", "imu_update_applied", "imu_update_time_unix_s",
     "imu_update_time_sow", "imu_consumed", "imu_consumed_time_unix_s",
     "imu_consumed_time_sow",
+    # Append-only initialization/propagation provenance tuple.  Keep this at
+    # the end so the existing GREAT-compatible prefix remains byte-for-byte.
+    *INITIALIZATION_PROVENANCE_FIELDS,
 )
 _INITIALIZATION_INPUT_APPEND_FIELDS = tuple(dict.fromkeys(
     field for field in _INITIALIZATION_INPUT_APPEND_FIELDS
@@ -199,7 +223,22 @@ def build_trace_record(event: str, state, *, sow: float | None = None,
                        imu_sample_count: int = 0,
                        gnss_measurement_inserted: int = 0,
                        main_run_gnss_update_seen: int = 0,
-                       state_source: str | None = None) -> dict:
+                       state_source: str | None = None,
+                       gnss_measurement_epoch_sow: float | None = None,
+                       gnss_source_epoch_sow: float | None = None,
+                       spp_epoch_sow: float | None = None,
+                       relpos_epoch_sow: float | None = None,
+                       cache_sample_start_sow: float | None = None,
+                       cache_sample_end_sow: float | None = None,
+                       state_epoch_sow: float | None = None,
+                       published_event_epoch_sow: float | None = None,
+                       propagation_interval_start_sow: float | None = None,
+                       propagation_interval_end_sow: float | None = None,
+                       propagation_interval_dt_s: float | None = None,
+                       position_frame_id: str | None = None,
+                       velocity_frame_id: str | None = None,
+                       attitude_frame_id: str | None = None,
+                       velocity_provenance: str | None = None) -> dict:
     """Build one schema-complete state record from an existing state object.
 
     ``sow`` is accepted separately so callers that retain source GPST can
@@ -247,6 +286,36 @@ def build_trace_record(event: str, state, *, sow: float | None = None,
     first_gnss_sow = _trace_scalar(first_gnss_sow)
     imu_prev_sow = _trace_scalar(imu_prev_sow)
     imu_curr_sow = _trace_scalar(imu_curr_sow)
+    provenance_sows = {
+        "gnss_measurement_epoch_sow": _trace_scalar(
+            gnss_measurement_epoch_sow),
+        "gnss_source_epoch_sow": _trace_scalar(gnss_source_epoch_sow),
+        "spp_epoch_sow": _trace_scalar(spp_epoch_sow),
+        "relpos_epoch_sow": _trace_scalar(relpos_epoch_sow),
+        "cache_sample_start_sow": _trace_scalar(cache_sample_start_sow),
+        "cache_sample_end_sow": _trace_scalar(cache_sample_end_sow),
+        "state_epoch_sow": _trace_scalar(
+            exact_sow if state_epoch_sow is None else state_epoch_sow),
+        "published_event_epoch_sow": _trace_scalar(
+            published_event_epoch_sow),
+    }
+    interval_start = _trace_scalar(propagation_interval_start_sow)
+    interval_end = _trace_scalar(propagation_interval_end_sow)
+    # Rate samples do not carry source GPST SOW.  Even when a caller has a
+    # Unix-derived ``dt``, keep the complete interval unavailable rather than
+    # manufacturing source endpoints.
+    if str(propagation_form or "").strip().lower() == "rate":
+        interval_start = interval_end = None
+    elif interval_start is None:
+        interval_start = imu_prev_sow
+        interval_end = imu_curr_sow
+    elif interval_end is None:
+        interval_end = imu_curr_sow
+    interval_dt = None
+    if interval_start is not None and interval_end is not None:
+        interval_dt = _trace_scalar(propagation_interval_dt_s)
+        if interval_dt is None:
+            interval_dt = interval_end - interval_start
     source_sow_available = exact_sow is not None
     window_sow_available = first_gnss_sow is not None
     record = {
@@ -286,6 +355,14 @@ def build_trace_record(event: str, state, *, sow: float | None = None,
         "gnss_measurement_inserted": int(gnss_measurement_inserted),
         "main_run_gnss_update_seen": int(main_run_gnss_update_seen),
         "state_source": state_source,
+        **provenance_sows,
+        "propagation_interval_start_sow": interval_start,
+        "propagation_interval_end_sow": interval_end,
+        "propagation_interval_dt_s": interval_dt,
+        "position_frame_id": position_frame_id,
+        "velocity_frame_id": velocity_frame_id,
+        "attitude_frame_id": attitude_frame_id,
+        "velocity_provenance": velocity_provenance,
         "pos_ecef": pos,
         "pos_ecef_x": None if pos is None else pos[0],
         "pos_ecef_y": None if pos is None else pos[1],
@@ -530,7 +607,21 @@ def build_initialization_input_record(*, timestamp: float | None = None,
                                       imu_update_applied: bool | None = None,
                                       imu_update_time_unix_s: float | None = None,
                                       imu_consumed: bool | None = None,
-                                      imu_consumed_time_unix_s: float | None = None) -> dict:
+                                      imu_consumed_time_unix_s: float | None = None,
+                                      gnss_measurement_epoch_sow: float | None = None,
+                                      gnss_source_epoch_sow: float | None = None,
+                                      spp_epoch_sow: float | None = None,
+                                      relpos_epoch_sow: float | None = None,
+                                      cache_sample_start_sow: float | None = None,
+                                      cache_sample_end_sow: float | None = None,
+                                      state_epoch_sow: float | None = None,
+                                      published_event_epoch_sow: float | None = None,
+                                      propagation_interval_start_sow: float | None = None,
+                                      propagation_interval_end_sow: float | None = None,
+                                      propagation_interval_dt_s: float | None = None,
+                                      position_frame_id: str | None = None,
+                                      velocity_frame_id: str | None = None,
+                                      attitude_frame_id: str | None = None) -> dict:
     """Build the common, observational initialization-input record.
 
     Raw values retain the convention in which they entered initialization;
@@ -659,6 +750,32 @@ def build_initialization_input_record(*, timestamp: float | None = None,
     diff_end_sow = _initialization_input_scalar(velocity_diff_end_sow)
     diff_dt = (None if diff_start_sow is None or diff_end_sow is None
                else diff_end_sow - diff_start_sow)
+    provenance_sows = {
+        "gnss_measurement_epoch_sow": _initialization_input_scalar(
+            exact_sow if gnss_measurement_epoch_sow is None
+            else gnss_measurement_epoch_sow),
+        "gnss_source_epoch_sow": _initialization_input_scalar(
+            exact_sow if gnss_source_epoch_sow is None
+            else gnss_source_epoch_sow),
+        "spp_epoch_sow": _initialization_input_scalar(spp_epoch_sow),
+        "relpos_epoch_sow": _initialization_input_scalar(relpos_epoch_sow),
+        "cache_sample_start_sow": _initialization_input_scalar(
+            cache_sample_start_sow),
+        "cache_sample_end_sow": _initialization_input_scalar(
+            cache_sample_end_sow),
+        "state_epoch_sow": _initialization_input_scalar(
+            exact_sow if state_epoch_sow is None else state_epoch_sow),
+        "published_event_epoch_sow": _initialization_input_scalar(
+            published_event_epoch_sow),
+    }
+    interval_start = _initialization_input_scalar(
+        propagation_interval_start_sow)
+    interval_end = _initialization_input_scalar(propagation_interval_end_sow)
+    interval_dt = None
+    if interval_start is not None and interval_end is not None:
+        interval_dt = _initialization_input_scalar(propagation_interval_dt_s)
+        if interval_dt is None:
+            interval_dt = interval_end - interval_start
     week = None
     state_sow = None
     if timestamp is not None:
@@ -860,6 +977,20 @@ def build_initialization_input_record(*, timestamp: float | None = None,
         "imu_consumed": imu_consumed,
         "imu_consumed_time_unix_s": consumed_time,
         "imu_consumed_time_sow": consumed_time_sow,
+        **provenance_sows,
+        "propagation_interval_start_sow": interval_start,
+        "propagation_interval_end_sow": interval_end,
+        "propagation_interval_dt_s": interval_dt,
+        "position_frame_id": (
+            str(position_frame_id).strip().upper()
+            if position_frame_id is not None else position_frame),
+        "velocity_frame_id": (
+            str(velocity_frame_id).strip().upper()
+            if velocity_frame_id is not None else velocity_frame),
+        "attitude_frame_id": (
+            str(attitude_frame_id).strip().upper()
+            if attitude_frame_id is not None else attitude_frame),
+        "velocity_provenance": velocity_provenance,
     }
     # Flat aliases make the row joinable with the existing GREAT stage trace.
     for prefix, value in (("raw_position", raw_pos),

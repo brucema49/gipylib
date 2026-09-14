@@ -155,6 +155,10 @@ class TcIntegration:
         # IMU 状态 (GVINS 风格)
         self.imupre: Optional[ImuMeasurement] = None
         self.imucur: Optional[ImuMeasurement] = None
+        # Source payload form for the latest diagnostic record.  This keeps a
+        # rate-to-increment conversion from looking like an input increment in
+        # provenance telemetry; it never participates in estimator routing.
+        self._trace_last_input_form: str | None = None
         # GNSS 原始观测队列: (obsr, obsb, nav, t_gnss)
         self.pending_obs: collections.deque = collections.deque()
 
@@ -300,27 +304,49 @@ class TcIntegration:
         try:
             state = self._est.state
             current = self.imucur
-            source_form = str(
+            source_form = self._trace_last_input_form
+            configured_source_form = str(
                 self._cfg.get("ins", {}).get("imu_data_form", "")) or None
+            if source_form is None:
+                source_form = configured_source_form
             if source_form is None:
                 source_form = (
                     "increment" if current is not None and
                     current.is_increment() else "rate"
                 )
+            source_form = str(source_form).strip().lower()
             propagation_form = (
                 "increment" if current is not None and current.is_increment()
                 else "rate"
             )
+            source_sow_available = source_form != "rate"
+            propagation_sow = (
+                self._trace_propagation_sow(snapshot["timestamp"])
+                if source_sow_available else None
+            )
+            propagation_start_sow = (
+                self._trace_imu_sow(self.imupre)
+                if source_sow_available else None
+            )
+            propagation_end_sow = (
+                self._trace_imu_sow(current)
+                if source_sow_available else None
+            )
+            ins_update = getattr(self._est, "ins_update", None)
+            publication_allowed = (
+                ins_update is None or
+                getattr(ins_update, "last_update_accepted", True)
+            )
             record = build_trace_record(
                 "imu_propagation_pre_gnss", state,
-                sow=self._trace_propagation_sow(snapshot["timestamp"]),
+                sow=propagation_sow,
                 dt=snapshot["dt"], gnss_free=False,
                 isolation="pre_first_gnss_update;not_gnss_free",
                 first_gnss_sow=self._init_propagation_trace_first_gnss_sow,
                 input_imu_form=source_form,
                 propagation_form=propagation_form,
-                imu_prev_sow=self._trace_imu_sow(self.imupre),
-                imu_curr_sow=self._trace_imu_sow(current),
+                imu_prev_sow=propagation_start_sow,
+                imu_curr_sow=propagation_end_sow,
                 imu_sample_count=1,
                 gnss_measurement_inserted=0,
                 main_run_gnss_update_seen=0,
@@ -328,6 +354,17 @@ class TcIntegration:
                     "main_run_gnss_assisted;pre_first_gnss_update;"
                     "not_gnss_free"
                 ),
+                state_epoch_sow=propagation_sow,
+                published_event_epoch_sow=(
+                    propagation_sow if publication_allowed else None),
+                propagation_interval_start_sow=propagation_start_sow,
+                propagation_interval_end_sow=propagation_end_sow,
+                propagation_interval_dt_s=(
+                    snapshot["dt"] if source_sow_available else None),
+                position_frame_id="ECEF",
+                velocity_frame_id="ECEF",
+                attitude_frame_id="ECEF",
+                velocity_provenance="ins_mechanization",
             )
             if (self._init_propagation_trace_first_gnss_sow is None and
                     self._init_propagation_trace_pending is not None):
@@ -382,7 +419,21 @@ class TcIntegration:
                                          imu_update_applied=None,
                                          imu_update_time_unix_s=None,
                                          imu_consumed=None,
-                                         imu_consumed_time_unix_s=None) -> None:
+                                         imu_consumed_time_unix_s=None,
+                                         gnss_measurement_epoch_sow=None,
+                                         gnss_source_epoch_sow=None,
+                                         spp_epoch_sow=None,
+                                         relpos_epoch_sow=None,
+                                         cache_sample_start_sow=None,
+                                         cache_sample_end_sow=None,
+                                         state_epoch_sow=None,
+                                         published_event_epoch_sow=None,
+                                         propagation_interval_start_sow=None,
+                                         propagation_interval_end_sow=None,
+                                         propagation_interval_dt_s=None,
+                                         position_frame_id=None,
+                                         velocity_frame_id=None,
+                                         attitude_frame_id=None) -> None:
         """Emit the raw-to-canonical initialization handoff, if requested."""
         sink = self._initialization_input_trace_sink
         if sink is None:
@@ -469,6 +520,22 @@ class TcIntegration:
                     imu_update_time_unix_s=imu_update_time_unix_s,
                     imu_consumed=imu_consumed,
                     imu_consumed_time_unix_s=imu_consumed_time_unix_s,
+                    gnss_measurement_epoch_sow=gnss_measurement_epoch_sow,
+                    gnss_source_epoch_sow=gnss_source_epoch_sow,
+                    spp_epoch_sow=spp_epoch_sow,
+                    relpos_epoch_sow=relpos_epoch_sow,
+                    cache_sample_start_sow=cache_sample_start_sow,
+                    cache_sample_end_sow=cache_sample_end_sow,
+                    state_epoch_sow=state_epoch_sow,
+                    published_event_epoch_sow=published_event_epoch_sow,
+                    propagation_interval_start_sow=(
+                        propagation_interval_start_sow),
+                    propagation_interval_end_sow=(
+                        propagation_interval_end_sow),
+                    propagation_interval_dt_s=propagation_interval_dt_s,
+                    position_frame_id=position_frame_id,
+                    velocity_frame_id=velocity_frame_id,
+                    attitude_frame_id=attitude_frame_id,
                 )
             )
         except Exception as exc:
@@ -808,6 +875,16 @@ class TcIntegration:
 
     def add_imu(self, imu: ImuMeasurement) -> None:
         """GVINS 风格 IMU 消费: 每条 IMU 检查 GNSS 队头时间戳。"""
+        # Record the untouched input form for diagnostics only.  In particular
+        # a rate sample converted below must retain unavailable source SOW.
+        if self._init_propagation_trace_sink is not None:
+            try:
+                self._trace_last_input_form = (
+                    "increment" if imu.is_increment() else
+                    "rate" if imu.is_rate() else None
+                )
+            except (AttributeError, TypeError, ValueError):
+                self._trace_last_input_form = None
         if not self._initialized:
             self._init_imu.append(imu)
             # 限制缓冲区大小: 只保留最近 5 秒的 IMU 数据 (避免 O(N²) 遍历)
@@ -1009,7 +1086,36 @@ class TcIntegration:
 
             _week, value = time2gpst(source_time)
             value = float(value)
-        except (AttributeError, TypeError, ValueError, ImportError):
+        except (AttributeError, TypeError, ValueError, OverflowError, ImportError):
+            return None
+        return value if np.isfinite(value) and 0.0 <= value < 604800.0 else None
+
+    @staticmethod
+    def _explicit_solution_sow(solution) -> float | None:
+        """Return a positioning solution's source GPST SOW, if available.
+
+        SPP and relative solutions carry their own ``gtime_t`` in ``t``.
+        This helper intentionally has no Unix timestamp fallback: a solution
+        epoch that cannot be read remains unavailable in the diagnostic row.
+        """
+        source_sow = getattr(solution, "source_sow", None)
+        if source_sow is not None:
+            try:
+                value = float(source_sow)
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and np.isfinite(value) and 0.0 <= value < 604800.0:
+                return value
+
+        source_time = getattr(solution, "t", None)
+        if source_time is None:
+            return None
+        try:
+            from src.core.gnss.rtklib.rtkcmn import time2gpst
+
+            _week, value = time2gpst(source_time)
+            value = float(value)
+        except (AttributeError, TypeError, ValueError, OverflowError, ImportError):
             return None
         return value if np.isfinite(value) and 0.0 <= value < 604800.0 else None
 
@@ -1205,6 +1311,16 @@ class TcIntegration:
         saved_P = nav.P.copy()
         saved_fix = nav.fix.copy() if hasattr(nav, 'fix') else None
         saved_lock = nav.lock.copy() if hasattr(nav, 'lock') else None
+        # The following values are source-time provenance only.  They are
+        # populated from the GNSS/solution objects below and are never used by
+        # initialization itself.
+        provenance_enabled = self._initialization_input_trace_sink is not None
+        gnss_measurement_epoch_sow = (
+            self._explicit_gnss_sow(obsr) if provenance_enabled else None
+        )
+        gnss_source_epoch_sow = gnss_measurement_epoch_sow
+        spp_epoch_sow = None
+        relpos_epoch_sow = None
 
         # SPP 粗定位 (GPS-only 避免 BDS/GAL 时间系统偏差导致发散)
         try:
@@ -1216,6 +1332,8 @@ class TcIntegration:
             if np.any(nav.rb):
                 nav.x[0:3] = nav.rb
             sol, x_spp = estpos(obsr, nav, rs[:, :3], dts, svh_gps)
+            if provenance_enabled:
+                spp_epoch_sow = self._explicit_solution_sow(sol)
             if not sol.stat:
                 self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
                 return
@@ -1239,6 +1357,8 @@ class TcIntegration:
                 rtk_sol = Sol()
                 rtk_sol.t = obsr.t
                 relpos(nav, obsr, obsb, rtk_sol)
+                if provenance_enabled:
+                    relpos_epoch_sow = self._explicit_solution_sow(rtk_sol)
                 if rtk_sol.stat != SOLQ_NONE:
                     rtk_rr = rtk_sol.rr[:3].copy()
                     # 仅 RTK 保留 SPP 一致性检验以拦截载波 false fix。RTD
@@ -1296,6 +1416,8 @@ class TcIntegration:
         velocity_diff_end_sow = (
             last_entry[2] if len(last_entry) > 2 else None
         )
+        cache_sample_start_sow = velocity_diff_start_sow
+        cache_sample_end_sow = velocity_diff_end_sow
         span = t_last - t_first
         if span < 5.0:
             return  # 不足 5 秒, 继续累积
@@ -1382,6 +1504,20 @@ class TcIntegration:
                 velocity_diff_end_position_ecef=pos_last,
                 velocity_diff_start_sow=velocity_diff_start_sow,
                 velocity_diff_end_sow=velocity_diff_end_sow,
+                gnss_measurement_epoch_sow=gnss_measurement_epoch_sow,
+                gnss_source_epoch_sow=gnss_source_epoch_sow,
+                spp_epoch_sow=spp_epoch_sow,
+                relpos_epoch_sow=relpos_epoch_sow,
+                cache_sample_start_sow=cache_sample_start_sow,
+                cache_sample_end_sow=cache_sample_end_sow,
+                state_epoch_sow=gnss_measurement_epoch_sow,
+                # No navigation output has been published at the handoff
+                # row; the first real output is annotated by _emit_output's
+                # propagation record instead of being fabricated here.
+                published_event_epoch_sow=None,
+                position_frame_id="ECEF",
+                velocity_frame_id="ECEF",
+                attitude_frame_id="NED",
                 initialization_gnss_week=self._explicit_gnss_week(obsr),
                 initialization_gnss_sow=self._explicit_gnss_sow(obsr),
                 raw_imu_prev=raw_imu_prev,
