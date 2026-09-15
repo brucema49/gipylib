@@ -408,8 +408,17 @@ def simplify_rinex(input_path: str, output_path: str, max_freqs: int = 2,
     return str(out_path)
 
 
-def needs_simplification(input_path: str, max_freqs: int = 2) -> bool:
-    """检查 RINEX 文件是否需要简化（任一系统频点数 > max_freqs 或信号未按交织顺序）。"""
+def needs_simplification(
+    input_path: str,
+    max_freqs: int = 2,
+    raw_band_priority: Optional[Dict[str, List[int]]] = None,
+) -> bool:
+    """检查 RINEX 文件是否需要简化。
+
+    任一系统满足以下条件即需要简化：频点数 > max_freqs、信号未按交织顺序、
+    或声明频点超出 ``raw_band_priority`` 优先集（此时解码器槽位映射不含该
+    band，保留原文件会触发 ``unsupported_raw_band`` 硬报错而非被静默剔除）。
+    """
     in_path = Path(input_path)
     if not in_path.exists():
         return False
@@ -432,6 +441,16 @@ def needs_simplification(input_path: str, max_freqs: int = 2) -> bool:
                     freqs.add(fb)
             if len(freqs) > max_freqs:
                 return True
+            # 检查声明频点是否都在该系统的原始 band 优先集内。信号代码的
+            # 第二个字符就是 RINEX raw band 数字（如 C1C→1, C5X→5）。
+            allowed = (raw_band_priority or {}).get(line[0])
+            if allowed is not None:
+                declared = {
+                    int(s[1]) for s in sigs
+                    if len(s) >= 2 and s[1].isdigit()
+                }
+                if declared - set(allowed):
+                    return True
             # 检查是否已按交织顺序（同频点信号连续）
             last_freq = -1
             for s in sigs:

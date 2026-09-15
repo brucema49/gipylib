@@ -61,7 +61,9 @@ class TcGnssSensor(Thread):
 
     def _prepare_rinex(self, path: str) -> str:
         """如需简化则生成临时简化文件，返回可用路径。"""
-        if not needs_simplification(path):
+        if not needs_simplification(
+            path, raw_band_priority=self.resolved_raw_band_priority
+        ):
             return path
         suffix = Path(path).suffix
         tmp = tempfile.NamedTemporaryFile(
