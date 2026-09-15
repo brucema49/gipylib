@@ -1,6 +1,6 @@
 # IMU 机械编排方案
 
-> **当前状态索引（2026-08-29）**：当前调用方统一使用 `src/core/ins/interpolator.py::imu_interpolate_linear`；`imu_interpolate` 最近邻函数只保留兼容历史接口。`ImuSensor` 已支持 RFU→FRD，Data19/手机的额外时间偏移通过 `TcStream.feed_imu` 边界配置。旧 `OdometryStrategy`/双滤波章节仅作历史背景，详见 [项目当前状态](项目当前状态.md)。
+> **当前状态索引（2026-09-15）**：当前调用方统一使用 `src/core/ins/interpolator.py::imu_interpolate_linear`；`imu_interpolate` 最近邻函数只保留兼容历史接口。`ImuSensor` 已支持 RFU→FRD，Data19/手机的额外时间偏移通过 `TcStream.feed_imu` 边界配置。旧 `OdometryStrategy`/双滤波章节仅作历史背景，详见 [项目当前状态](项目当前状态.md)。
 
 > 实现 INS 机械编排和初始化，支持增量式和速率式两种 IMU 数据格式，
 > 以及 IMU/GNSS 时间对齐插值。

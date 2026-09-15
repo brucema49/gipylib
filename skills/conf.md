@@ -1,6 +1,6 @@
 # 配置文件说明
 
-> **当前状态索引（2026-08-29）**：配置说明需同时区分相位 `maxinno` 与伪距 `maxcode`；TC 可用 `pos_psd=0`，LC 不能直接照搬。当前 RTK 浮点基线为 `prnbias=0.03`，输出支持 `stat_level`/`trace_enabled`，Data19 可使用 `ins.imu_time_offset_s`。详见 [项目当前状态](项目当前状态.md)。
+> **当前状态索引（2026-09-15）**：配置说明需同时区分相位 `maxinno` 与伪距 `maxcode`；**INS 参数已拆 `ins`/`ins_tc`/`ins_lc` 三段，`pos_psd`/`vel_psd` 为 LC-only 机制禁止用于 TC**。当前 RTK 浮点基线为 `prnbias=0.03`，输出支持 `stat_level`/`trace_enabled`，Data19 可使用 `ins.imu_time_offset_s`。详见 [项目当前状态](项目当前状态.md) 第 4.4 节。
 
 > 定义 GInsStream 统一定位解算配置文件的格式、字段与默认值。
 > 配置文件采用 YAML 格式，存放于 `data/config.yaml`（参考配置：`data/spp-ins-lc.yaml`、`data/rtdtc.yaml`、`phone/rtdtc.yaml`、`data/ignav-rtktc.conf`）。

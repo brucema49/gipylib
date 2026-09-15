@@ -1,6 +1,6 @@
 # 配置参数详细说明
 
-> **当前状态索引（2026-08-29）**：本文参数表以当前代码为准；特别注意 `maxinno=5`（相位）与 `maxcode=30`（伪距）的语义分离、TC/LC 的 `pos_psd` 边界、`vel_var_floor`、`imu_time_offset_s` 和 stat/trace 输出配置。详见 [项目当前状态](项目当前状态.md)。
+> **当前状态索引（2026-09-15）**：本文参数表以当前代码为准；特别注意 `maxinno=5`（相位）与 `maxcode=30`（伪距）的语义分离、**INS 三段 schema（`ins`/`ins_tc`/`ins_lc`）与 `pos_psd`/`vel_psd` 的 LC-only 归属**、`vel_var_floor`、`imu_time_offset_s` 和 stat/trace 输出配置。详见 [项目当前状态](项目当前状态.md) 第 4.4 节。
 
 > 本文档详细解释 `data/config.yaml` 中所有配置参数的含义、单位、默认值、取值范围与参考来源。
 > 配置文件采用**行内注释**风格（注释在参数右侧），本文档提供完整说明。
@@ -199,6 +199,24 @@ GPST 必须同时做 `week+1356` 和 `toc/toe/tot+14 s`。GPS+BDS SPP/TC 还依�
 
 INS 配置部分参考 ignav 的 `configure.ini` 和 `tools/KF-GINS/config/kf-gins.yaml`。
 
+### 2.0 INS 配置三段结构（ins / ins_tc / ins_lc）
+
+2026-09-15 起 INS 参数按是否需要区分松紧组合拆成三段，加载器（`config_loader._merge_mode_specific_ins`）在读取 `ins.enabled` 后、任何消费方读值前把对应段合并进 `cfg["ins"]`，业务代码只看到合并后的 `ins` 段：
+
+| 段 | 含义 | 生效条件 |
+|---|---|---|
+| `ins` | 松紧组合**共用**参数（usually） | 始终 |
+| `ins_tc` | **紧组合专属**（或需覆盖共用值的 TC 版本） | `ins.enabled='tc'` |
+| `ins_lc` | **松组合专属**（或需覆盖共用值的 LC 版本） | `ins.enabled='lc'` |
+
+- `ins.enabled='off'` 时 `ins_tc`/`ins_lc` 都不合并；未激活的段允许保留作对照。
+- **LC-only 专属键**（写在 `ins`/`ins_tc` 且 `tc` 模式报错）：`pos_psd`、`vel_psd`、`gnss_vel_std`、`gnss_sd_scale`、`gnss_sd_axis_scale`、`gnss_time_sync_noise_s`、`use_reported_gnss_sd`、`vertical_sigma_factor`、`pos_diff_vel_std`、`position_diff_velocity_update`、`innov_reject_threshold`、`innov_reject_warmup`。
+- **TC-only 专属键**：`tc_use_doppler`。
+- **共用参数**：`nhc_warmup`（LC/TC 都消费，应写在 `ins` 段）。
+- **废弃死键**（任何 ins 段出现即报错）：`rtk_float_pos_std`、`pos_diff_vel_max_std`。
+
+> 完整键归属与跨模式校验规则见 [项目当前状态](项目当前状态.md) 第 4.4 节与 `man/manual.md` 第 3.0 节。
+
 ### 2.1 主开关与 Reboot
 
 | 参数 | 类型 | 默认值 | 单位 | 取值范围 | 说明 |
@@ -213,10 +231,11 @@ INS 配置部分参考 ignav 的 `configure.ini` 和 `tools/KF-GINS/config/kf-gi
 | `reboot_use_prior_state` | bool | `false` | — | true/false | reboot 后重新初始化时是否使用前一次状态作为先验 |
 
 **校验规则**：
-- `enabled` 必填，必须为 `off` / `on` / `tc`（`coupling_mode` 字段已废弃，存在则报错）
+- `enabled` 必填，必须为 `off` / `lc` / `tc`（`coupling_mode` 字段已废弃，存在则报错）
 - `enabled=off` 时 `gnss_source` 必须为 `internal`（纯 GNSS 模式不支持外部结果输入）
-- `external` 模式下 `enabled` 必须为 `on`
-- `internal` + `enabled=on/tc` 模式下 `imu_data_path` 必填
+- `external` 模式下 `enabled` 必须为 `lc`
+- `internal` + `enabled=lc/tc` 模式下 `imu_data_path` 必填
+- INS 三段合并与跨模式校验：按 `ins.enabled` 合并 `ins_tc`（仅 `tc`）/`ins_lc`（仅 `lc`）；`ins_tc`/`ins_lc` 不得写 `enabled`；任一 ins 段出现 `rtk_float_pos_std`/`pos_diff_vel_max_std` 死键报错；TC 模式下共用 `ins` 段不得出现 `pos_psd`/`vel_psd`（LC-only），LC 模式不得出现 `tc_use_doppler`（见 [项目当前状态](项目当前状态.md) 第 4.4 节）
 
 **Reboot 机制**（详见 [初始化.md 第 13.6 节](file:///home/mxl/workplace/gipylib/skills/初始化.md#136-reboot-识别与重新初始化)）：
 - `Aligner` 负责检测数据流层面的 reboot 信号（GNSS 中断、IMU 中断、时间戳跳变）
@@ -354,14 +373,16 @@ INS 配置部分参考 ignav 的 `configure.ini` 和 `tools/KF-GINS/config/kf-gi
 | `accel_psd` | double | `1.0e-2` | m²s⁻³ | >0 | 加计过程噪声 PSD（调谐值）。传感器级为 2.6e-6 |
 | `gyro_bias_psd` | double | `1.0e-10` | rad²s⁻³ | >0 | 陀螺零偏随机游走 PSD（调谐值） |
 | `acce_bias_psd` | double | `1.0e-4` | m²s⁻⁵ | >0 | 加计零偏随机游走 PSD（调谐值） |
-| `pos_psd` | double | `5.0e-3` | m²/s | ≥0 | **位置随机游走 PSD（LC EKF 必需项）**。使 P_pos 1s 内增长 ~0.005，配合 R=0.0025(sigma=0.05) 使 K≈0.8。无 pos_psd 时 P_pos 在量测更新后趋近 0，K→0，滤波器锁死无法跟踪 GNSS |
+| `pos_psd` | double | `5.0e-3` | m²/s | ≥0 | **位置随机游走 PSD（LC-only，见 2.0 节三段 schema）**。写在 `ins_lc` 段生效；TC 从机制禁止（`INS_LC_ONLY_KEYS`）。使 P_pos 1s 内增长 ~0.005，配合 R 使 K≈0.8；无 pos_psd 时 LC 的 P_pos 在量测更新后趋近 0，K→0，滤波器锁死 |
 
-> **注意**：`pos_psd` 是 LC EKF 必需项。`TransferMatrix` 通过 `ins_cfg.get("pos_psd", 0.0)` 读取（标量），Q 矩阵使用 `pos_psd * dt`。旧版 `position_random_walk`（数组）已废弃，不再使用。
+> **注意**：`pos_psd` 是 LC 必需项，`TransferMatrix` 通过 `ins_cfg.get("pos_psd", 0.0)` 读取（标量），Q 矩阵使用 `pos_psd * dt`。**TC 不得包含此键** —— `ins.enabled='tc'` 时写在共用 `ins` 段会直接报错；历史 `pos_psd=1e-8` 注入量已移入休眠的 `ins_lc` 段，对 TC 输出逐位无影响（量级远低于速度积分传播）。旧版 `position_random_walk`（数组）已废弃。
 
-> **TC/LC 边界**：TC 中 `pos_psd=0` 已通过 RTK-TC 验证；LC 不能直接清零，否则位置量测后 `P_pos` 坍缩，可能导致滤波锁死和速度尖峰。`vel_psd`、`vel_var_floor` 也必须按模式和数据集分别验证，不能从 TC 基线直接推广到 LC。
+> **TC/LC 边界**：TC 不得注入 `pos_psd`，其位置不确定度由 IMU 传播与观测 H/R 决定；LC 不能照搬 TC 的零 `pos_psd`，否则 P_pos 坍缩导致滤波锁死和速度尖峰。`vel_psd`、`vel_var_floor` 也必须按模式和数据集分别验证，不能从 TC 基线直接推广到 LC。
 
-| `vel_psd` | double | 依模式 | m²/s³ | ≥0 | 速度随机游走 PSD；TC MECH-16 使用 0 并以 `vel_var_floor` 保持运行点，LC 参考配置使用非零值 |
-| `vel_var_floor` | double | `0.0` | (m/s)² | ≥0 | TC 可选的 `P_vel` 运行点下限；低于已验证边界可能造成量测响应不足，默认关闭 |
+| `vel_psd` | double | 依模式 | m²/s³ | ≥0 | 速度随机游走 PSD（**LC-only**，机制禁止 TC）；写在 `ins_lc` 段生效，LC 参考配置使用非零值 |
+| `vel_var_floor` | double | `0.0` | (m/s)² | ≥0 | `P_vel` 运行点下限（TC 用）；低于已验证边界可能造成量测响应不足，默认关闭 |
+
+> **废弃死键**：`rtk_float_pos_std`、`pos_diff_vel_max_std` 在仓库内无任何消费点，出现在任何 ins 段都会报错（见 `config_loader.DEPRECATED_INS_KEYS`）。
 
 #### 2.7.3 初始不确定度（SI 单位，从 cpt-rtktc_gps.conf 提取）
 

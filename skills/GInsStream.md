@@ -1,6 +1,6 @@
 # GInsStream 整体代码框架
 
-> **当前状态索引（2026-08-29）**：当前架构是队列驱动的流式 Python 管线 + 单滤波 EKF，实际代码位于 `src/core/ins/`、`src/core/tc/`、`src/core/gnss/` 和 `src/stream/`。本文中“双滤波”、旧 `core/imu`/`core/estimator` 路径和旧策略层均为历史设计；最新实现和已验证结果以 [项目当前状态](项目当前状态.md) 为准。
+> **当前状态索引（2026-09-15）**：当前架构是队列驱动的流式 Python 管线 + 单滤波 EKF，实际代码位于 `src/core/ins/`、`src/core/tc/`、`src/core/gnss/` 和 `src/stream/`。本文中“双滤波”、旧 `core/imu`/`core/estimator` 路径和旧策略层均为历史设计；最新实现和已验证结果以 [项目当前状态](项目当前状态.md) 为准。
 
 > GNSS/INS 松/紧组合流式导航项目，基于纯 threading + 队列流水线流式读取架构，实现 SPP+RTK/NHC/ZUPT 松组合融合导航。
 > 矩阵运算使用 numpy，框架参考 GINav、GREAT-MSF。

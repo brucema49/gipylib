@@ -19,6 +19,56 @@ SUPPORTED_MEASUREMENT_TRACE_FORMATS = {"jsonl", "csv"}
 SUPPORTED_INIT_PROPAGATION_TRACE_FORMATS = {"jsonl", "csv"}
 SUPPORTED_INITIALIZATION_INPUT_TRACE_FORMATS = {"jsonl", "csv"}
 
+# --- 松紧组合差异参数 -------------------------------------------------------
+# ``ins`` 段保存松紧组合**共用**的参数 (usually); ``ins_tc`` / ``ins_lc`` 只写
+#   该模式专属、或需要覆盖共用值的参数。加载时按 ``ins.enabled`` 把对应段合并进
+#   ``cfg["ins"]``, 未激活的段不生效 (允许同一文件同时描述两种模式)。
+#
+# 语义区分的依据是"是否存在独立 GNSS PVT 观测行":
+#   松组合 (LC) 有独立的位置/速度观测, 因此可以 (也必须) 配置观测噪声、
+#   位置差分速度、以及为稳定 P 而额外注入的 pos_psd/vel_psd;
+#   紧组合 (TC) 只有 DD 伪距/相位观测, 位置与速度不确定度必须完全由
+#   Q(IMU 噪声) 与 H/R 传播得到, 额外注入 pos_psd/vel_psd 会破坏与 GREAT
+#   的等价性 (见 issue/9-14机械编排发散.md P5)。
+INS_MODE_SECTIONS = {"lc": "ins_lc", "tc": "ins_tc"}
+
+# 仅松组合: 依赖独立 GNSS PVT(位置/速度)观测, 紧组合没有这类观测行。
+INS_LC_ONLY_KEYS = frozenset({
+    # 额外的位置/速度随机游走 (LC 稳定项; TC 必须保持 0, 故直接禁止出现)
+    "pos_psd",
+    "vel_psd",
+    # GNSS PVT 观测噪声与缩放
+    "gnss_vel_std",
+    "gnss_sd_scale",
+    "gnss_sd_axis_scale",
+    "gnss_time_sync_noise_s",
+    "use_reported_gnss_sd",
+    "vertical_sigma_factor",
+    # 位置差分速度观测
+    "pos_diff_vel_std",
+    "position_diff_velocity_update",
+    # 位置创新拒绝 (LC 观测级粗差剔除, lc_estimator.py:81-82)
+    "innov_reject_threshold",
+    "innov_reject_warmup",
+})
+
+# 已废弃的死键: 仓库内无任何消费点 (历史上属于 LC 语义)。出现即报错,
+# 避免误以为仍在生效; 消费它们的代码如恢复, 应同时从本清单移除。
+DEPRECATED_INS_KEYS = frozenset({
+    "rtk_float_pos_std",      # 原意: RTK FLOAT 位置 sigma 下限; 无消费点
+    "pos_diff_vel_max_std",   # 原意: 直接速度超阈改用位置差分; 无消费点
+})
+
+# 仅紧组合
+INS_TC_ONLY_KEYS = frozenset({
+    "tc_use_doppler",       # 紧组合 Doppler 观测开关 (LC 无此观测)
+})
+
+# 共用参数的归属修正记录 (供 manual.md 与配置注释引用):
+#   nhc_warmup 同时被 lc_integration.py:108 与 tc_integration.py:143 消费,
+#   属于共用参数, 不在本清单; 放在 ins_lc/ins_tc 段的 nhc_warmup 只在对应
+#   模式生效, 需要两种模式共用时必须写在共用 ins 段。
+
 _WGS84_A = 6378137.0
 _WGS84_F = 1 / 298.257223563
 _WGS84_B = _WGS84_A * (1 - _WGS84_F)
@@ -180,6 +230,76 @@ def _validate_initialization_input_trace(tc_cfg: dict) -> None:
     trace_cfg["filename"] = filename
 
 
+def _merge_mode_specific_ins(cfg: dict, ins_enabled: str) -> None:
+    """把 ``ins_tc`` / ``ins_lc`` 合并进 ``cfg["ins"]`` 并做跨模式校验。
+
+    三段语义:
+
+    - ``ins``    : 松紧组合**共用**参数 (usually)。
+    - ``ins_tc`` : 仅 ``ins.enabled='tc'`` 生效 (专属项或覆盖共用值)。
+    - ``ins_lc`` : 仅 ``ins.enabled='lc'`` 生效。
+
+    ``ins.enabled='off'`` 时两段都不生效。
+
+    Raises:
+        ValueError: 段不是 mapping；段内写了 ``enabled``；段内出现了另一个
+            模式的专属键；共用段出现了当前模式禁止的键；或任何 ins 段出现
+            废弃死键。
+    """
+
+    if not isinstance(cfg.get("ins", {}), dict):
+        raise ValueError("ins must be a mapping")
+    active_section = INS_MODE_SECTIONS.get(ins_enabled)
+    forbidden_in_common = {
+        "lc": INS_TC_ONLY_KEYS,
+        "tc": INS_LC_ONLY_KEYS,
+    }.get(ins_enabled, frozenset())
+
+    sections_to_check = [("ins", cfg["ins"])] + [
+        (section, cfg[section])
+        for section in INS_MODE_SECTIONS.values()
+        if isinstance(cfg.get(section), dict)
+    ]
+    for name, block in sections_to_check:
+        dead = sorted(DEPRECATED_INS_KEYS.intersection(block))
+        if dead:
+            raise ValueError(
+                f"{name} contains deprecated keys with no consumer in the "
+                f"codebase: {', '.join(dead)} (see DEPRECATED_INS_KEYS)"
+            )
+
+    for mode, section in INS_MODE_SECTIONS.items():
+        block = cfg.get(section)
+        if block is None:
+            continue
+        if not isinstance(block, dict):
+            raise ValueError(f"{section} must be a mapping")
+        if "enabled" in block:
+            raise ValueError(
+                f"{section}.enabled is not allowed; ins.enabled selects the mode"
+            )
+        # 专属段内部也不允许混入另一个模式的参数, 便于提前发现误用。
+        wrong = (INS_LC_ONLY_KEYS if mode == "tc" else INS_TC_ONLY_KEYS)
+        stray = sorted(wrong.intersection(block))
+        if stray:
+            raise ValueError(
+                f"{section} may not contain "
+                f"{'loose-coupling' if mode == 'tc' else 'tight-coupling'}"
+                f"-only keys: {', '.join(stray)}"
+            )
+        if section == active_section:
+            cfg["ins"].update(block)
+
+    if forbidden_in_common:
+        stray = sorted(forbidden_in_common.intersection(cfg["ins"]))
+        if stray:
+            other = "紧组合" if ins_enabled == "lc" else "松组合"
+            raise ValueError(
+                f"ins.enabled='{ins_enabled}': 以下参数只适用于{other}, "
+                f"不能出现在共用 ins 段: {', '.join(stray)}"
+            )
+
+
 def load_config(path) -> dict:
     """加载 YAML 配置并做必要校验。
 
@@ -211,6 +331,10 @@ def load_config(path) -> dict:
             f"ins.enabled must be one of {SUPPORTED_INS_ENABLED}, "
             f"got '{ins_enabled}'"
         )
+
+    # 按 ins.enabled 合并模式专属段, 并禁止跨模式误用参数。必须在任何
+    # ins_cfg.get(...) 之前执行, 否则消费方会读到未合并的共用值。
+    _merge_mode_specific_ins(cfg, ins_enabled)
 
     # gnss_source 校验
     gnss_source = cfg["gnss"]["gnss_source"]
