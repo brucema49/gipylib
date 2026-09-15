@@ -351,6 +351,19 @@ def load_config(path) -> dict:
     from src.stream.gnss_band_mapping import resolve_raw_band_priority
     resolve_raw_band_priority(cfg.get("gnss", {}))
 
+    # 卫星剔除: remove_sat 为规范键（用户面向），excsats 为遗留别名，
+    # 两者可共存（合并剔除），消费点在 rtklib_config_adapter.build_params。
+    for key in ("remove_sat", "excsats"):
+        value = cfg["gnss"].get(key)
+        if value is None:
+            continue
+        if (not isinstance(value, list)
+                or not all(isinstance(item, str) for item in value)):
+            raise ValueError(
+                f"gnss.{key} must be a list of satellite id strings "
+                f"(e.g. [\"C01\"]), got {value!r}"
+            )
+
     # 纯 GNSS 模式 (ins.enabled=off) 必须 internal, 不接受外部结果
     if ins_enabled == "off" and gnss_source != "internal":
         raise ValueError(

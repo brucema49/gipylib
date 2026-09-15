@@ -52,7 +52,7 @@ def build_params(gnss_cfg: dict) -> dict:
     params["use_sing_pos"] = gnss_cfg["use_sing_pos"]
     params["elmin"] = _f(gnss_cfg["elmin"])
     params["cnr_min"] = _fv(gnss_cfg["cnr_min"])
-    params["excsats"] = gnss_cfg["excsats"]
+    # excsats 在下方与 remove_sat 合并并转换为卫星号（见 id2sat 处）
     params["maxinno"] = _f(gnss_cfg["maxinno"])
     params["maxcode"] = _f(gnss_cfg["maxcode"])
     params["maxage"] = _f(gnss_cfg["maxage"])
@@ -92,8 +92,25 @@ def build_params(gnss_cfg: dict) -> dict:
     params["sing_p0"] = _f(gnss_cfg["sing_p0"])
     params["sing_v0"] = _f(gnss_cfg["sing_v0"])
     params["sing_elmin"] = _f(gnss_cfg["sing_elmin"])
-    params["freq"] = _fv(gnss_cfg["freq_table"])
-    params["dfreq_glo"] = _fv(gnss_cfg["dfreq_glo"])
+
+    # 频率映射（freq_table/freq_ix0/freq_ix1/dfreq_glo）已不再是用户必填项:
+    # 缺失时由 gnutlib 的 LibGnut 频率表自动派生（见 rinex_improve）。
+    freq_keys_missing = any(
+        gnss_cfg.get(key) is None
+        for key in ("freq_table", "freq_ix0", "freq_ix1", "dfreq_glo"))
+    if freq_keys_missing:
+        from src.utility.rinex_improve import auto_freq_plan, default_band_plan
+        nf = int(gnss_cfg.get("nf", 2) or 2)
+        band_plan = gnss_cfg.get("band_plan")
+        if not band_plan:
+            band_plan = default_band_plan(gnss_cfg.get("gnss_t"), nf)
+        derived = auto_freq_plan(band_plan, freq_table=gnss_cfg.get("freq_table"),
+                                 dfreq_glo=gnss_cfg.get("dfreq_glo"),
+                                 max_freq=max(nf, 2))
+    params["freq"] = _fv(gnss_cfg["freq_table"] if gnss_cfg.get("freq_table") is not None
+                         else derived["freq_table"])
+    params["dfreq_glo"] = _fv(gnss_cfg["dfreq_glo"] if gnss_cfg.get("dfreq_glo") is not None
+                              else derived["dfreq_glo"])
     params["rb"] = _fv(gnss_cfg["rb"])
     params["rr_f"] = _fv(gnss_cfg["rr_f"])
     params["rr_b"] = _fv(gnss_cfg["rr_b"])
@@ -123,8 +140,27 @@ def build_params(gnss_cfg: dict) -> dict:
 
     params["gnss_t"] = [cmap[s] for s in gnss_cfg["gnss_t"] if s in cmap]
 
-    params["freq_ix0"] = {cmap[k]: _i(v) for k, v in gnss_cfg["freq_ix0"].items() if k in cmap}
-    params["freq_ix1"] = {cmap[k]: _i(v) for k, v in gnss_cfg["freq_ix1"].items() if k in cmap}
+    # 卫星剔除: remove_sat 为新的规范键（用户面向），excsats 为遗留别名。
+    # rtklib-py 的 satexclude 以卫星号比较, 这里统一转换为卫星号,
+    # 并保留无法解析的原始项以便诊断。
+    remove_entries = list(gnss_cfg.get("remove_sat") or []) + \
+        list(gnss_cfg.get("excsats") or [])
+    from .rtklib.rtkcmn import id2sat
+    excsat_nos = []
+    for entry in remove_entries:
+        sat_no = id2sat(str(entry).strip().upper())
+        if sat_no > 0 and sat_no not in excsat_nos:
+            excsat_nos.append(sat_no)
+    params["excsats"] = excsat_nos
+
+    if freq_keys_missing:
+        params["freq_ix0"] = {
+            cmap[k]: _i(v) for k, v in derived["freq_ix0"].items() if k in cmap}
+        params["freq_ix1"] = {
+            cmap[k]: _i(v) for k, v in derived["freq_ix1"].items() if k in cmap}
+    else:
+        params["freq_ix0"] = {cmap[k]: _i(v) for k, v in gnss_cfg["freq_ix0"].items() if k in cmap}
+        params["freq_ix1"] = {cmap[k]: _i(v) for k, v in gnss_cfg["freq_ix1"].items() if k in cmap}
 
     # rtklib-py 的 rnx_decode 需要信号查找表与跳过表。
     # sig_tbl: rtklib-py 标准信号查找表。

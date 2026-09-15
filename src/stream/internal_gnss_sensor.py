@@ -11,11 +11,12 @@ from threading import Thread
 from src.core.thread_control import ThreadControl
 from src.core.data_types import SensorData
 from src.core.gnss.rtklib_config_adapter import RtklibEnv
-from src.stream.gnss_band_mapping import (
-    raw_band_priority_to_simplifier_priority,
-    resolve_raw_band_priority,
+from src.stream.gnss_band_mapping import resolve_raw_band_priority
+from src.utility.rinex_improve import (
+    improve_rinex,
+    needs_improvement,
+    resolve_stream_plan,
 )
-from src.utility.rinex_simplifier import needs_simplification, simplify_rinex
 
 
 class InternalGnssSensor(Thread):
@@ -31,11 +32,12 @@ class InternalGnssSensor(Thread):
         self.gnss_cfg = config["gnss"]
         self.output_queue = output_queue
         self.control = control
-        self._temp_files = []  # 临时简化文件，待清理
-        # Keep raw RINEX bands separate from solver-facing freq_ix values.
-        # Resolve at the real sensor entry so invalid configuration fails
-        # before a decoder thread can consume it.
-        self.resolved_raw_band_priority = resolve_raw_band_priority(self.gnss_cfg)
+        self._temp_files = []  # 临时改写文件，待清理
+        # 显式 raw_band_priority 仍被接受（高级出口）；未配置时为 None，
+        # 由 _run_impl 内的 resolve_stream_plan 按 RINEX 头自动规划。
+        # 这里提前解析一次，使非法的显式配置在线程启动前即报错。
+        self.resolved_raw_band_priority = (
+            resolve_raw_band_priority(self.gnss_cfg) or None)
         # GREAT RAW_MIX-compatible tracking-attribute order.  Keys are raw
         # RINEX band digits, deliberately separate from legacy ``freq_ix``.
         self.raw_signal_priority = self.gnss_cfg.get("raw_signal_priority", {})
@@ -44,7 +46,7 @@ class InternalGnssSensor(Thread):
         try:
             self._run_impl()
         finally:
-            # 清理临时简化文件
+            # 清理临时改写文件
             for p in self._temp_files:
                 try:
                     Path(p).unlink(missing_ok=True)
@@ -52,37 +54,47 @@ class InternalGnssSensor(Thread):
                     pass
             self.output_queue.put(None)  # EOF sentinel
 
-    def _build_freq_priority(self) -> dict:
-        """Return the legacy simplifier-rank adapter for resolved raw bands."""
-        return raw_band_priority_to_simplifier_priority(
-            self.resolved_raw_band_priority
-        )
-
     def _prepare_rinex(self, path: str) -> str:
-        """如需简化则生成临时简化文件，返回可用路径。"""
-        if not needs_simplification(path):
+        """如需改写（LibGnut 频带归一化/频点选择）则生成临时文件。"""
+        if not needs_improvement(
+            path,
+            band_plan=self.resolved_raw_band_priority,
+            gnss_t=self.gnss_cfg.get("gnss_t"),
+            raw_signal_priority=self.raw_signal_priority or None,
+            max_freqs=max(int(self.gnss_cfg.get("nf", 2) or 2), 2),
+        ):
             return path
         suffix = Path(path).suffix
         tmp = tempfile.NamedTemporaryFile(
             mode="w", suffix=suffix, delete=False, encoding="utf-8"
         )
         tmp.close()
-        simplify_rinex(
+        improve_rinex(
             path,
             tmp.name,
-            raw_band_priority=self.resolved_raw_band_priority,
-            raw_signal_priority=self.raw_signal_priority,
+            band_plan=self.resolved_raw_band_priority,
+            gnss_t=self.gnss_cfg.get("gnss_t"),
+            raw_signal_priority=self.raw_signal_priority or None,
+            max_freqs=max(int(self.gnss_cfg.get("nf", 2) or 2), 2),
         )
         self._temp_files.append(tmp.name)
         return tmp.name
 
     def _run_impl(self):
-        # 1. 初始化 rtklib 环境 + nav
-        env = RtklibEnv(self.gnss_cfg)
+        # 1. 解析流级信号方案（显式映射优先，否则按 RINEX 头自动规划），
+        #    并补齐缺失的频率映射键
+        cfg, self.resolved_raw_band_priority = resolve_stream_plan(
+            self.gnss_cfg,
+            self.gnss_cfg.get("rover_path"),
+            self.gnss_cfg.get("base_path"),
+        )
+
+        # 2. 初始化 rtklib 环境 + nav
+        env = RtklibEnv(cfg)
         env.setup()
         nav = env.init_nav()
 
-        # 2. 准备 RINEX 文件（必要时简化）
+        # 3. 准备 RINEX 文件（必要时改写）
         rover_path = self._prepare_rinex(self.gnss_cfg["rover_path"])
 
         # 3. 加载流动站观测值 + 星历

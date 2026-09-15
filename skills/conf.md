@@ -144,7 +144,7 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 |------|------|--------|------|------|---------------|
 | `elmin` | float | `15.0` | deg | 最小仰角（浮点解） | `elmin` |
 | `cnr_min` | [float, float] | `[28, 20]` | dB-Hz | 最小信噪比 [freq1, freq2] | `cnr_min` |
-| `excsats` | list | `[]` | — | 排除卫星列表（如 `["G01", "G23"]`） | `excsats` |
+| `remove_sat` | list | `[]` | — | 剔除卫星列表（如 `["C01"]`）；内部转换为卫星号后交给 `satexclude`。遗留别名 `excsats` 仍被接受并与之合并 | `excsats` |
 
 ### 3.4 周跳与粗差检测
 
@@ -203,15 +203,17 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 
 ### 3.8 星座与信号配置
 
+信号映射默认由 `src/utility/rinex_improve.py` + `src/utility/gnutlib/`
+（LibGnut 移植）按文件头自动规划；**真实数据与 LibGnut 库级默认冲突时，用
+`raw_band_priority` 手动固定频点**（数据自检无法替代人工判断，见 3.8.2）：
+
 | 字段 | 类型 | 默认值 | 说明 | rtklib-py 对应 |
 |------|------|--------|------|---------------|
 | `gnss_t` | list | `["GPS", "GLO", "GAL"]` | 启用星座列表；北斗显式写 `BDS` | `gnss_t` |
-| `freq_ix0` | dict | `{GPS: 0, GLO: 4, GAL: 0, BDS: 0}` | 第一频率的 **freq_table 索引**（非 RINEX band）。BDS 走 GREAT 对齐 legacy 表：`0`→B1I(C2I)、`6`→B3I(C6I)，见 3.8.1 | `freq_ix0` |
-| `freq_ix1` | dict | `{GPS: 2, GLO: 5, GAL: 2, BDS: 3}` | 第二频率的 freq_table 索引；BDS `3`→B2b/B2I(C7x) | `freq_ix1` |
-| `raw_band_priority` | dict | 无（走 3.8.1 默认） | **原始 RINEX band 优先级**，键为星座名/GPS 别名，值为 raw band 数字有序表；长度必须等于 `nf`。与 `freq_ix` 正交，显式声明时优先于 legacy 解析 | — |
-| `raw_signal_priority` | dict | 无 | 每 (系统, band) 的观测码/载波跟踪属性优先序（GREAT RAW_MIX 风格），供简化器选择 | — |
-| `freq_table` | list | `[1.57542e9, 1.22760e9, 1.17645e9, 1.20714e9, 1.60200e9, 1.24600e9, 1.561098e9]` | 支持频率表 (Hz)，BDS B1I 不可省略 | `freq` |
-| `dfreq_glo` | [float, float] | `[0.56250e6, 0.43750e6]` | Hz | GLONASS 频率间隔 [L1, L2] | `dfreq_glo` |
+| `nf` | int | `1` | 频点数上限（每系统槽位数），与自动波段方案共同决定槽位 | `nf` |
+| `raw_band_priority` | dict | 无 | **手动频点映射（推荐显式保留）**：raw RINEX band 优先序，长度 = `nf`；声明后跳过自动规划 | — |
+| `raw_signal_priority` | dict | 无 | 同频跟踪属性（code/phase/doppler/snr）优先串覆盖（GREAT RAW_MIX 风格） | — |
+| `freq_table` / `freq_ix0` / `freq_ix1` / `dfreq_glo` | — | 自动派生 | 缺失时由 `gnutlib.gsys` 的 LibGnut 频率表（10.23 MHz 乘数、GLONASS FDMA 间隔）派生；与手写等价（按 Hz 值查表） | `freq` / `freq_ix` / `dfreq_glo` |
 
 **支持的信号类型**（sig_tbl 映射）：
 
@@ -224,88 +226,82 @@ GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，�
 | `1I` | BDS B1I（`1561.098 MHz`） |
 | `7I` | BDS B2I/B2b（`1207.14 MHz`） |
 
-北斗 RINEX 的 `C1I/L1I`、`C7I/L7I` 必须分别进入双频槽位 0/1。当前实现按
-信号频带号而非头部列位置映射，以兼容 `C,C,L,L,S,S` 类型分组。BDS 广播星历
-从 BDT 转 GPST 时同时执行 `week+1356` 和 `toc/toe/tot+14 s`；BDS GEO PRN
-`1..5`、`59+` 使用专用坐标旋转。GPS+BDS SPP 与 SPP-TC 使用 BDS 独立 ISB。
+BDS 广播星历从 BDT 转 GPST 时执行 `week+1356` 和 `toc/toe/tot+14 s`；BDS GEO
+PRN `1..5`、`59+` 使用专用坐标旋转。GPS+BDS SPP 与 SPP-TC 使用 BDS 独立 ISB。
 
-#### 3.8.1 GNSS 频率分配机制（band / freq_ix / normalized 三套编号）
+#### 3.8.1 自动信号方案（rinex_improve + gnutlib）
 
-gipylib 存在三套正交编号，混淆它们是历次 BDS 故障的共同根源
-（`issue/9-15北斗频点映射.md`）：
-
-| 编号域 | 例子 | 定义处 | 用途 |
-|---|---|---|---|
-| **raw RINEX band digit** | 观测码第二字符：`C1C`→1、`C2I`→2、`C5Q`→5、`C6I`→6、`C7I`→7 | RINEX 3 观测码本身 | 物理频点标识；`raw_band_priority` 的值域 |
-| **solver freq_ix** | `freq_table[6]` | 配置的 `freq_table`（每数据集自定义） | 解算侧频率值查找；**与 band 数字无对应关系** |
-| **normalized band** | `RAW_TO_NORMALIZED_BAND['C'][2]=1` | `src/stream/gnss_band_mapping.py` | 简化器内部频点序（第一/第二频点…） |
-
-数据流（`TcGnssSensor._run_impl`）：
+处理逻辑以 LibGnut（`GREAT-MSF/src/LibGnut`）为第一权威，输出保持 pyrinrx
+（rtklib-py）可直接解码的 RINEX 与频点槽位语义：
 
 ```
-RINEX 文件头 SYS / # / OBS TYPES（声明每系统的观测码 → raw band）
-  → needs_simplification(path, raw_band_priority)   # 声明 band 超出优先集 ⇒ 需简化
-  → simplify_rinex(raw_band_priority, raw_signal_priority)   # 剔除非优先 band、重排列
-  → rnx_decode.decode_obs                            # raw_band_to_slot 槽位映射
-       raw band ∉ 优先集 ⇒ ObservationMappingError(unsupported_raw_band) 硬报错
+RINEX 文件头 SYS / # / OBS TYPES
+  → gnutlib.parse_obs_header + fix_band          # BDS C1x→C2x(≤3.03)、C3x→C6x、C7D/P/Z→C9(P/Z)(≥3.04)
+  → plan_stream_signals(rover, base, gnss_t, nf)  # 流动站 ∩ 基站共同波段
+       · 按 LibGnut GNSS_BAND_PRIORITY（gutils/gnss.h）排序后截断到 nf
+       · band_consistency 码-相自检：用错波长时 Δ(C-λL) 显著变大 ⇒ 剔除(fail-open)
+  → auto_freq_plan                                # 波段 → gnutlib 频率值 → freq_table/freq_ix/dfreq_glo
+  → needs_improvement / improve_rinex             # 频带归一化 + 同频跟踪码选择 + C-L-D-S 交织重写
+       · 跟踪码按 LibGnut range/phase_order_attr_raw（gobsgnss.h，末位优先）
+       · code_availability 剔除稀疏跟踪码（如手机基站 GPS L1M 仅 25% 有值）
+  → rnx_decode.decode_obs                         # 自动方案作为 raw_band_to_slot
   → zdres / selsat / DD 行（RtkTcMeas / RtdTcMeas）
 ```
 
-**默认分配机制**（未写 `raw_band_priority` 时，`gnss_band_mapping.py`）：
+三套编号仍然存在（band / freq_ix / 槽位），但**全部在 `rinex_improve` 内部
+闭合**：用户只声明星座与频点数上限。
 
-1. `DEFAULT_RAW_BAND_PRIORITY`（双频优先序，**GREAT 对齐**）：
-   `G:[1,2] R:[1,2] E:[1,7] **C:[6,2]** J:[1,2]`。BDS 首选 **B3I(C6I)**——
-   GREAT campus01 单频基线实际使用的频点，其次 B1I(C2I)；B1C(band 1) 仅
-   BDS-3 且多数接收机（含手机）不提供，不进默认对。依据
-   `GREAT-MSF/src/LibGnut/gutils/gnss.cpp:78`（BDS 频带表 B1I=BAND_2、
-   B3I=BAND_6）。
-2. `LEGACY_FREQ_BAND_METADATA`（`freq_ix → raw band` 解析，BDS 亦按 GREAT
-   对齐）：`BDS: {0:2, 1:7, 2:5, 3:7, 4:6, 5:7, 6:6}`，即 freq_ix `0`→B1I、
-   `6`→B3I。`nf` 显式时每系统的 band 表长度必须等于 `nf`。
-3. 信号级频点归属 `_FREQ_ORDER`：`2I`（BDS B1I）属于第一频点族
-   （normalized 1），**不是** GPS/GAL 的 L2 族——曾因错标为 3 导致简化器
-   整段剔除 BDS 观测（issue/9-15 F3），修改任一信号归属前必须同时核对
-   `RAW_TO_NORMALIZED_BAND`。
+| 编号域 | 例子 | 定义处 | 用途 |
+|---|---|---|---|
+| **raw RINEX band digit** | 观测码第二字符：`C2I`→2、`C5Q`→5、`C6I`→6 | RINEX 3 观测码（经 `fix_band` 归一化） | 物理频点标识；自动方案的值域 |
+| **solver freq_ix** | `freq_table[6]` | `auto_freq_plan` 派生 | 解算侧频率查找；**与 band 数字无对应关系** |
+| **decoder slot** | 槽位 0/1 | `raw_band_priority_to_slot_mapping` | 按方案顺序分配，流动/基站一致 |
 
-**强制校验**（`config_loader` / `gnss_band_mapping`，违反即 `ValueError`）：
-未知系统或 band 不在 `RAW_BAND_DOMAIN`、band 重复、`raw_band_priority`
-长度 ≠ `nf`、`freq_ix` 无 metadata 可解析、increment 输入禁止二次转换。
+`LEGACY_FREQ_BAND_METADATA`（`freq_ix → raw band`）与
+`raw_band_priority` 仍被支持，用于复现历史配置；两者同时存在时以显式
+`raw_band_priority` 为准（`gnss_band_mapping.resolve_raw_band_priority`）。
 
-#### 3.8.2 数据不适配默认分配时的手动设置
+**强制校验**：未知系统或 band 不在 `RAW_BAND_DOMAIN`、band 重复、
+`raw_band_priority` 长度 ≠ `nf`、`freq_ix` 无 metadata 可解析、increment
+输入禁止二次转换，均 `ValueError`。
 
-出现以下任一信号，默认分配不可用，**必须在配置里显式写
-`raw_band_priority`**：
+#### 3.8.2 何时必须显式 `raw_band_priority`
 
-| 场景 | 症状 | 处理 |
-|---|---|---|
-| 观测文件声明默认双频之外的 band（如 GPS L5） | `unsupported_raw_band` 硬报错 | 显式单 band，如 `{GPS: [1]}` |
-| BDS 接收机只有 B1I（C2I，band 2）无 B3I/B1C（手机、部分平板/POS 机） | 简化后 BDS 段整体消失、`candidate_sats` 该系统为空 | `{BDS: [2]}`（**不是 6**——band 2 取自观测码 `C2I` 第二字符，与 `freq_ix0` 的频率表索引 6 正交） |
-| 双频接收机但需 GREAT campus01 频点组合 | 需与 GREAT 对照等价 | `{BDS: [6]}` 或双频 `{BDS: [6, 2]}` |
-| 同一文件混多系统且各系统单频不同 | 列位置映射错频配对 | 每系统各给一个 band，如 `{GPS:[1], GAL:[1], BDS:[2], GLO:[1]}` |
+自动方案按 LibGnut 库级优先级选择，**物理上一致但质量不必最优**：库默认
+（BDS B1I 优先）与真实数据集的最优频点可能不同，数据自检（码-相一致性、
+观测码可用性）只能排除物理错误，不能替代人工选优。实测（campus01，
+truth-left 10 Hz，`remove_sat: ["C01"]`）：自动 B1I 3D RMS 1.123 m、
+手动 B3I 1.272 m、手动 B3I 且不剔除 C01 1.187 m、旧链路（B3I）1.145 m
+——同一数据集差异可达 0.15 m 量级，故**保留手动频点映射**：
 
-**书写规则**：键可用 `GPS/GAL/BDS/GLO` 或 RINEX 单字符 `G/E/C/R`；值是
-有序 band 数字表（第一元素=解码槽 0）；长度 = `nf`； band 值域
-`G/E/J/C: {1,2,5,6,7,8}`、`R: {1,2,3,4,6}`。显式声明优先于 legacy
-`freq_ix` 解析；两处同时存在时以 `raw_band_priority` 为准。
+| 场景 | 处理 |
+|---|---|
+| 数据集标定的共同载波与 LibGnut 默认不同（如 campus01 BDS 用 B3I） | `raw_band_priority: {GPS: [1], GAL: [1], BDS: [6], GLO: [1]}` |
+| 需要固定单频点以做对照实验（如手机 GPS L1 + BDS B1I） | `raw_band_priority: {GPS: [1], BDS: [2]}` |
+| 复现历史配置 | 保留原 `raw_band_priority`（legacy `freq_ix*` 亦可，二者取显式 `raw_band_priority`） |
 
-**验证方法**：改完后先用简化器干跑确认各系统段保留——
+**书写规则**：键可用 `GPS/GAL/BDS/GLO` 或 RINEX 单字符 `G/E/C/R`；值是有序
+band 数字表（第一元素 = 槽位 0）；长度 = `nf`；值域 `G/E/J/C: {1,2,5,6,7,8}`、
+`R: {1,2,3,4,6}`。
+
+**验证方法**（自动方案审计）——
 
 ```bash
 python3 -c "
 from src.utility.config_loader import load_config
-from src.stream.gnss_band_mapping import resolve_raw_band_priority
-from src.utility.rinex_simplifier import simplify_rinex
+from src.utility.rinex_improve import resolve_stream_plan, improve_rinex
 cfg = load_config('你的配置.yaml')['gnss']
-simplify_rinex(cfg['rover_path'], '/tmp/simplified.obs',
-               raw_band_priority=resolve_raw_band_priority(cfg))
+resolved, plan = resolve_stream_plan(cfg, cfg['rover_path'], cfg.get('base_path'))
+print('自动方案:', plan, '频率映射:', resolved['freq_ix0'], resolved['freq_ix1'])
+improve_rinex(cfg['rover_path'], '/tmp/simplified.obs', band_plan=plan,
+              gnss_t=cfg['gnss_t'])
 "
 grep 'SYS / # / OBS TYPES' /tmp/simplified.obs   # 每个目标系统都应在场
 ```
 
-逐卫星残差核查：`tc.measurement_trace` 开启后用
-`phone/plot/residual_dump.py` 按 (系统, 卫星) 统计 `prefit_innovation`，
-可发现逐卫星伪距系统偏差（如 BDS B1I 的 C41 +13 m、IGSO +1~1.7 m，
-见 `issue/9-15北斗频点映射.md` 第 4 节）。
+逐卫星残差核查：RTD 用 `phone/plot/rtd_residual_stats.py`（逐系统×频点×卫星
+的码 DD prefit 残差统计）；TC 开启 `tc.measurement_trace` 后用
+`phone/plot/residual_dump.py`。
 
 ### 3.9 基站与初始位置
 
@@ -580,7 +576,8 @@ NHC（非完整性约束）利用车辆运动学假设（车轮不侧滑、不�
 | `data/brdm0870.19p` | RINEX | 星历文件（广播星历） |
 
 > RINEX 解码由 `src/core/gnss/rtklib/rinex.py::rnx_decode` 实现（吸收自 rtklib-py）。
-> 必要时由 `src/utility/rinex_simplifier.py` 简化为 2 频点。
+> 必要时由 `src/utility/rinex_improve.py` 按自动信号方案改写频点与跟踪码
+> （LibGnut 移植见 `src/utility/gnutlib/`；旧 `rinex_simplifier.py` 保留兼容 API）。
 
 ### 7.3 GNSS 定位结果文件
 
