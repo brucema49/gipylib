@@ -255,9 +255,14 @@ class TcIntegration:
         self._writer = writer
 
     def _build_measurement_builder(self):
-        """Create the selected builder with the optional RTK trace sink."""
+        """Create the selected builder with the optional DD trace sink.
+
+        Both DD modes (rtk/rtd) accept the observational measurement trace;
+        SPP has no DD rows and keeps the plain constructor.
+        """
         builder_cls = _MEAS_BUILDERS.get(self._mode, SppTcMeas)
-        if self._mode == "rtk" and self._measurement_trace_sink is not None:
+        if (self._mode in ("rtk", "rtd")
+                and self._measurement_trace_sink is not None):
             return builder_cls(self._cfg, trace_sink=self._measurement_trace_sink)
         return builder_cls(self._cfg)
 

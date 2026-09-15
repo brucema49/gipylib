@@ -15,15 +15,15 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# 频点编号映射：信号代码后两位 → 频点序号（越小优先级越高）
-# L1/E1/B1 频点: 0
-# L2 频点: 1
-# L5/E5a 频点: 2
-# E5b/B2I 频点: 3
-# E6/B3 频点: 4
+# 频点编号映射：信号代码后两位 → 频点序号（越小优先级越高）。
+# 必须与 gnss_band_mapping.RAW_TO_NORMALIZED_BAND 的 band 级声明一致：
+# BDS B1I 的观测码是 2I，但 B1I (1561.098 MHz) 属于第一频点族
+# (RAW_TO_NORMALIZED_BAND['C'][2] = 1)，不是 GPS/GAL 的 L2 族 —— 把 2I
+# 归入 L2 族会让简化器把整段 BDS C2I 观测当作非优先频点剔除
+# (issue/9-15北斗频点映射.md)。
 _FREQ_ORDER: Dict[str, int] = {
     "1C": 0, "1X": 0, "1W": 0, "1P": 0, "1I": 0, "1M": 0, "1S": 0,
-    "2C": 1, "2X": 1, "2W": 1, "2L": 1, "2P": 1, "2S": 1, "2I": 3, "2M": 1,
+    "2C": 1, "2X": 1, "2W": 1, "2L": 1, "2P": 1, "2S": 1, "2I": 1, "2M": 1,
     "5Q": 2, "5X": 2, "5P": 2,
     "6C": 4, "6I": 4, "6X": 4,
     "7Q": 3, "7X": 3, "7I": 3, "7P": 3,

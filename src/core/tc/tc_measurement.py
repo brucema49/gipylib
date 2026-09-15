@@ -1765,8 +1765,9 @@ class RtdTcMeas(_DdBase):
     v[k] = (yu[i,f]-yr[i,f]) - (yu[j,f]-yr[j,f])   (仅 P, 不含 phase)
     """
 
-    def __init__(self, config: dict):
-        super().__init__(config)
+    def __init__(self, config: dict, *, trace_sink=None, trace_callback=None):
+        super().__init__(
+            config, trace_sink=trace_sink, trace_callback=trace_callback)
         self.use_phase = False
         self.use_code = True
         ins = config.get("ins", {}) if config else {}
@@ -1808,15 +1809,25 @@ class RtdTcMeas(_DdBase):
 
     def build(self, state, obsr, nav, si, x=None, obsb=None):
         """构造 RTD 双差伪距量测。"""
+        trace_context = self._trace_begin(
+            obsr, obsb, nav, state=state, si=si, x=x)
         if obsb is None:
-            return np.array([]), np.zeros((0, si.dim)), np.zeros((0, 0)), {}
+            v = np.array([])
+            H = np.zeros((0, si.dim))
+            self._trace_finish(
+                trace_context, v, H, nav, si, R=np.zeros((0, 0)), P=None)
+            return v, H, np.zeros((0, 0)), {}
         rs, var, dts, svh = satposs(obsr, nav)
         rsb, varb, dtsb, svhb = satposs(obsb, nav)
         nav.vsat[:, :] = 0
         yr, er, azelr = zdres(nav, obsb, rsb, dtsb, svhb, varb, nav.rb, 0)
         ns, iu, ir = selsat(nav, obsr, obsb, azelr[:, 1])
         if ns <= 0:
-            return np.array([]), np.zeros((0, si.dim)), np.zeros((0, 0)), {}
+            v = np.array([])
+            H = np.zeros((0, si.dim))
+            self._trace_finish(
+                trace_context, v, H, nav, si, R=np.zeros((0, 0)), P=None)
+            return v, H, np.zeros((0, 0)), {}
         rr = state.pos_e
         yu, eu, azel = zdres(nav, obsr, rs, dts, svh, var, rr, 1)
         from src.core.gnss.rtklib import rinex as rn
@@ -1836,7 +1847,8 @@ class RtdTcMeas(_DdBase):
         P = None
         # RTD 的 _build_dd 直接只遍历 code 频率，并保留 code DD 的完整协方差。
         v, H, R, info = self._build_dd(
-            nav, x, P, yr, er, yu, eu, sats, els, dt, obsr, si, state)
+            nav, x, P, yr, er, yu, eu, sats, els, dt, obsr, si, state,
+            trace_context=trace_context)
         if self.use_doppler and obsb is not None:
             rmap = {int(s): i for i, s in enumerate(obsr.sat)}
             bmap = {int(s): i for i, s in enumerate(obsb.sat)}
@@ -1856,4 +1868,5 @@ class RtdTcMeas(_DdBase):
                 R = np.block([[R, np.zeros((n0, len(vd)))],
                               [np.zeros((len(vd), n0)), Rd]])
                 info.update(idop)
+        self._trace_finish(trace_context, v, H, nav, si, R=R, P=None)
         return v, H, R, info

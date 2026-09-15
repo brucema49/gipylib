@@ -24,14 +24,18 @@ RINEX_TO_SYSTEM = {rinex: system for system, rinex in SYSTEM_TO_RINEX.items()}
 # Legacy frequency-table metadata.  The key is the solver constellation name
 # and the nested key is the legacy ``freq_ix`` value.  Values are *raw RINEX
 # band digits*, never frequencies and never decoder slots.
+#
+# BDS entries follow GREAT-MSF's frequency plan (src/LibGnut/gutils/gnss.cpp:78
+# orders the BDS bands B1I, B2I, B3I, ... with B1I=BAND_2 and B3I=BAND_6):
+# freq_ix 0 (the old generic first slot) resolves to B1I (C2I, raw band 2)
+# and freq_ix 6 (the extended-table entry used by the GREAT campus01 single
+# frequency baseline) resolves to B3I (C6I, raw band 6).  Datasets that need
+# a different pairing must declare ``raw_band_priority`` explicitly.
 LEGACY_FREQ_BAND_METADATA = {
     "GPS": {0: 1, 1: 2, 2: 5, 3: 6, 4: 7, 5: 8},
     "GLO": {0: 1, 1: 2, 4: 1, 5: 2},
     "GAL": {0: 1, 1: 2, 2: 5, 3: 6, 4: 7},
-    # Both historical BDS layouts occur in project configurations: index 0
-    # denotes B1 in the old mixed table, while index 6 denotes the dedicated
-    # B1I entry in the extended table.  Both resolve to raw RINEX band 1.
-    "BDS": {0: 1, 1: 2, 2: 5, 3: 7, 4: 6, 5: 7, 6: 1},
+    "BDS": {0: 2, 1: 7, 2: 5, 3: 7, 4: 6, 5: 7, 6: 6},
     "QZS": {0: 1, 1: 2, 2: 5, 3: 6},
     "SBS": {0: 1, 2: 5},
 }
@@ -66,11 +70,16 @@ RAW_TO_NORMALIZED_BAND = {
 # Decoder-facing defaults are expressed in raw RINEX band digits.  A caller
 # may provide a different ordered mapping for each stream (for example the
 # legacy GAL/BDS pair versus GREAT's GAL/BDS pair).
+#
+# The BDS order follows GREAT: B3I (C6I, raw band 6) first — the frequency
+# the GREAT campus01 single-frequency baseline actually solves with — then
+# B1I (C2I, raw band 2).  B1C (band 1) is BDS-3-only and absent from many
+# receivers (phones included), so it is not part of the default pair.
 DEFAULT_RAW_BAND_PRIORITY = {
     "G": [1, 2],
     "R": [1, 2],
     "E": [1, 7],
-    "C": [1, 6],
+    "C": [6, 2],
     "J": [1, 2],
 }
 
