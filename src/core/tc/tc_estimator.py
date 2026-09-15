@@ -16,8 +16,6 @@
 """
 import numpy as np
 
-from src.core.ins.attitude import dcm2euler
-from src.core.ins.earth_param import cal_Ce2n, ecef2llh
 from src.core.ins.lc_estimator import LcEstimator
 from src.core.ins.state_index import StateIndex
 from src.core.tc.tc_state_index import TcStateIndex
@@ -78,29 +76,26 @@ class TcEstimator(LcEstimator):
         self._clk_stored = np.zeros(4, dtype=np.float64)
         self._N_stored = np.zeros(tc_si.n_amb if tc_si.has_ambiguity() else 0,
                                   dtype=np.float64)
-        ins_cfg = config.get("ins", {})
-        self._feedback_pos_smoothing_s = float(
-            ins_cfg.get("feedback_pos_smoothing_s", 0.0)
-        )
-        if self._feedback_pos_smoothing_s < 0.0:
-            raise ValueError("ins.feedback_pos_smoothing_s must be >= 0")
-        self._feedback_pos_smoothing_mode = str(
-            ins_cfg.get("feedback_pos_smoothing_mode", "all")
-        ).lower()
-        if self._feedback_pos_smoothing_mode not in {"all", "transverse"}:
-            raise ValueError(
-                "ins.feedback_pos_smoothing_mode must be 'all' or 'transverse'"
-            )
-        if not self._feedback_pos_enabled:
-            self._feedback_pos_smoothing_s = 0.0
-            self._feedback_pos_smoothing_mode = "all"
-        self._pending_pos_correction = np.zeros(3, dtype=np.float64)
-        self._pending_pos_elapsed = 0.0
-        self._pending_pos_start = None
+        # Position feedback allocation over future IMU samples is explicitly
+        # disabled.  GREAT closes the error state at the GNSS boundary; a
+        # deferred correction would alter that model rather than repair it.
+        # Keep no pending correction state in the estimator.
         self._last_propagation_snapshot = None
         # A trace-only post-fit payload is frozen at the Joseph boundary and
         # consumed by TcIntegration after its final acceptance/rollback gate.
         self._pending_tc_postfit_trace = None
+        # Candidate row recorded when the transactional post-fit check fails;
+        # no automatic scalar/satellite pruning is performed in this unified
+        # TC estimator because its sparse DD state is not GREAT's outer GNSS
+        # parameter filter.
+        self.last_tc_outlier_indices = tuple()
+        self.last_tc_outlier_row = None
+        self.last_tc_postfit = None
+        self.last_tc_active_row_indices = tuple()
+        self.last_tc_update_v = None
+        self.last_tc_update_H = None
+        self.last_tc_update_R = None
+        self.last_tc_update_info = None
 
     @property
     def last_propagation_snapshot(self):
@@ -221,21 +216,6 @@ class TcEstimator(LcEstimator):
         if np.any(self.x[:n_ins]):
             self.x[:n_ins] = Phi_ins @ self.x[:n_ins]
 
-        self._apply_pending_position_correction(
-            self.ins_update.state.timestamp
-        )
-
-        # P_vel 运行点下限 (对齐 ignav propinss 自然平衡值 ~17mm):
-        # ignav 无 vel_psd 注入, 其 P_vel 由 Phi 耦合自然维持在 mm-cm 级;
-        # gipylib 在 vel_psd=0 时 P_vel 会塌缩至更低导致 K 过小、机动段
-        # 恢复缓慢 (MECH-14 长偏移)。此处直接强制相同运行点。
-        vel_floor = float(self._tc_config.get("ins", {}).get(
-            "vel_var_floor", 0.0))
-        if vel_floor > 0.0:
-            for k in range(3):
-                if self.P[3 + k, 3 + k] < vel_floor:
-                    self.P[3 + k, 3 + k] = vel_floor
-
         self.P = 0.5 * (self.P + self.P.T)
 
         self._last_propagation_snapshot = {
@@ -267,13 +247,60 @@ class TcEstimator(LcEstimator):
             # Pclk 不重置, 由 time_update 的 Q_clk 随机游走累积
             self.x[clk0:clk0 + 4] = 0.0
 
-    def tc_meas_update(self, v, H, R, source: str = "", trace=None):
-        """GNSS 量测更新 (调 joseph_update + feedback)。
+    @staticmethod
+    def _normalise_retry_groups(retry_groups, n_rows: int):
+        """Return deterministic row groups for a GREAT-style retry.
 
-        ``trace`` is an optional measurement-builder hook.  When present,
-        the diagnostic post-fit is frozen immediately after the Joseph
-        update for final emission by the integration boundary.  It is
-        deliberately absent from the solver path by default.
+        The groups are DD metadata supplied by the builder.  Removing one is
+        an atomic satellite-level operation; it never changes a scalar
+        residual threshold or any covariance/noise parameter.
+        """
+        if retry_groups is None:
+            return []
+        values = (retry_groups.values() if isinstance(retry_groups, dict)
+                  else retry_groups)
+        try:
+            iterator = iter(values)
+        except TypeError:
+            return []
+        result, seen = [], set()
+        for group in iterator:
+            try:
+                rows = sorted({int(index) for index in group
+                               if 0 <= int(index) < int(n_rows)})
+            except (TypeError, ValueError):
+                continue
+            key = tuple(rows)
+            if rows and key not in seen:
+                result.append(rows)
+                seen.add(key)
+        return result
+
+    def _postfit_result(self, v, H, R):
+        """Compute GREAT-compatible normalized post-fit diagnostics."""
+        postfit = np.asarray(v, dtype=np.float64) - H @ self.x
+        covariance = H @ self.P @ H.T + R
+        variances = np.diag(covariance)
+        normalized = np.full(postfit.size, np.nan, dtype=np.float64)
+        valid = variances > 0.0
+        normalized[valid] = np.abs(postfit[valid]) / np.sqrt(variances[valid])
+        bad_row = None
+        if np.any(np.isfinite(normalized)):
+            bad_row = int(np.nanargmax(normalized))
+        accepted = validate_tc_postfit(
+            postfit, covariance, n_parameters=3)
+        return accepted, postfit, covariance, bad_row
+
+    def tc_meas_update(self, v, H, R, source: str = "", trace=None,
+                       retry_groups=None, retry_satellites=None,
+                       retry_builder=None):
+        """GNSS 量测更新 (Joseph + GREAT 同历元重建 + immediate feedback).
+
+        GREAT 在同一 GNSS 端点删除最大归一化残差所属卫星并重建外层
+        GNSS 方程。正式 GREAT 兼容路径通过 ``retry_builder`` 重新选择
+        参考星并重算 DD 协方差；旧的冻结行切片仅保留给无重建回调的
+        legacy 单元测试，不作为正式解算策略。不分配反馈到未来时间，
+        也不修改任何噪声、权重或门限。
         """
         if len(v) == 0:
             return None
@@ -286,30 +313,190 @@ class TcEstimator(LcEstimator):
             }
         P_before = self.P.copy()
         x_before = self.x.copy()
-        self.joseph_update(v, H, R)
+        v_full = np.asarray(v, dtype=np.float64).reshape(-1)
+        H_full = np.asarray(H, dtype=np.float64)
+        R_full = np.asarray(R, dtype=np.float64)
+        self.last_tc_postfit = None
+        self.last_tc_active_row_indices = tuple()
+        self.last_tc_outlier_indices = tuple()
+        self.last_tc_outlier_row = None
+        self.last_tc_update_v = v_full.copy()
+        self.last_tc_update_H = H_full.copy()
+        self.last_tc_update_R = R_full.copy()
+        self.last_tc_update_info = None
+
         # The TC path bypasses rtklib's relpos()/valpos() wrapper.  Validate
-        # the linearized post-fit residual before closing the INS loop, and
-        # make rejection transactional so a bad float epoch cannot corrupt
-        # the nominal state or its cross-covariances.
+        # before closing the INS loop, and keep rejection transactional.
+        self.joseph_update(v_full, H_full, R_full)
         postfit = None
+        active_rows = list(range(v_full.size))
+        accepted = True
         if source == "rtk":
-            postfit = np.asarray(v) - H @ self.x
-            if not validate_tc_postfit(postfit, R, n_parameters=3):
+            accepted, postfit, _postfit_covariance, bad_row = \
+                self._postfit_result(v_full, H_full, R_full)
+            if bad_row is not None:
+                self.last_tc_outlier_row = int(bad_row)
+
+            retry_groups = self._normalise_retry_groups(
+                retry_groups, v_full.size)
+            retry_satellites = list(retry_satellites or ())
+            excluded_rows = set()
+            excluded_sats = set()
+            # GREAT removes the complete satellite owning the worst row and
+            # retries the outer update at the same endpoint.  The builder has
+            # already frozen DD rows, so only the normal equations are sliced;
+            # there is no second ambiguity synchronization or retuning.  A
+            # frozen DD model is not allowed to perform repeated removals:
+            # after one conservative retry, failure means rejecting the epoch
+            # rather than silently changing the reference/observability model.
+            retry_attempted = False
+            while (not accepted and bad_row is not None
+                   and retry_groups):
+                original_bad = active_rows[int(bad_row)]
+                group_index = next((index for index, candidate in enumerate(
+                    retry_groups)
+                    if original_bad in candidate
+                    and (
+                        (retry_builder is not None
+                         and index < len(retry_satellites)
+                         and int(retry_satellites[index]) not in excluded_sats)
+                        or (retry_builder is None
+                            and not set(candidate).issubset(excluded_rows))
+                    )), None)
+                group = (retry_groups[group_index]
+                         if group_index is not None else None)
+                if group is None:
+                    break
+                sat = (retry_satellites[group_index]
+                       if group_index is not None
+                       and group_index < len(retry_satellites) else None)
+                if retry_builder is not None and sat is not None:
+                    # Rebuild the observation model at the same endpoint.
+                    # The EKF state/covariance are restored to the exact
+                    # pre-update snapshot before every trial, matching
+                    # GREAT's outer do/while rather than slicing a frozen
+                    # normal equation.
+                    excluded_sats.add(int(sat))
+                    excluded_rows.update(group)
+                    self.P = P_before.copy()
+                    self.x = x_before.copy()
+                    rebuilt = retry_builder(
+                        tuple(sorted(excluded_sats)),
+                        x_retry=self.effective_x(),
+                        P_retry=P_before)
+                    if rebuilt is None or len(rebuilt) != 4:
+                        break
+                    v_try, H_try, R_try, info_try = rebuilt
+                    v_try = np.asarray(v_try, dtype=np.float64).reshape(-1)
+                    H_try = np.asarray(H_try, dtype=np.float64)
+                    R_try = np.asarray(R_try, dtype=np.float64)
+                    if v_try.size < 4:
+                        break
+                    self.P = P_before.copy()
+                    self.x = x_before.copy()
+                    self.joseph_update(v_try, H_try, R_try)
+                    accepted, postfit, _postfit_covariance, bad_row = \
+                        self._postfit_result(v_try, H_try, R_try)
+                    self.last_tc_update_v = v_try.copy()
+                    self.last_tc_update_H = H_try.copy()
+                    self.last_tc_update_R = R_try.copy()
+                    self.last_tc_update_info = dict(info_try or {})
+                    # Rebuild the satellite groups from the new DD identity;
+                    # reference selection can change after an exclusion, so
+                    # carrying the original row numbers would remove the
+                    # wrong satellite on the next GREAT-style iteration.
+                    remapped = {}
+                    row_indices = list(
+                        self.last_tc_update_info.get("row_indices", ()))
+                    for pair_order, pair in enumerate(
+                            self.last_tc_update_info.get("pairs", ())):
+                        row_index = (row_indices[pair_order]
+                                     if pair_order < len(row_indices)
+                                     else pair_order)
+                        if len(pair) < 2:
+                            continue
+                        for candidate_sat in (pair[1], pair[0]):
+                            try:
+                                sat_key = int(candidate_sat)
+                                row_key = int(row_index)
+                            except (TypeError, ValueError):
+                                continue
+                            remapped.setdefault(sat_key, []).append(row_key)
+                    retry_satellites = list(remapped)
+                    retry_groups = list(remapped.values())
+                    active_rows = list(range(v_try.size))
+                    retry_attempted = True
+                    if bad_row is not None:
+                        self.last_tc_outlier_row = int(bad_row)
+                    # Row indices refer to the rebuilt model, so the final
+                    # trace intentionally reports satellite exclusions only;
+                    # integration diagnostics consume the rebuilt matrices.
+                    continue
+                proposed = excluded_rows | set(group)
+                keep = [index for index in range(v_full.size)
+                        if index not in proposed]
+                # Keep the same minimum-row contract as _trigger_meas.
+                if len(keep) < 4:
+                    break
+                excluded_rows = proposed
+                active_rows = keep
+                retry_attempted = True
+                keep_index = np.asarray(keep, dtype=int)
+                self.P = P_before.copy()
+                self.x = x_before.copy()
+                R_keep = R_full[np.ix_(keep_index, keep_index)]
+                self.joseph_update(v_full[keep_index], H_full[keep_index, :],
+                                   R_keep)
+                accepted, postfit, _postfit_covariance, bad_row = \
+                    self._postfit_result(v_full[keep_index],
+                                         H_full[keep_index, :], R_keep)
+                if bad_row is not None:
+                    self.last_tc_outlier_row = int(active_rows[int(bad_row)])
+
+            if not accepted:
                 self.P = P_before
                 self.x = x_before
+                self.last_tc_postfit = None
+                self.last_tc_active_row_indices = tuple()
                 return None
+
+            self.last_tc_outlier_indices = tuple(sorted(excluded_rows))
+            if retry_builder is not None and retry_attempted:
+                # A true rebuild may change the number/order of DD rows when
+                # the reference satellite changes.  Keep post-fit values in
+                # the final model's own coordinates; the integration layer
+                # consumes last_tc_update_{v,H,R} for matching diagnostics.
+                self.last_tc_active_row_indices = tuple(
+                    range(int(np.asarray(postfit).size)))
+                self.last_tc_postfit = np.asarray(
+                    postfit, dtype=np.float64).copy()
+            else:
+                self.last_tc_active_row_indices = tuple(active_rows)
+                postfit_full = np.full(v_full.size, np.nan, dtype=np.float64)
+                postfit_full[np.asarray(active_rows, dtype=int)] = postfit
+                self.last_tc_postfit = postfit_full
+
         x_post = self.x.copy()
         P_post = self.P.copy() if trace is not None else None
         if trace is not None:
             if postfit is None:
-                postfit = np.asarray(v) - H @ x_post
+                postfit = v_full - H_full @ x_post
+                self.last_tc_postfit = np.asarray(postfit, dtype=np.float64).copy()
+                self.last_tc_active_row_indices = tuple(active_rows)
+            elif self.last_tc_postfit is not None:
+                postfit = self.last_tc_postfit
             self._pending_tc_postfit_trace = {
                 "trace": trace,
                 "postfit": np.asarray(postfit, dtype=float).copy(),
                 "x_post": x_post.copy(),
                 "P_post": P_post.copy(),
+                "excluded_rows": tuple(self.last_tc_outlier_indices),
             }
         feedback_x = x_post
+        if source != "rtk":
+            self.last_tc_active_row_indices = tuple(active_rows)
+            self.last_tc_postfit = np.asarray(
+                v_full - H_full @ x_post, dtype=np.float64).copy()
         self.feedback()
         return feedback_x
 
@@ -332,68 +519,8 @@ class TcEstimator(LcEstimator):
         INS 误差状态由父类 feedback 处理 (state -= x, x 清零)。
         """
         si = self.si
-        smooth_position = (
-            self._feedback_pos_smoothing_s > 0.0
-            and self._feedback_pos_fraction < 1.0
-        )
-        delta_pos = self.x[si.pos:si.pos + 3].copy()
-
-        # The base implementation supports partial feedback by retaining the
-        # unclosed position error in x.  For the TC smoothing mode, retain the
-        # correction in nominal position instead, so the error state remains
-        # closed-loop and the correction can be distributed over IMU epochs.
-        if smooth_position:
-            self._apply_pending_position_correction(
-                self.ins_update.state.timestamp, force=True
-            )
-            fraction = self._feedback_pos_fraction
-            _, deferred = self._split_position_feedback(delta_pos, fraction)
-            self._feedback_pos_fraction = 1.0
-            try:
-                self._feedback_gnss_params_and_base()
-            finally:
-                self._feedback_pos_fraction = fraction
-
-            if np.any(deferred):
-                self.ins_update.state.pos_e += deferred
-                self._refresh_position_frame()
-            self._schedule_pending_position_correction(deferred)
-            return
-
+        # Full immediate closed-loop feedback at this exact GNSS boundary.
         self._feedback_gnss_params_and_base()
-
-    def _split_position_feedback(
-        self, delta_pos: np.ndarray, fraction: float
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Return immediate and deferred ECEF position-error components."""
-        if self._feedback_pos_smoothing_mode == "all":
-            return (
-                fraction * delta_pos,
-                (1.0 - fraction) * delta_pos,
-            )
-
-        state = self.ins_update.state
-        lat, lon, _ = ecef2llh(state.pos_e)
-        C_e_n = cal_Ce2n(lat, lon)
-        delta_ned = C_e_n @ delta_pos
-        vel_ned = C_e_n @ state.vel_e
-        horizontal_vel = vel_ned[:2]
-        speed = float(np.linalg.norm(horizontal_vel))
-        if speed <= 1.0e-6:
-            # No stable travel direction: fall back to all-axis smoothing.
-            return (
-                fraction * delta_pos,
-                (1.0 - fraction) * delta_pos,
-            )
-
-        along_ned = np.zeros(3, dtype=np.float64)
-        along_ned[:2] = horizontal_vel / speed
-        along_component = np.dot(delta_ned, along_ned) * along_ned
-        vertical_component = np.array([0.0, 0.0, delta_ned[2]])
-        transverse_component = delta_ned - along_component - vertical_component
-        immediate_ned = along_component + vertical_component + fraction * transverse_component
-        deferred_ned = (1.0 - fraction) * transverse_component
-        return C_e_n.T @ immediate_ned, C_e_n.T @ deferred_ned
 
     def _feedback_gnss_params_and_base(self) -> None:
         """Accumulate TC direct states and run the common INS feedback."""
@@ -408,52 +535,6 @@ class TcEstimator(LcEstimator):
             self._N_stored += self.x[amb_slice]
         # 父类 feedback: INS state -= x, 清零全部 x (含 GNSS ε)
         super().feedback()
-
-    def _schedule_pending_position_correction(self, correction: np.ndarray) -> None:
-        """Schedule an unapplied ECEF position correction after feedback."""
-        self._pending_pos_correction = np.asarray(correction, dtype=np.float64).copy()
-        self._pending_pos_elapsed = 0.0
-        self._pending_pos_start = float(self.ins_update.state.timestamp)
-
-        if not np.any(self._pending_pos_correction):
-            self._pending_pos_start = None
-
-    def _refresh_position_frame(self) -> None:
-        """Keep reported attitude Euler angles consistent with ECEF position."""
-        lat, lon, _ = ecef2llh(self.ins_update.state.pos_e)
-        C_b_n = cal_Ce2n(lat, lon) @ self.ins_update.state.C_b_e
-        self.ins_update.state.att_rpy = dcm2euler(C_b_n)
-
-    def _apply_pending_position_correction(
-        self, timestamp: float, force: bool = False
-    ) -> None:
-        """Apply the scheduled correction increment up to ``timestamp``."""
-        correction = self._pending_pos_correction
-        if not np.any(correction):
-            return
-
-        duration = self._feedback_pos_smoothing_s
-        if duration <= 0.0:
-            return
-        if self._pending_pos_start is None:
-            self._pending_pos_start = float(timestamp)
-
-        if force:
-            elapsed = duration
-        else:
-            elapsed = float(timestamp) - self._pending_pos_start
-            elapsed = min(max(elapsed, 0.0), duration)
-
-        increment = correction * (elapsed - self._pending_pos_elapsed) / duration
-        if np.any(increment):
-            self.ins_update.state.pos_e -= increment
-        self._pending_pos_elapsed = elapsed
-
-        if elapsed >= duration:
-            self._refresh_position_frame()
-            self._pending_pos_correction[:] = 0.0
-            self._pending_pos_elapsed = 0.0
-            self._pending_pos_start = None
 
     def switch_mode(self, new_mode: str, builder=None):
         """降级时状态向量重整。
@@ -472,9 +553,6 @@ class TcEstimator(LcEstimator):
         self.P = new_P
         self.x = new_x
         self._mode = new_mode
-        self._pending_pos_correction[:] = 0.0
-        self._pending_pos_elapsed = 0.0
-        self._pending_pos_start = None
         # 重建 TransferMatrix (用 new_si, dim 可能因 clk_bias 块变化而改变)
         # 否则 build_Q 会用旧 si.dim 生成 Q, 与新 P 维度不匹配
         from src.core.ins.transfer_matrix import TransferMatrix
@@ -507,9 +585,6 @@ class TcEstimator(LcEstimator):
         self.state.pos_e[:] = 0.0
         self.state.vel_e[:] = 0.0
         self.state.C_b_e = np.eye(3)
-        self._pending_pos_correction[:] = 0.0
-        self._pending_pos_elapsed = 0.0
-        self._pending_pos_start = None
         # GNSS 直接估计重置
         self._clk_stored[:] = 0.0
         self._N_stored = np.zeros(si.n_amb if si.has_ambiguity() else 0,

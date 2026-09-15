@@ -83,8 +83,12 @@ class TcMatrixDiagnosticWriter:
             "n_code_att": int(info.get("n_code_att", 0)),
             "n_code_acc": int(info.get("n_code_acc", 0)),
             "n_code_rej": int(info.get("n_code_rej", 0)),
+            "excluded_rows": [int(value) for value in
+                              info.get("excluded_rows", ())],
             "ref_sats": [int(value) for value in info.get("ref_sats", [])],
             "pairs": [list(pair) for pair in info.get("pairs", [])],
+            "row_indices": [int(value) for value in
+                            info.get("row_indices", ())],
         })
         self._write(record)
 

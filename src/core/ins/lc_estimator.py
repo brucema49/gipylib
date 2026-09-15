@@ -24,22 +24,6 @@ from src.core.ins.transfer_matrix import TransferMatrix, rodrigues, skew
 logger = logging.getLogger(__name__)
 
 
-def _config_switch(value, name: str) -> bool:
-    """Parse an on/off configuration value, accepting YAML bools and strings."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)) and value in (0, 1):
-        return bool(value)
-    text = str(value).strip().lower()
-    if text in {"on", "true", "yes", "1"}:
-        return True
-    if text in {"off", "false", "no", "0"}:
-        return False
-    raise ValueError(
-        f"{name} must be on/off or true/false, got {value!r}"
-    )
-
-
 class LcEstimator:
     """松组合 EKF 估计器 (单滤波, StateIndex 参数块管理)。
 
@@ -86,22 +70,14 @@ class LcEstimator:
         self._vertical_sigma_factor = float(ins_cfg.get("vertical_sigma_factor", 1.0))
         self._gnss_time_sync_noise_s = float(ins_cfg.get("gnss_time_sync_noise_s", 0.005))
         self._gnss_vel_std = ins_cfg.get("gnss_vel_std", 0.5)
-        feedback_switch = ins_cfg.get("feedback_pos_enable")
-        if feedback_switch is None:
-            # Preserve the pre-switch behavior for legacy configurations that
-            # already declare a feedback ratio.  A completely unspecified
-            # configuration keeps the ignav-style immediate feedback.
-            self._feedback_pos_enabled = "feedback_pos_fraction" in ins_cfg
-        else:
-            self._feedback_pos_enabled = _config_switch(
-                feedback_switch,
-                "ins.feedback_pos_enable",
-            )
-        self._feedback_pos_fraction = float(
-            ins_cfg.get("feedback_pos_fraction", 1.0)
-        ) if self._feedback_pos_enabled else 1.0
-        if not 0.0 < self._feedback_pos_fraction <= 1.0:
-            raise ValueError("ins.feedback_pos_fraction must be in (0, 1]")
+        # GREAT closes the INS error state at the same GNSS epoch.  Temporal
+        # allocation of a position feedback is therefore deliberately not a
+        # supported estimator mode: accepting a fraction would change the
+        # state semantics and hide the underlying P/Q/R mismatch.  Keep the
+        # attributes as immutable compatibility markers for old callers, but
+        # always perform full immediate feedback below.
+        self._feedback_pos_enabled = False
+        self._feedback_pos_fraction = 1.0
         self._innov_reject_threshold = float(ins_cfg.get("innov_reject_threshold", 0.0))
         self._innov_reject_warmup = int(ins_cfg.get("innov_reject_warmup", 100))
         self._gnss_update_count = 0
@@ -394,8 +370,8 @@ class LcEstimator:
         delta_as = (self.x[si.accel_scale:si.accel_scale+3]
                     if si.has_imu_scale() else np.zeros(3))
 
-        applied_pos = self._feedback_pos_fraction * delta_pos
-        new_pos = state.pos_e - applied_pos
+        # Immediate closed-loop correction (no deferred/time-distributed part).
+        new_pos = state.pos_e - delta_pos
         new_vel = state.vel_e - delta_vel
         C_b_e_new = rodrigues(-delta_psi) @ state.C_b_e
         U, _, Vt = np.linalg.svd(C_b_e_new)
@@ -434,6 +410,3 @@ class LcEstimator:
 
         self.ins_update.state = new_state
         self.x[:] = 0.0
-        remaining_pos = (1.0 - self._feedback_pos_fraction) * delta_pos
-        if np.any(remaining_pos):
-            self.x[si.pos:si.pos+3] = remaining_pos

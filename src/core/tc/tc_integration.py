@@ -209,6 +209,14 @@ class TcIntegration:
         # 量测连续失败计数 (用于发散恢复: 连续失败超阈值时尝试 SPP 重初始化)
         self._consecutive_failures: int = 0
         self._recovery_threshold: int = 10  # 连续失败 10 个历元后尝试恢复
+        tc_cfg = config.get("tc", {}) if isinstance(config, dict) else {}
+        # GREAT does not overwrite the INS trajectory with an unrelated SPP
+        # position after a rejected DD epoch.  Keep the legacy fallbacks
+        # available to other applications, but allow the formal GREAT
+        # comparison profiles to disable both reset mechanisms explicitly.
+        self._spp_fallback_enabled = bool(tc_cfg.get("spp_fallback_enable", True))
+        self._auto_recovery_enabled = bool(tc_cfg.get("auto_recovery", True))
+        self._velocity_guard_enabled = bool(tc_cfg.get("velocity_guard_enable", True))
         # 上一 GNSS 历元时刻 (gtime_t), 供 udbias 计算历元间隔 (随机游走/失锁计时)
         self._prev_obs_t = None
         # Optional, explicit-only measurement boundary diagnostics.  Keeping
@@ -818,9 +826,17 @@ class TcIntegration:
             update["limit_m"] = float(limit_m)
         if accepted and pending is not None:
             postfit = pending.get("postfit")
+            postfit_array = None
             if postfit is not None:
+                try:
+                    candidate = np.asarray(postfit, dtype=float).reshape(-1)
+                    if np.all(np.isfinite(candidate)):
+                        postfit_array = candidate
+                except Exception:
+                    postfit_array = None
+            if postfit_array is not None:
                 update.update({
-                    "postfit": np.asarray(postfit, dtype=float).copy(),
+                    "postfit": postfit_array.copy(),
                     "postfit_definition": "v_minus_H_x_post",
                     "postfit_scope": (
                         "measurement_update_post_joseph_pre_feedback"
@@ -829,6 +845,9 @@ class TcIntegration:
                     "postfit_variance": None,
                     "postfit_variance_available": False,
                 })
+            excluded = pending.get("excluded_rows", ())
+            if excluded:
+                update["excluded_rows"] = [int(index) for index in excluded]
         try:
             if state is None:
                 state = self._est.state if self._est is not None else None
@@ -852,6 +871,38 @@ class TcIntegration:
             self._output_callback(self._est.state, self._est.P, qins)
         elif self._writer is not None:
             self._write_state(qins)
+
+    @staticmethod
+    def _build_rtk_retry_groups(info: dict, n_rows: int):
+        """Map DD rows to satellite groups for same-epoch retry.
+
+        GREAT removes the target satellite owning the worst normalized row and
+        reruns the outer update.  ``RtkTcMeas`` emits one ``pairs`` entry per
+        accepted row, so this mapping is lossless and remains diagnostic-only
+        until ``TcEstimator`` explicitly needs a retry.
+        """
+        groups = {}
+        row_indices = list(info.get("row_indices", ()))
+        for pair_order, pair in enumerate(info.get("pairs", ())):
+            row_index = (row_indices[pair_order]
+                         if pair_order < len(row_indices) else pair_order)
+            if row_index >= int(n_rows) or len(pair) < 2:
+                continue
+            # Insert target first: a failed DD row is normally attributed to
+            # its non-reference satellite, matching GREAT's _remove_sat.
+            for sat in (pair[1], pair[0]):
+                try:
+                    key = int(sat)
+                except (TypeError, ValueError):
+                    continue
+                groups.setdefault(key, []).append(int(row_index))
+        sat_ids = []
+        row_groups = []
+        for sat, rows in groups.items():
+            if rows:
+                sat_ids.append(int(sat))
+                row_groups.append(rows)
+        return row_groups, sat_ids
 
     def _emit_propagation(self) -> None:
         """Write exactly one row per successful mechanization commit.
@@ -1013,6 +1064,8 @@ class TcIntegration:
 
     def _check_velocity_divergence(self) -> None:
         """Reset an obviously divergent TC velocity after propagation."""
+        if not self._velocity_guard_enabled:
+            return
         vel = self._est.state.vel_e
         speed = float(np.linalg.norm(vel))
         if speed <= 50.0:
@@ -1723,7 +1776,8 @@ class TcIntegration:
             # 用 SPP 3D 位置做 fallback 位置更新, 防止 INS 自由漂移
             logger.debug(f"TC no_meas (mode={mode}, t={t_gnss:.3f}): "
                          f"obsr sats={len(obsr.sat)}, obsb sats={len(obsb.sat) if obsb is not None else 0}")
-            if self._spp_fallback_update(obsr, obsb, nav, t_gnss):
+            if (self._spp_fallback_enabled
+                    and self._spp_fallback_update(obsr, obsb, nav, t_gnss)):
                 self._emit_final_measurement_trace(
                     trace_builder, status="rejected_gate", accepted=False,
                 )
@@ -1753,7 +1807,8 @@ class TcIntegration:
             logger.debug(f"TC skip_meas (mode={mode}, t={t_gnss:.3f}): "
                          f"n_meas={n_meas} < {min_meas}, try SPP fallback, "
                          f"obsr={len(obsr.sat)}, obsb={len(obsb.sat) if obsb is not None else 0}")
-            if self._spp_fallback_update(obsr, obsb, nav, t_gnss):
+            if (self._spp_fallback_enabled
+                    and self._spp_fallback_update(obsr, obsb, nav, t_gnss)):
                 self._emit_final_measurement_trace(
                     trace_builder, status="rejected_gate", accepted=False,
                 )
@@ -1814,11 +1869,24 @@ class TcIntegration:
         # estimator then freezes and emits post-fit immediately after Joseph
         # and before feedback.  The optional kwarg is omitted on the normal
         # path to preserve compatibility with estimator test doubles.
+        retry_enabled = bool(self._cfg.get("tc", {}).get(
+            "satellite_retry_enable", True))
+        retry_groups, retry_satellites = (
+            self._build_rtk_retry_groups(info, len(v))
+            if mode == "rtk" and retry_enabled else ([], [])
+        )
+        retry_builder = getattr(self._meas_builder, "_last_retry_builder", None)
+        retry_kw = ({
+            "retry_groups": retry_groups,
+            "retry_satellites": retry_satellites,
+            "retry_builder": retry_builder,
+        } if retry_groups and retry_builder is not None else {})
         if trace_builder is None:
-            feedback_x = self._est.tc_meas_update(v, H, R, source=mode)
+            feedback_x = self._est.tc_meas_update(
+                v, H, R, source=mode, **retry_kw)
         else:
             feedback_x = self._est.tc_meas_update(
-                v, H, R, source=mode, trace=trace_builder)
+                v, H, R, source=mode, trace=trace_builder, **retry_kw)
         if feedback_x is None:
             reject_info = dict(info)
             reject_info["postfit_norm"] = float(
@@ -1849,10 +1917,57 @@ class TcIntegration:
             )
             return
         update_info = dict(info)
-        postfit = np.asarray(v) - H @ feedback_x
-        update_info["postfit_norm"] = float(np.linalg.norm(postfit))
+        used_v = getattr(self._est, "last_tc_update_v", None)
+        used_H = getattr(self._est, "last_tc_update_H", None)
+        used_R = getattr(self._est, "last_tc_update_R", None)
+        rebuilt_info = getattr(self._est, "last_tc_update_info", None)
+        if used_v is None or used_H is None or used_R is None:
+            used_v, used_H, used_R = v, H, R
+        if rebuilt_info:
+            # Preserve the original trace metadata while replacing numerical
+            # counts/pairs with the final rebuilt DD model used by the EKF.
+            for key, value in rebuilt_info.items():
+                if key != "retry_builder":
+                    update_info[key] = value
+        postfit = getattr(self._est, "last_tc_postfit", None)
+        if postfit is None:
+            postfit = np.asarray(used_v) - used_H @ feedback_x
+        else:
+            postfit = np.asarray(postfit, dtype=float)
+        active_rows = tuple(getattr(
+            self._est, "last_tc_active_row_indices", range(len(used_v))))
+        active_index = np.asarray(active_rows, dtype=int)
+        if active_index.size and postfit.size == len(used_v):
+            postfit_for_stats = postfit[active_index]
+            r_for_stats = used_R[np.ix_(active_index, active_index)]
+        else:
+            postfit_for_stats = postfit
+            r_for_stats = used_R
+        update_info["postfit_norm"] = float(np.linalg.norm(postfit_for_stats))
         update_info["postfit_chi2"] = float(np.sum(
-            postfit * postfit / np.diag(R)))
+            postfit_for_stats * postfit_for_stats /
+            np.maximum(np.diag(r_for_stats), np.finfo(float).tiny)))
+        update_info["excluded_rows"] = [
+            int(index) for index in getattr(
+                self._est, "last_tc_outlier_indices", ())]
+        # A true GREAT-style retry changes H/R and therefore the innovation
+        # covariance and gain.  Recompute these diagnostics from the final
+        # rebuilt model instead of leaving the pre-retry matrices in the CSV.
+        if (used_H.shape != H.shape or used_R.shape != R.shape
+                or not np.array_equal(used_H, H)):
+            s_matrix = used_H @ pre_p @ used_H.T + used_R
+            s_diag_median = float(np.median(np.diag(s_matrix)))
+            K_gain = pre_p @ used_H.T @ np.linalg.inv(s_matrix)
+            k_pos_norm = float(np.linalg.norm(
+                K_gain[si.pos:si.pos + 3], axis=1).max())
+            k_vel_norm = float(np.linalg.norm(
+                K_gain[si.vel:si.vel + 3], axis=1).max())
+            k_att_norm = float(np.linalg.norm(
+                K_gain[si.att:si.att + 3], axis=1).max())
+            k_ba_norm = float(np.linalg.norm(
+                K_gain[si.accel_bias:si.accel_bias + 3], axis=1).max())
+            k_bg_norm = float(np.linalg.norm(
+                K_gain[si.gyro_bias:si.gyro_bias + 3], axis=1).max())
         self._record_matrix_update_diagnostic(
             timestamp=t_gnss,
             pre_p=pre_p,
@@ -1869,8 +1984,8 @@ class TcIntegration:
         self._record_measurement_diagnostic(
             timestamp=t_gnss,
             mode=mode,
-            n_meas=n_meas,
-            innovation=v,
+            n_meas=int(update_info.get("n", len(used_v))),
+            innovation=used_v,
             pre_velocity=pre_velocity,
             velocity_correction=feedback_x[si.vel:si.vel + 3],
             attitude_correction=feedback_x[si.att:si.att + 3],
@@ -1898,16 +2013,16 @@ class TcIntegration:
         # 轻量更新信息快照 (供 stat_writer 的 GIPY_INNOV/GIPY_GAIN 使用)
         self.last_update_info = {
             "mode": mode,
-            "innovation_norm": float(np.linalg.norm(v)),
-            "n_meas": int(n_meas),
-            "n_phase_acc": int(info.get("n_phase_acc", 0)),
-            "n_code_acc": int(info.get("n_code_acc", 0)),
+            "innovation_norm": float(np.linalg.norm(used_v)),
+            "n_meas": int(update_info.get("n", len(used_v))),
+            "n_phase_acc": int(update_info.get("n_phase_acc", 0)),
+            "n_code_acc": int(update_info.get("n_code_acc", 0)),
             "k_pos_norm": float(k_pos_norm),
             "k_vel_norm": float(k_vel_norm),
             "k_att_norm": float(k_att_norm),
             "k_bg_norm": float(k_bg_norm),
             "k_ba_norm": float(k_ba_norm),
-            "ref_sats": info.get("ref_sats", []),
+            "ref_sats": update_info.get("ref_sats", []),
         }
         self._degrade.on_success(self._est)
         self.last_qins = 3  # TC 量测更新完成
@@ -2219,6 +2334,8 @@ class TcIntegration:
         """
         self._consecutive_failures += 1
         if not recover:
+            return
+        if not self._auto_recovery_enabled:
             return
         if self._consecutive_failures < self._recovery_threshold:
             return

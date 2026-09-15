@@ -12,6 +12,7 @@ from collections.abc import Callable
 import csv
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -226,7 +227,24 @@ class TcMeasurementTraceWriter:
 
     @classmethod
     def _canonical_json(cls, value) -> str:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True,
+        def json_safe(item):
+            if isinstance(item, float):
+                return item if math.isfinite(item) else None
+            if isinstance(item, dict):
+                return {key: json_safe(val) for key, val in item.items()}
+            if isinstance(item, (list, tuple)):
+                return [json_safe(val) for val in item]
+            # Diagnostic records can carry numpy scalar/array values from
+            # optional post-fit metadata.  Convert those without allowing
+            # NaN/Inf to disable the observational sink.
+            if hasattr(item, "tolist"):
+                try:
+                    return json_safe(item.tolist())
+                except Exception:
+                    return None
+            return item
+
+        return json.dumps(json_safe(value), ensure_ascii=False, sort_keys=True,
                           separators=(",", ":"), allow_nan=False)
 
     def _write_csv(self, event: dict) -> None:

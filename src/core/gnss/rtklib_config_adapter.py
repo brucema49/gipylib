@@ -69,6 +69,15 @@ def build_params(gnss_cfg: dict) -> dict:
     params["sig_p0"] = _f(gnss_cfg["sig_p0"])
     params["sig_v0"] = _f(gnss_cfg["sig_v0"])
     params["sig_n0"] = _f(gnss_cfg["sig_n0"])
+    # RTKLIB ambiguity states are cycles.  Keep that legacy default explicit,
+    # while allowing GREAT-compatible configurations to declare the initial
+    # sigma in metres and convert per satellite at the RTK boundary.
+    sig_n0_units = str(gnss_cfg.get("sig_n0_units", "cycles")).strip().lower()
+    if sig_n0_units not in {"cycles", "m", "meter", "metre", "meters", "metres"}:
+        raise ValueError(
+            "gnss.sig_n0_units must be 'cycles' or a metre alias, "
+            f"got '{sig_n0_units}'")
+    params["sig_n0_units"] = sig_n0_units
     params["armode"] = _i(gnss_cfg["armode"])
     params["thresar"] = _f(gnss_cfg["thresar"])
     params["thresar1"] = _f(gnss_cfg["thresar1"])

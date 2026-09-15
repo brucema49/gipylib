@@ -124,11 +124,26 @@ class TransferMatrix:
 
     @staticmethod
     def _read_bias_corr_time(ins_cfg: dict, key: str) -> float:
-        """读取并校验一个零偏 Gauss-Markov 相关时间 (秒)。"""
+        """读取并校验一个零偏 Gauss-Markov 相关时间 (秒)。
+
+        ``+inf`` 表示纯随机游走: 该块在 F 中不施加 -I/τ 阻尼。GREAT-MSF 的
+        ``t_gsins::_tauG/_tauA`` 恒为零向量 (``gins.cpp:32,46`` 只做零初始化,
+        ``set_Ft()`` 直接把它作为对角块写入), 因此 GREAT 的零偏是随机游走而
+        非一阶马尔可夫。缺省仍为历史 36 s, 只影响显式声明 ``inf`` 的配置。
+        """
         value = float(ins_cfg.get(key, _CORR_TIME_BIAS_H * 3600.0))
+        if math.isinf(value):
+            return value
         if not np.isfinite(value) or value <= 0.0:
-            raise ValueError(f"{key} must be a finite positive number")
+            raise ValueError(f"{key} must be a finite positive number or +inf")
         return value
+
+    @staticmethod
+    def _gm_block(tau: float) -> np.ndarray:
+        """一阶 Gauss-Markov 对角块 ``-I/τ``; ``τ=+inf`` 时退化为零 (随机游走)。"""
+        if math.isinf(tau):
+            return np.zeros((3, 3), dtype=np.float64)
+        return -np.eye(3, dtype=np.float64) / tau
 
     def build_F(self, C_b_e: np.ndarray, f_b: np.ndarray,
                 w_b_ib: np.ndarray, pos_e: np.ndarray) -> np.ndarray:
@@ -172,14 +187,17 @@ class TransferMatrix:
         # F_ψψ = -[ω_ie^e×]  (Coriolis)
         F[6:9, 6:9] = -skew(self.w_ie_e)
 
-        # F_ψbg = +C_b_e  (ψ-error: 正号, 对齐 ignav)
+        # F_ψbg = +C_b_e for gipylib's B→E left-multiplicative ψ-error.
+        # GREAT stores the transpose E→B attitude (its corresponding block is
+        # ``-Ceb``); transposing that convention changes both attitude and
+        # velocity-attitude signs, so it must not be copied literally here.
         F[6:9, 9:12] = C_b_e
 
-        # F_bgbg = -I / tau_gyro  (陀螺零偏一阶马尔可夫)
-        F[9:12, 9:12] = -np.eye(3) / self.tau_gyro
+        # F_bgbg = -I / tau_gyro  (陀螺零偏一阶马尔可夫; inf → 随机游走)
+        F[9:12, 9:12] = self._gm_block(self.tau_gyro)
 
-        # F_baba = -I / tau_acce  (加计零偏一阶马尔可夫)
-        F[12:15, 12:15] = -np.eye(3) / self.tau_acce
+        # F_baba = -I / tau_acce  (加计零偏一阶马尔可夫; inf → 随机游走)
+        F[12:15, 12:15] = self._gm_block(self.tau_acce)
 
         if self.si.has_imu_scale():
             # ψ-error convention: scale_true - scale_est makes the nominal
@@ -187,9 +205,9 @@ class TransferMatrix:
             F[3:6, self.si.accel_scale:self.si.accel_scale + 3] = C_b_e @ np.diag(f_b)
             F[6:9, self.si.gyro_scale:self.si.gyro_scale + 3] = C_b_e @ np.diag(w_b_ib)
             F[self.si.gyro_scale:self.si.gyro_scale + 3,
-              self.si.gyro_scale:self.si.gyro_scale + 3] = -np.eye(3) / self.tau_gyro_scale
+              self.si.gyro_scale:self.si.gyro_scale + 3] = self._gm_block(self.tau_gyro_scale)
             F[self.si.accel_scale:self.si.accel_scale + 3,
-              self.si.accel_scale:self.si.accel_scale + 3] = -np.eye(3) / self.tau_acce_scale
+              self.si.accel_scale:self.si.accel_scale + 3] = self._gm_block(self.tau_acce_scale)
 
         # 可选块: F=0 (lever_arm/imu_angle/imu_leverarm/time_sync 均为常数或随机游走)
         return F
@@ -217,17 +235,17 @@ class TransferMatrix:
         F[3:6, 12:15] = C_b_e
         F[6:9, 6:9] = -skew(self.w_ie_e)
         F[6:9, 9:12] = C_b_e
-        F[9:12, 9:12] = -np.eye(3) / self.tau_gyro
-        F[12:15, 12:15] = -np.eye(3) / self.tau_acce
+        F[9:12, 9:12] = self._gm_block(self.tau_gyro)
+        F[12:15, 12:15] = self._gm_block(self.tau_acce)
         if self.si.has_imu_scale():
             if self.si.accel_scale + 3 <= n_ins:
                 F[3:6, self.si.accel_scale:self.si.accel_scale + 3] = C_b_e @ np.diag(f_b)
                 F[self.si.accel_scale:self.si.accel_scale + 3,
-                  self.si.accel_scale:self.si.accel_scale + 3] = -np.eye(3) / self.tau_acce_scale
+                  self.si.accel_scale:self.si.accel_scale + 3] = self._gm_block(self.tau_acce_scale)
             if self.si.gyro_scale + 3 <= n_ins:
                 F[6:9, self.si.gyro_scale:self.si.gyro_scale + 3] = C_b_e @ np.diag(w_b_ib)
                 F[self.si.gyro_scale:self.si.gyro_scale + 3,
-                  self.si.gyro_scale:self.si.gyro_scale + 3] = -np.eye(3) / self.tau_gyro_scale
+                  self.si.gyro_scale:self.si.gyro_scale + 3] = self._gm_block(self.tau_gyro_scale)
         return F
 
     def build_Q_ins(self, dt: float, C_b_e: np.ndarray,

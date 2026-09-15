@@ -94,7 +94,10 @@ def _parse_obs_types_lines(lines: List[str], start_idx: int) -> Tuple[List[str],
 
 
 def _select_signals(sigs: List[str], max_freqs: int,
-                    preferred_freqs: List[int] = None) -> Tuple[List[str], List[Optional[int]]]:
+                    preferred_freqs: List[int] = None,
+                    signal_priority: Dict[int, Dict[str, str]] = None,
+                    preferred_raw_bands: List[int] = None,
+                    ) -> Tuple[List[str], List[Optional[int]]]:
     """从原始信号列表中选择最多 max_freqs 个频点的信号。
 
     Args:
@@ -102,12 +105,16 @@ def _select_signals(sigs: List[str], max_freqs: int,
         max_freqs: 最多保留频点数
         preferred_freqs: 优先保留的频点列表（如 [3, 0] 表示优先保留 B2I, 其次 L1）。
                      若为 None 或优先频点不足 max_freqs 个，则按频点序号补齐。
+        preferred_raw_bands: 可选的字面 RINEX 频段列表。当多个 raw band
+                             折叠到同一个 normalized 频点（如 BDS C6/C8）时，
+                             用它限定实际保留的信号，避免把别的 tracking band
+                             当成目标频段。
 
     返回 (新信号列表, 旧索引→新索引映射，None 表示丢弃)。
     新信号列表按 C-L-D-S 顺序交织排列。
     """
     # 按频点分组
-    freq_groups: Dict[int, Dict[str, str]] = {}  # freq_band → {type_char: sig}
+    freq_groups: Dict[int, Dict[str, List[str]]] = {}
     for i, sig in enumerate(sigs):
         fb = _freq_band(sig)
         if fb == 99:
@@ -117,10 +124,10 @@ def _select_signals(sigs: List[str], max_freqs: int,
             continue
         if fb not in freq_groups:
             freq_groups[fb] = {}
-        # Preserve the legacy header-first choice when several legal signals
-        # advertise the same physical band and observation type.
-        if tc not in freq_groups[fb]:
-            freq_groups[fb][tc] = sig
+        # Preserve all candidates; the default selector below still chooses
+        # the header-first entry, while an explicit GREAT-style attribute
+        # priority can choose a different tracking code.
+        freq_groups[fb].setdefault(tc, []).append(sig)
 
     # 选择频点：优先保留 preferred_freqs 中存在的频点
     available_freqs = set(freq_groups.keys())
@@ -152,8 +159,64 @@ def _select_signals(sigs: List[str], max_freqs: int,
     old_to_new: List[Optional[int]] = [None] * len(sigs)
     for fb in selected_freqs:
         for tc in ["C", "L", "D", "S"]:
-            if tc in freq_groups[fb]:
-                sig = freq_groups[fb][tc]
+            candidates = freq_groups[fb].get(tc, [])
+            if preferred_raw_bands:
+                # A normalized frequency may represent several literal RINEX
+                # bands (notably BDS 6 and 8).  Resolve the target raw band
+                # from the ordered request and keep only that exact band.
+                target_raw = next(
+                    (
+                        raw_band for raw_band in preferred_raw_bands
+                        if any(
+                            len(candidate) >= 2
+                            and candidate[1].isdigit()
+                            and int(candidate[1]) == raw_band
+                            for candidate in candidates
+                        )
+                    ),
+                    None,
+                )
+                if target_raw is None:
+                    candidates = []
+                else:
+                    candidates = [
+                        candidate for candidate in candidates
+                        if len(candidate) >= 2 and candidate[1].isdigit()
+                        and int(candidate[1]) == target_raw
+                    ]
+            if candidates:
+                order = ""
+                if signal_priority:
+                    # ``signal_priority`` is expressed in literal RINEX band
+                    # digits (for example GPS ``1`` or BDS ``6``), while
+                    # ``fb`` is the internal normalized decoder band.  Use
+                    # the candidate's raw digit first so the two namespaces
+                    # cannot be confused; retain a normalized fallback for
+                    # direct callers that already use ``_freq_band`` values.
+                    raw_band = None
+                    for candidate in candidates:
+                        if len(candidate) >= 2 and candidate[1].isdigit():
+                            raw_band = int(candidate[1])
+                            break
+                    entry = signal_priority.get(raw_band)
+                    if entry is None:
+                        entry = signal_priority.get(fb)
+                    if isinstance(entry, dict):
+                        order = str(entry.get({
+                            "C": "code", "L": "phase", "D": "doppler",
+                            "S": "snr",
+                        }[tc], ""))
+                if order:
+                    ranked = [
+                        (order.find(sig[2]), -idx, sig)
+                        for idx, sig in enumerate(candidates)
+                        if len(sig) >= 3 and order.find(sig[2]) >= 0
+                    ]
+                    # GREAT uses the highest-ranked attribute.  The negative
+                    # header index keeps selection deterministic on ties.
+                    sig = max(ranked)[2] if ranked else candidates[0]
+                else:
+                    sig = candidates[0]
                 new_idx = len(new_sigs)
                 new_sigs.append(sig)
                 # 找到原始索引（同频点同类型的第一个）
@@ -208,7 +271,9 @@ def _reorder_obs_line(line: str, old_to_new: List[Optional[int]]) -> str:
 
 def simplify_rinex(input_path: str, output_path: str, max_freqs: int = 2,
                    freq_priority: Dict[str, List[int]] = None,
-                   raw_band_priority: Dict[str, List[int]] = None) -> str:
+                   raw_band_priority: Dict[str, List[int]] = None,
+                   raw_signal_priority: Dict[str, Dict[int, Dict[str, str]]] = None
+                   ) -> str:
     """简化 RINEX 3.02 观测文件。
 
     Args:
@@ -223,6 +288,9 @@ def simplify_rinex(input_path: str, output_path: str, max_freqs: int = 2,
         raw_band_priority: 各系统按 decoder slot 顺序排列的 raw RINEX band
                            列表。传入后在本边界转换为 simplifier 的 normalized
                            频点序号；不能与 freq_priority 同时传入。
+        raw_signal_priority: 可选的 GREAT 风格同频 tracking-attribute 优先级。
+                             键可用 RINEX 系统字母或全名，值为
+                             ``{raw_band: {code: "CPW", phase: "..."}}``。
 
     Returns:
         输出文件路径
@@ -275,7 +343,29 @@ def simplify_rinex(input_path: str, output_path: str, max_freqs: int = 2,
                 preferred = freq_priority.get(
                     sys_char, _DEFAULT_FREQ_PRIORITY.get(sys_char)
                 )
-            new_sigs, old_to_new = _select_signals(sigs, max_freqs, preferred)
+            signal_priority = {}
+            if raw_signal_priority:
+                signal_priority = raw_signal_priority.get(sys_char, {})
+                if not signal_priority:
+                    signal_priority = raw_signal_priority.get({
+                        "G": "GPS", "E": "GAL", "C": "BDS", "R": "GLO",
+                        "J": "QZS",
+                    }[sys_char], {})
+                signal_priority = {
+                    int(band): value for band, value in signal_priority.items()
+                }
+            preferred_raw_bands = None
+            if raw_band_priority:
+                preferred_raw_bands = raw_band_priority.get(sys_char)
+                if preferred_raw_bands is None:
+                    preferred_raw_bands = raw_band_priority.get({
+                        "G": "GPS", "E": "GAL", "C": "BDS", "R": "GLO",
+                        "J": "QZS",
+                    }[sys_char])
+            new_sigs, old_to_new = _select_signals(
+                sigs, max_freqs, preferred, signal_priority,
+                preferred_raw_bands=preferred_raw_bands,
+            )
             sys_sigs[sys_char] = (new_sigs, old_to_new)
             i = next_i
             continue

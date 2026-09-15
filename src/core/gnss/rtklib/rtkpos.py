@@ -115,6 +115,11 @@ def rtkinit(cfg):
     nav.sig_p0 = cfg.sig_p0
     nav.sig_v0 = cfg.sig_v0
     nav.sig_n0 = cfg.sig_n0
+    # Ambiguity states themselves remain in cycles.  ``sig_n0_units`` only
+    # describes the configured prior sigma and enables an explicit metre→cycle
+    # conversion for GREAT-compatible configurations; absent/legacy values
+    # retain the historical cycle semantics.
+    nav.sig_n0_units = getattr(cfg, "sig_n0_units", "cycles")
     
     # solution parameters
     nav.sol = []
@@ -250,6 +255,30 @@ def IB(s, f, na=3):
     return na + uGNSS.MAXSAT * f + s - 1
 
 
+def ambiguity_sigma_cycles(nav, sat, frq):
+    """Return the configured ambiguity prior sigma in carrier cycles.
+
+    RTKLIB's ambiguity states are stored in cycles while GREAT-MSF's
+    ``sig_init_amb`` is specified in metres.  The historical RTKLIB path
+    remains cycle-based unless ``nav.sig_n0_units`` is explicitly ``"m"``;
+    in metre mode the conversion is performed per satellite so GLONASS FDMA
+    wavelengths are handled correctly as well.
+    """
+    sigma = float(getattr(nav, "sig_n0", 30.0))
+    units = str(getattr(nav, "sig_n0_units", "cycles")).strip().lower()
+    if units in {"m", "meter", "metre", "meters", "metres"}:
+        try:
+            freq = float(sat2freq(int(sat), int(frq), nav))
+        except (KeyError, IndexError, TypeError):
+            # Unsupported constellations still have dormant slots in the
+            # fixed MAXSAT state vector; leave those slots in legacy units
+            # until a physical carrier is available.
+            freq = 0.0
+        if freq > 0.0 and np.isfinite(freq):
+            return sigma * freq / rCST.CLIGHT
+    return sigma
+
+
 def varerr(nav, sys, el, f, dt, rcvstd, snr_rover, snr_base):
     """ variation of measurement """
     code = 1 * (f >= nav.nf) # 0 = phase, 1 = code
@@ -299,7 +328,6 @@ def ddres(nav, x, P, yr, er, yu, eu, sat, el, dt, obsr, save_res=False,
     Ri = np.zeros(ny)
     Rj = np.zeros(ny)
     H = np.zeros((nav.nx, ny))
-    P_init = nav.sig_n0**2 # value used to initialize P states
     trace(3,"ddres   : dt=%.4f ns=%d\n" % (dt, ns))
     
     if save_res:
@@ -327,7 +355,8 @@ def ddres(nav, x, P, yr, er, yu, eu, sat, el, dt, obsr, save_res=False,
             for i in i_el[::-1]:
                 ii = IB(sat[i], frq, nav.na)
                 # check if sat just reset
-                if  P[ii,ii] <= nav.sig_n0**2: 
+                sigma_i = ambiguity_sigma_cycles(nav, sat[i], frq)
+                if  P[ii,ii] <= sigma_i**2:
                     break
             else: # check if none without reset
                 i = i_el[0] # use highest sat if none without reset
@@ -367,7 +396,10 @@ def ddres(nav, x, P, yr, er, yu, eu, sat, el, dt, obsr, save_res=False,
                         nav.resc[sat[j]-1,frq] = v[nv]
                 
                 # use larger outlier thresh if just initialized phase
-                thresadj = 10 if (P[ii,ii] >= P_init or P[jj,jj] >= P_init) else 1
+                sigma_i = ambiguity_sigma_cycles(nav, sat[i], frq)
+                sigma_j = ambiguity_sigma_cycles(nav, sat[j], frq)
+                thresadj = 10 if (P[ii,ii] >= sigma_i**2 or
+                                   P[jj,jj] >= sigma_j**2) else 1
                 # if residual too large, flag as outlier
                 if abs(v[nv]) > nav.maxinno[code] * thresadj:
                     nav.vsat[sat[j]-1,frq] = 0
@@ -720,7 +752,6 @@ def detslp_ll(nav, obs, ix, rcv):
     LLI = nav.prev_lli[:,:,rcv]
     
     ixsat = obs.sat[ix] - 1
-    initP = (nav.sig_n0 / 2)**2 # init value for slips
     # ``udbias`` calls this once for the base and once for the rover.  Keep
     # detections from the first receiver while OR-ing the second receiver's
     # LLI flags into the shared epoch mask.
@@ -741,8 +772,9 @@ def detslp_ll(nav, obs, ix, rcv):
         ixslip = np.where((slip[ixsat[ixL],f] & 1) != 0)[0]
         slipsats = ixsat[ixL[ixslip]] + 1
         ib = IB(slipsats, f, nav.na)
-        for i in ib:
-            nav.P[i,i] = max(nav.P[i,i], initP)
+        for sat_i, i in zip(slipsats, ib):
+            sigma_i = ambiguity_sigma_cycles(nav, sat_i, f)
+            nav.P[i, i] = max(nav.P[i, i], (sigma_i / 2.0) ** 2)
         # output results to trace
 
         if len(slipsats) > 0:
@@ -875,7 +907,8 @@ def udbias(nav, obsb, obsr, iu, ir):
                 continue
             # set initial states of phase-bias
             freq = sat2freq(sat[i], f, nav)
-            initx(nav, bias[i], nav.sig_n0**2, j)
+            sigma_i = ambiguity_sigma_cycles(nav, sat[i], f)
+            initx(nav, bias[i], sigma_i**2, j)
             nav.outc[sat[i]-1,f] = 1  # make equal to others set above
             nav.rejc[sat[i]-1,f] = 0
             nav.lock[sat[i]-1,f] = 0

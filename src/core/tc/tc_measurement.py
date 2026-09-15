@@ -29,7 +29,8 @@ from src.core.gnss.rtklib.rtkcmn import (geodist, satazel, ecef2pos,
 from src.core.gnss.rtklib.ephemeris import satposs
 from src.core.gnss.rtklib.pntpos import varerr as spp_varerr, prange, gettgd, REL_HUMI
 from src.core.gnss.rtklib.rtkpos import (
-    zdres, selsat, ddcov, IB, udbias, varerr as rtk_varerr,
+    zdres, selsat, ddcov, IB, udbias, ambiguity_sigma_cycles,
+    varerr as rtk_varerr,
 )
 from src.core.gnss.rtklib import rCST
 from src.core.time_utils import unix_to_gpst
@@ -57,8 +58,10 @@ def validate_tc_postfit(residual: np.ndarray, covariance: np.ndarray,
 
     The TC path bypasses rtklib-py's ``relpos`` wrapper, so it must perform
     this check after the EKF correction and before feeding the correction back
-    into the nominal INS state.  As in ignav, the diagonal of ``R`` is used
-    for the per-residual and chi-square checks.
+    into the nominal INS state.  GREAT's TCRTK path performs a normalized
+    worst-row test and removes/rebuilds an offending satellite; it does not
+    apply a second epoch-wide chi-square rejection.  Keep the same per-row
+    test here and leave satellite-level retry to the integration layer.
     """
     residual = np.asarray(residual, dtype=np.float64).reshape(-1)
     covariance = np.asarray(covariance, dtype=np.float64)
@@ -69,12 +72,10 @@ def validate_tc_postfit(residual: np.ndarray, covariance: np.ndarray,
         return False
     if np.any(residual * residual > (sigma_limit ** 2) * variances):
         return False
-    dof = residual.size - int(n_parameters)
-    if dof <= 0:
-        return True
-    critical = _CHI_SQR_001[min(dof, len(_CHI_SQR_001)) - 1]
-    statistic = float(np.sum(residual * residual / variances))
-    return statistic <= critical
+    # Do not add an epoch-wide chi-square gate: with many correlated DD rows
+    # it rejects epochs that GREAT accepts after its row/satellite retry and
+    # leaves the INS nominal trajectory uncorrected for several seconds.
+    return True
 
 
 def sync_tc_ambiguities_with_rtklib(nav, obsb, obsr, iu, ir, estimator,
@@ -95,7 +96,7 @@ def sync_tc_ambiguities_with_rtklib(nav, obsb, obsr, iu, ir, estimator,
         return copy(obsr.t)
 
     amb_pairs = [
-        (si.amb_idx(s, f), IB(s, f, nav.na))
+        (s, f, si.amb_idx(s, f), IB(s, f, nav.na))
         for f in range(nav.nf)
         for s in range(1, uGNSS.MAXSAT + 1)
     ]
@@ -105,14 +106,15 @@ def sync_tc_ambiguities_with_rtklib(nav, obsb, obsr, iu, ir, estimator,
     #    清零逻辑被自身回写值 defeat, 僵尸永生 (issue/8-22 第12节)。
     effective = estimator.effective_x()
     ptc_diag = np.diag(estimator.P)
-    healthy = {tc_i for tc_i, _ in amb_pairs if 1e-9 < ptc_diag[tc_i] < 5.0e3}
-    for tc_idx, rtk_idx in amb_pairs:
+    healthy = {tc_i for _, _, tc_i, _ in amb_pairs
+               if 1e-9 < ptc_diag[tc_i] < 5.0e3}
+    for _, _, tc_idx, rtk_idx in amb_pairs:
         if tc_idx in healthy:
             nav.x[rtk_idx] = effective[tc_idx]
-    for tc_i, rtk_i in amb_pairs:
+    for _, _, tc_i, rtk_i in amb_pairs:
         if tc_i not in healthy:
             continue
-        for tc_j, rtk_j in amb_pairs:
+        for _, _, tc_j, rtk_j in amb_pairs:
             if tc_j in healthy:
                 nav.P[rtk_i, rtk_j] = estimator.P[tc_i, tc_j]
 
@@ -126,9 +128,8 @@ def sync_tc_ambiguities_with_rtklib(nav, obsb, obsr, iu, ir, estimator,
     # 3. rtklib -> TC.  ``udbias`` may have reset the state to 0 (cycle slip /
     #    outage), in which case the TC slot is cleared and re-seeded from
     #    ``nav.P``; otherwise only the stored value and diagonal are updated.
-    sig_n0_sq = float(getattr(estimator, "_tc_config", {}).get(
-        "gnss", {}).get("sig_n0", 30.0)) ** 2
-    for tc_idx, rtk_idx in amb_pairs:
+    for sat_i, frq_i, tc_idx, rtk_idx in amb_pairs:
+        sig_n0_sq = ambiguity_sigma_cycles(nav, sat_i, frq_i) ** 2
         compact = tc_idx - si.amb_start
         if nav.x[rtk_idx] == 0.0:
             estimator._N_stored[compact] = 0.0
@@ -433,8 +434,21 @@ class _DdBase(TcMeasurement):
         self.elmin = math.radians(gnss.get("elmin", 15.0))
         self.use_phase = True     # RTK=True, RTD=False
         self.use_code = True
+        # GREAT-MSF's strict RAW_MIX observation contract forms code rows
+        # only for satellites that also have a raw phase observation at the
+        # same frequency/epoch.  Keep the historical code-only behaviour by
+        # default; callers opt into the explicit contract in configuration.
+        self.pair_phase_code_rows = bool(gnss.get("pair_phase_code_rows", False))
         # 用于决定 ref sat 的 sig_n0 (与 rtklib ddres 一致)
         self._sig_n0 = float(config.get("gnss", {}).get("sig_n0", 30.0))
+        # GREAT's TCRTK path forms the complete same-epoch DD candidate set,
+        # performs the EKF update, and only then evaluates the normalized
+        # post-fit residual.  Keep the historical RTKLIB pre-fit ``maxinno``
+        # rejection available to legacy callers, but make the ordering an
+        # explicit configuration choice so the GREAT comparison cannot
+        # silently discard rows before the state update.
+        self.prefit_outlier_enable = bool(
+            gnss.get("prefit_outlier_enable", True))
         self._measurement_trace = trace_from(
             sink=trace_sink, callback=trace_callback)
         # This identity is local to one builder/trace stream.  It prevents a
@@ -452,6 +466,7 @@ class _DdBase(TcMeasurement):
         # consulted by the measurement builder.
         self._last_trace_record = None
         self._last_trace_final_emitted = False
+        self._last_retry_builder = None
 
     @staticmethod
     def _trace_state_snapshot(state, si=None, x=None, stage=None, P=None):
@@ -1153,6 +1168,9 @@ class _DdBase(TcMeasurement):
         record["nominal_state"] = deepcopy(snapshot)
         update_record = update
         accepted = bool(update_record.get("accepted", False))
+        excluded_rows = {
+            int(index) for index in update_record.get("excluded_rows", ())
+        }
         if final:
             record["final"] = True
             record["status"] = str(update_record.get("status", "completed"))
@@ -1182,6 +1200,18 @@ class _DdBase(TcMeasurement):
             row["state_stage"] = stage
             index = row.get("row_index")
             if index is None:
+                continue
+            if int(index) in excluded_rows:
+                # Keep the DD identity in the trace, but make the scalar
+                # outlier decision explicit.  It was not part of the final
+                # normal equation and therefore has no valid post-fit value.
+                row["status"] = "rejected_outlier"
+                for key in (
+                    "postfit", "postfit_residual", "postfit_definition",
+                    "postfit_scope", "postfit_available",
+                    "postfit_variance", "postfit_variance_available",
+                ):
+                    row.pop(key, None)
                 continue
             if index < postfit_values.size and np.isfinite(postfit_values[index]):
                 value = float(postfit_values[index])
@@ -1280,7 +1310,7 @@ class _DdBase(TcMeasurement):
         return i_el[0]  # 全 reset 时用最高
 
     def _build_dd(self, nav, x, P, yr, er, yu, eu, sat, el, dt, obsr, si, state,
-                  trace_context=None):
+                  trace_context=None, excluded_sats=None):
         """构造双差 v / H / R (H 为 [m, si.dim])。
 
         与 rtklib ddres 数学等价, 但:
@@ -1297,10 +1327,14 @@ class _DdBase(TcMeasurement):
         Ri_list, Rj_list = [], []
         nb_per_block = []   # ddcov 用
         used_pairs = []     # (i, j, freq, code) 供 info
+        used_row_indices = []  # explicit v-row identity (rejected rows omitted)
         n_phase_att = n_phase_acc = n_phase_rej = 0
         n_code_att = n_code_acc = n_code_rej = 0
         P_diag = np.diag(P) if P is not None else None
-        sig_n0_sq = self._sig_n0 ** 2
+        excluded_sats = {
+            int(value) for value in (excluded_sats or ())
+            if isinstance(value, (int, np.integer)) or str(value).isdigit()
+        }
         self._trace_candidates(trace_context, sat, nav)
 
         # 用于 amb 索引: 当 si.amb_idx 返回 -1 (RTD) 时跳过 ambiguity 列
@@ -1313,6 +1347,11 @@ class _DdBase(TcMeasurement):
                 # 该 sys 内的 sat 索引
                 all_idx = self._sys_idx(sat, sys)
                 idx = all_idx
+                if excluded_sats:
+                    idx = np.asarray(
+                        [value for value in idx
+                         if int(sat[value]) not in excluded_sats],
+                        dtype=int)
                 # 同时要求 yr/yu 非零 (有 base+rover 残差)
                 nozero = np.where((yr[:, f] != 0) & (yu[:, f] != 0))[0]
                 idx = np.intersect1d(idx, nozero)
@@ -1321,13 +1360,31 @@ class _DdBase(TcMeasurement):
                         self._trace_exclusion(
                             trace_context, sat, sys, missing, frq, kind,
                             "missing_observation")
+                if code and self.use_phase and self.pair_phase_code_rows:
+                    # Pairing is based on raw observation availability, not
+                    # on phase innovation acceptance (which remains governed
+                    # by the existing outlier test below).  This preserves
+                    # the mathematical measurement model while matching
+                    # GREAT's phase/code satellite intersection.
+                    phase_nozero = np.where(
+                        (yr[:, frq] != 0) & (yu[:, frq] != 0)
+                    )[0]
+                    paired_missing = np.setdiff1d(
+                        idx, np.intersect1d(idx, phase_nozero)
+                    )
+                    if trace_context is not None:
+                        for missing in paired_missing:
+                            self._trace_exclusion(
+                                trace_context, sat, sys, missing, frq, kind,
+                                "missing_phase_pair")
+                    idx = np.intersect1d(idx, phase_nozero)
                 if len(idx) == 0:
                     continue
                 # 选参考卫星 (最高仰角, 非刚 reset)
                 # 注: RTK 才用 P 判 reset, RTD 无 ambiguity 直接选最高
                 if self._has_amb(si) and P_diag is not None:
                     ref_i = self._pick_ref_with_P(sat, idx, el, si, frq,
-                                                   P_diag, sig_n0_sq, nav)
+                                                   P_diag, nav)
                 else:
                     i_el = idx[np.argsort(el[idx])]
                     ref_i = i_el[-1]
@@ -1401,10 +1458,16 @@ class _DdBase(TcMeasurement):
                         df = (freqi - freqj) / nav.dfreq_glo[frq]
                         v_nv -= df * nav.glo_hwbias
                     # outlier test (与 rtklib 一致, 超阈值的跳过)
-                    thresadj = 10 if (not code and self._has_amb(si) and P_diag is not None
-                                      and (P_diag[self._amb_idx(sat[ref_i], frq, si)] >= sig_n0_sq
-                                           or P_diag[self._amb_idx(sat[j], frq, si)] >= sig_n0_sq)) else 1
-                    if abs(v_nv) > nav.maxinno[code] * thresadj:
+                    sigma_ref_sq = ambiguity_sigma_cycles(
+                        nav, sat[ref_i], frq) ** 2
+                    sigma_target_sq = ambiguity_sigma_cycles(
+                        nav, sat[j], frq) ** 2
+                    thresadj = 10 if (not code and self._has_amb(si)
+                                      and P_diag is not None
+                                      and (P_diag[self._amb_idx(sat[ref_i], frq, si)] >= sigma_ref_sq
+                                           or P_diag[self._amb_idx(sat[j], frq, si)] >= sigma_target_sq)) else 1
+                    if (self.prefit_outlier_enable
+                            and abs(v_nv) > nav.maxinno[code] * thresadj):
                         # 维护 vsat/rejc, 供 udbias 的失锁计数 (outc) 使用 (与 ddres 一致)
                         nav.vsat[sat[j] - 1, frq] = 0
                         nav.rejc[sat[j] - 1, frq] += 1
@@ -1456,6 +1519,7 @@ class _DdBase(TcMeasurement):
                     Ri_list.append(Ri)
                     Rj_list.append(Rj)
                     used_pairs.append((int(sat[ref_i]), int(sat[j]), frq, code))
+                    used_row_indices.append(len(v_list) - 1)
                     if trace_context is not None:
                         trace_context["dd_keys"].append({
                             "ref": int(sat[ref_i]),
@@ -1516,7 +1580,8 @@ class _DdBase(TcMeasurement):
                         "status": block_status,
                         "off_diagonal": "reference_variance",
                     })
-        info = {"pairs": used_pairs, "n": len(v_list),
+        info = {"pairs": used_pairs, "row_indices": used_row_indices,
+                "n": len(v_list),
                 "ref_sats": sorted({p[0] for p in used_pairs}),
                 "n_phase_att": n_phase_att, "n_phase_acc": n_phase_acc,
                 "n_phase_rej": n_phase_rej,
@@ -1530,6 +1595,10 @@ class _DdBase(TcMeasurement):
         # ddcov 构造 R
         R = ddcov(np.array(nb_per_block), len(nb_per_block),
                   np.array(Ri_list), np.array(Rj_list), len(v_list))
+        if R.shape != (len(v_list), len(v_list)):
+            raise RuntimeError(
+                f"DD covariance shape mismatch: rows={len(v_list)} "
+                f"blocks={nb_per_block} R={R.shape}")
         info["n"] = len(v)
         return v, H, R, info
 
@@ -1543,14 +1612,19 @@ class _DdBase(TcMeasurement):
                 idx.append(k)
         return np.array(idx, dtype=int)
 
-    def _pick_ref_with_P(self, sat, idx, el, si, frq, P_diag, sig_n0_sq, nav):
+    def _pick_ref_with_P(self, sat, idx, el, si, frq, P_diag, nav):
         """与 rtklib ddres 选 ref sat 一致: 高仰角优先 + 非刚 reset。"""
         i_el = idx[np.argsort(el[idx])]
         for i in i_el[::-1]:
             ii_amb = self._amb_idx(sat[i], frq, si)
-            if ii_amb < 0 or P_diag[ii_amb] <= sig_n0_sq:
+            sigma_i_sq = ambiguity_sigma_cycles(nav, sat[i], frq) ** 2
+            if ii_amb < 0 or P_diag[ii_amb] <= sigma_i_sq:
                 return i
-        return i_el[0]
+        # If every ambiguity is still in the reset/large-variance state,
+        # retain the same highest-elevation fallback used by GREAT.  Returning
+        # the lowest-elevation element here changes the DD reference exactly
+        # at ambiguity re-initialisation and can create a large state jump.
+        return i_el[-1]
 
 
 class RtkTcMeas(_DdBase):
@@ -1664,6 +1738,24 @@ class RtkTcMeas(_DdBase):
         save_tc_phase_state(nav, obsb, obsr, iu, ir)
         self._trace_finish(trace_context, v, H, nav, si,
                            amb_init_target=amb_init_target, R=R, P=P)
+        # GREAT can remove a complete satellite after a posterior residual
+        # test and rebuild the same-epoch equations.  Freeze only the
+        # geometry/observation arrays here; the retry supplies the current
+        # effective ambiguity state and covariance, then re-enters
+        # ``_build_dd`` so the reference satellite and DD covariance are
+        # selected afresh.  No ambiguity synchronization is repeated.
+        self._last_retry_builder = None
+        if obsb is not None:
+            def _rebuild(excluded_sats, x_retry=None, P_retry=None):
+                x_local = np.asarray(
+                    x if x_retry is None else x_retry,
+                    dtype=np.float64).copy()
+                P_local = P if P_retry is None else P_retry
+                return self._build_dd(
+                    nav, x_local, P_local, yr, er, yu, eu, sats, els, dt,
+                    obsr, si, state, trace_context=None,
+                    excluded_sats=excluded_sats)
+            self._last_retry_builder = _rebuild
         return v, H, R, info
 
 

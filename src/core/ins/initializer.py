@@ -488,14 +488,18 @@ class InsInitializer:
         att_std = np.array(ins_cfg.get("initial_att_std_si",
                                        [0.00524, 0.00524, 0.00524]),
                            dtype=np.float64)
-        # yaw 不确定度按对准模式调整: roll/pitch 由加速度计调平 (config 值合理),
-        # yaw 在静态对准不可观测 (pi rad), 动态对准取决于 GNSS 精度
-        if mode == InitMode.STATIC:
-            att_std[2] = math.pi          # yaw 完全未知
-        elif mode == InitMode.VELOCITY_VECTOR:
-            att_std[2] = 0.3              # ~17 deg (GNSS 速度精度依赖)
-        elif mode == InitMode.POSITION_DIFF:
-            att_std[2] = 1.0              # ~57 deg (位置差分精度差)
+        # An explicit per-axis attitude STD is authoritative.  The previous
+        # implementation overwrote configured yaw uncertainty for every
+        # alignment mode (POSITION_DIFF became 1 rad), which made TC P
+        # inconsistent with GREAT's sensor-model initialization.  Retain the
+        # mode-dependent defaults only for callers that omit the field.
+        if "initial_att_std_si" not in ins_cfg:
+            if mode == InitMode.STATIC:
+                att_std[2] = math.pi          # yaw 完全未知
+            elif mode == InitMode.VELOCITY_VECTOR:
+                att_std[2] = 0.3              # ~17 deg (GNSS 速度精度依赖)
+            elif mode == InitMode.POSITION_DIFF:
+                att_std[2] = 1.0              # ~57 deg (位置差分精度差)
         gyro_bias_std = np.array(ins_cfg.get("gyro_bias_std_si",
                                              [2.424e-5, 2.424e-5, 2.424e-5]),
                                  dtype=np.float64)

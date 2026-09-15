@@ -38,6 +38,9 @@ class TcGnssSensor(Thread):
         # reader slice; resolving it here makes invalid configuration fail
         # before the sensor thread starts.
         self.resolved_raw_band_priority = resolve_raw_band_priority(self.gnss_cfg)
+        # GREAT RAW_MIX-compatible tracking-attribute order.  Keys are raw
+        # RINEX band digits, deliberately separate from legacy ``freq_ix``.
+        self.raw_signal_priority = self.gnss_cfg.get("raw_signal_priority", {})
 
     def run(self):
         try:
@@ -69,6 +72,7 @@ class TcGnssSensor(Thread):
             path,
             tmp.name,
             raw_band_priority=self.resolved_raw_band_priority,
+            raw_signal_priority=self.raw_signal_priority,
         )
         self._temp_files.append(tmp.name)
         return tmp.name
