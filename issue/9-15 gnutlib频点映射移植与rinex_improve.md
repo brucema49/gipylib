@@ -198,7 +198,39 @@ pytest -q --ignore=tests/test_matrix_compare.py
    `remove_sat: ["C01"]` 只解决了 GEO 故障历元。
 4. C40（10 行、+223 m）与瞬时多路径大残差（0.295%）仍由 `maxcode` 门限兜住。
 
-## 9. 工作记录
+## 9. 全量配置更新与四条链路实跑（第三轮）
+
+**更新范围**：主工作区全部 21 个配置（`phone/*`、`data/*`、`data-great/*`、
+`Data19_20201214_HG4930_CAR_Opensky/*`），统一为新 schema：
+
+1. `remove_sat: ["C01"]`（原 `excsats` 重命名/补齐，现已在适配层转卫星号真正生效）；
+2. 显式 `raw_band_priority` 固化——**由 `freq_table[freq_ix]` 的频率值反解 raw band**
+   （gnutlib 频率表），而不是沿用 `LEGACY_FREQ_BAND_METADATA`。这一步修掉了 Data19
+   的历史不一致：其 `freq_table[6]=1.561098 GHz`（B1I），而 legacy 表把 ix 6 解析成
+   B3I；反解结果 GPS `[1,2]` / BDS `[2,7]` / GAL `[1,5]` / GLO `[1,2]`，与该数据集
+   频率表语义一致。`phone/rtd.yaml` 例外：BDS 与基站仅 1 个共同波段（< `nf=2` 的
+   长度校验），保持自动方案并在配置里注明。
+3. 清理被 loader 明确禁止的键：Data19 的 `ins` 段废弃键
+   （`pos_diff_vel_max_std`/`rtk_float_pos_std`）与 `*-tc` 配置中的松组合专属键
+   （`pos_psd`/`vel_psd`/`pos_diff_vel_std`/`innov_reject_*`）——两者均无消费点，
+   删除后 **21/21 配置可加载**（此前 4 个 TC 配置无法加载）。
+
+未改动：`Data19_*/bds_diagnosis/results/*`（诊断脚本生成的产物配置）、
+`.worktrees/*`（其他分支）、`library/pyrinex`、`tools/KF-GINS/config`、`tests/fixtures`。
+
+**四条链路实跑**（同一份代码与配置）：
+
+| 配置 | 运行时长 | 产物 | 指标 |
+|---|---|---|---|
+| `phone/rtdtc.yaml` | 250.2 s | `phone/output/RTDTC.rslt`（Qins: 2→498733 / 3→4986） | Qins=3 水平 **4.180 m**、3D 9.237 m |
+| `data-great/rtktc-increment.yaml` | 79.1 s | `data-great/output/rtktc-increment/nav-100hz.csv` | truth-left 3D **1.272 m**（B3I + 剔除 C01） |
+| `data-great/rtktc-rate.yaml` | 78.6 s | `data-great/output/rtktc-rate/nav-100hz.csv` | truth-left 3D **1.272 m** |
+| `data/rtk-ins紧组合.yaml` | 109.5 s | `data/output/RTKINS.rslt`（173492 行，Qins=3 → 1708） | 正常收敛，无解算异常 |
+
+四条链路均未出现 `ObservationMappingError`/KeyError，说明自动方案、显式手动映射、
+`remove_sat` 三类输入在 rinex_improve 下都自洽。
+
+## 10. 工作记录
 
 - 2026-09-15 — [gipylib `dev-ubuntu`] 完成 gnutlib 移植（`gnss.py`/`gsys.py`/`rinexo3.py`）、
   `rinex_improve.py`（自动方案 + 频率派生 + 两条数据自检）、两个传感器与配置适配器改造、
@@ -223,3 +255,11 @@ pytest -q --ignore=tests/test_matrix_compare.py
   4. campus01 全变体重测 + 更正旧记录（见第 6 节）：0.548 m 不可复现，旧链路 1.145 m；
      自动 B1I 1.123 m 为当前最优，手动 B3I + `remove_sat:["C01"]` 1.272 m。全量测试
      684 passed / 7 failed（7 项均为改动前既有）。
+- 2026-09-16（第三轮，按用户反馈）：
+  1. 全量 21 个配置统一 schema：按**频率值反解**固化显式 `raw_band_priority`
+     （修掉 Data19 `freq_table[6]`=B1I 却被 legacy 表解析成 B3I 的历史不一致），
+     `remove_sat: ["C01"]` 补齐/去重；`phone/rtd.yaml` 因 BDS 共同波段数 < nf 保持自动。
+  2. 清理禁止键（Data19 `ins` 废弃键、TC 配置里的松组合专属键）→ 21/21 可加载。
+  3. 实跑 4 条链路（phone TC、campus01 rate/increment、data RTK-INS TC）均正常收敛，
+     指标见第 9 节。
+  4. 类型现代化补充：`Optional[X]` → `X | None`、补齐缺失参数注解，新文件 lint 清零。
