@@ -48,7 +48,11 @@ from src.core.ins.interpolator import (
 from src.core.ins.lc_integration import _DecimationCounter
 from src.core.ins.static_detect import StaticDetect
 from src.core.time_utils import unix_to_gpst
-from src.core.tc.tc_ambiguity import TcAmbiguity
+from src.core.tc.tc_ambiguity import (
+    GREAT_MAXDEV_CYCLES,
+    GREAT_MAXSIG_CYCLES,
+    TcAmbiguity,
+)
 from src.core.tc.tc_degrade import TcDegradeManager
 from src.core.tc.tc_estimator import TcEstimator
 from src.core.tc.tc_measurement import SppTcMeas, RtkTcMeas, RtdTcMeas
@@ -155,9 +159,27 @@ class TcIntegration:
             fail_threshold=tc_cfg.get("fail_threshold", 3),
             reboot_threshold=tc_cfg.get("reboot_threshold", 30.0))
 
-        # 模糊度 (RTK 才用)
+        # 模糊度 (RTK 才用)。参数对齐 GREAT gsetamb 与 rtklib manage_amb_LAMBDA:
+        #   thresar   <- gnss.thresar      (GREAT <ratio> 3.0)
+        #   thresar_var <- gnss.thresar1   (rtklib 位置方差门限)
+        #   min_amb   <- gnss.minfixsats-1 (GREAT full_fix_num=3 / rtklib nb>=3)
+        #   min_common_epochs <- gnss.minlock (GREAT min_common_time=30 s → 历元)
+        #   part_fix  <- gnss.ar_part_fix  (GREAT part_fix, 默认关)
+        gnss_cfg = config.get("gnss", {}) or {}
         self._ambiguity = TcAmbiguity(
-            thresar=float(config.get("gnss", {}).get("thresar", 3.0)))
+            thresar=float(gnss_cfg.get("thresar", 3.0)),
+            thresar_var=float(gnss_cfg.get("thresar1", 0.5)),
+            hold_count=int(gnss_cfg.get("minfix", 10)),
+            min_amb=int(gnss_cfg.get("minfixsats", 4)) - 1,
+            min_common_epochs=int(gnss_cfg.get("minlock", 0)),
+            part_fix=bool(gnss_cfg.get("ar_part_fix", False)),
+            part_min_amb=int(gnss_cfg.get("part_fix_num", 2)),
+            # GREAT widelane/narrowlane_decision 门限: 整型性判决
+            # (max|浮点−整数| <= maxdev 周 且 max sigma <= maxsig 周)。
+            # 默认取 GREAT 值; 协方差偏保守时可临时放宽 ar_maxsig 做归因。
+            maxdev=float(gnss_cfg.get("ar_maxdev", GREAT_MAXDEV_CYCLES)),
+            maxsig=float(gnss_cfg.get("ar_maxsig", GREAT_MAXSIG_CYCLES)),
+        )
 
         # 估计器 + 量测构造器 (初始化后创建)
         self._est: Optional[TcEstimator] = None
@@ -2516,7 +2538,10 @@ class TcIntegration:
         ref_sat = max(cnt, key=cnt.get)
         ref_frq = next(p[2] for p in healthy if p[0] == ref_sat)
 
-        dds = []  # (j_sat, j_frq, sign): y = N_ref − sign*N_j
+        # DD 定义统一为 y = N_ref − N_j (与下方 Q_dd 的协方差定义一致)。
+        # 参考星出现在两位时方向不同, 但 DD 值本身不随方向变号——原先按
+        # sign 变号会与 Q_dd 不一致并产生错误整数 (实测 +2.2 m 高程常偏)。
+        dds = []  # (j_sat, j_frq, orientation): +1=参考星在首位, -1=在第二位
         for p in healthy:
             if p[0] == ref_sat and p[2] == ref_frq:
                 dds.append((p[1], p[2], 1.0))
@@ -2531,9 +2556,9 @@ class TcIntegration:
         nb = len(dds)
         y_dd = np.zeros(nb)
         Q_dd = np.zeros((nb, nb))
-        for k, (ks, kf, kg) in enumerate(dds):
+        for k, (ks, kf, _orient) in enumerate(dds):
             ki = _nav_ib(ks, kf)
-            y_dd[k] = nav.x[r_i] - kg * nav.x[ki]
+            y_dd[k] = nav.x[r_i] - nav.x[ki]
             # Q[k,m] = Var(N_r − N_k 与 N_r − N_m 的协方差)
             #        = Q[r,r] − Q[r,m'] − Q[k',r] + Q[k',m']
             for m, (ms, mf, mg) in enumerate(dds):
@@ -2541,24 +2566,39 @@ class TcIntegration:
                 Q_dd[k, m] = (nav.P[r_i, r_i] - nav.P[r_i, mi]
                               - nav.P[ki, r_i] + nav.P[ki, mi])
 
+        # 卫星连续参与历元数 (GREAT _lock_epo_num): 本历元未出现的卫星清零
+        self._ambiguity.update_lock(seen_sat)
+
         posvar = float(np.mean(np.diag(
             self._est.P[si.pos:si.pos + 3, si.pos:si.pos + 3])))
-        fixed_dd, ratio, ok = self._ambiguity.try_fix(y_dd, Q_dd, posvar)
+        sat_pairs = [(ref_sat, js) for (js, _jf, _sg) in dds]
+        fixed_dd, ratio, ok = self._ambiguity.try_fix(
+            y_dd, Q_dd, posvar, sat_pairs=sat_pairs)
         if not ok:
             self._amb_fixed = False
+            logger.debug(
+                f"TC amb rejected: nb={nb}, ratio={ratio:.2f}, maxdev="
+                f"{self._ambiguity.last_maxdev}, maxsig="
+                f"{self._ambiguity.last_maxsig}, posvar={posvar:.3f}")
             return
 
         # restamb 写回: 基准星保持浮点; 其余 = 基准浮点值 − DD 整数 (TC+nav 双写)
+        # 部分固定时未通过的分量为 NaN, 保持浮点不写回
         n_ref = float(nav.x[r_i])
         fixed_slots = []
-        for k, (js, jf, sg) in enumerate(dds):
-            new_n = n_ref - sg * fixed_dd[k]
+        for k, (js, jf, _orient) in enumerate(dds):
+            if not np.isfinite(fixed_dd[k]):
+                continue
+            new_n = n_ref - fixed_dd[k]
             tc_idx = si.amb_idx(js, jf)
             compact = tc_idx - si.amb_start
             self._est._N_stored[compact] = new_n
             self._est.x[tc_idx] = 0.0
             nav.x[_nav_ib(js, jf)] = new_n
             fixed_slots.append(tc_idx)
+        if not fixed_slots:
+            self._amb_fixed = False
+            return
 
         # ignav 风格 holdamb: 仅对本次实际固定的槽位添加约束量测
         # v[k]=0 (已写回整数), joseph_update(v=0,H,R) 不改变状态但收缩 P,
@@ -2576,6 +2616,11 @@ class TcIntegration:
         logger.info(
             f"TC amb fixed: ratio={ratio:.2f}, nb={nb}, "
             f"n_const={n_const}, holdamb R={VAR_HOLDAMB}")
+        logger.debug(
+            f"TC amb diag: ratio={ratio:.2f}, nb={nb}, partial="
+            f"{self._ambiguity.last_partial}, maxdev="
+            f"{self._ambiguity.last_maxdev}, maxsig="
+            f"{self._ambiguity.last_maxsig}")
         self._amb_fixed = True
 
     # ===== 约束 =====

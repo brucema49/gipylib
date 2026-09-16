@@ -621,14 +621,26 @@ def improve_rinex(input_path: str, output_path: str,
                 f.write(line)
                 header_end_idx = idx
                 break
-            if label.startswith("SYS / # / OBS TYPES") and line[0] in sys_selected:
+            if label.startswith("SYS / # / OBS TYPES") and line[0] != " ":
                 sys_char = line[0]
-                for out_line in _format_obs_types_line(sys_char,
-                                                       sys_selected[sys_char]):
-                    f.write(out_line + "\n")
-                # 跳过续行
-                nsig = int(line[3:6])
-                skip_until_cont = max(0, (nsig - 1) // _SIGS_PER_HEADER_LINE)
+                try:
+                    nsig = int(line[3:6])
+                except ValueError:
+                    nsig = 0
+                n_cont = max(0, -(-max(nsig - _SIGS_PER_HEADER_LINE, 0)
+                                  // _SIGS_PER_HEADER_LINE))
+                if sys_char in sys_selected:
+                    for out_line in _format_obs_types_line(
+                            sys_char, sys_selected[sys_char]):
+                        f.write(out_line + "\n")
+                elif wanted is None:
+                    # 未指定 gnss_t: 原样保留（含续行）
+                    f.write(line)
+                    continue
+                # 其余情况（gnss_t 已指定但该系统不在列表内）: 连同续行丢弃。
+                # 必须丢弃——pyrinrx 解码器每系统最多解析 26 个观测码, 保留
+                # 声明 28 个观测码的系统（如 WUH2 基站的 C）会越界崩溃。
+                skip_until_cont = n_cont
                 continue
             if skip_until_cont > 0 and label.startswith("SYS / # / OBS TYPES"):
                 skip_until_cont -= 1
@@ -637,16 +649,9 @@ def improve_rinex(input_path: str, output_path: str,
                 continue  # 比例因子已烤入数值
             f.write(line)
 
-        # 数据行改写
-        for line in lines[header_end_idx + 1:]:
-            if not line.strip() or line[0] == ">":
-                f.write(line if line.endswith("\n") else line + "\n")
-                continue
+        def _rewrite_row(line: str) -> str:
+            """按选择的信号表重写一条卫星观测行。"""
             sys_char = line[0]
-            if sys_char not in sys_selected:
-                # 未选择信号的系统原样保留（解码器按 gnss_t 自行跳过）
-                f.write(line)
-                continue
             old_codes = sys_old_codes[sys_char]
             new_codes = sys_selected[sys_char]
             old_to_new: list[int | None] = [None] * len(old_codes)
@@ -677,7 +682,33 @@ def improve_rinex(input_path: str, output_path: str,
                     except (ValueError, IndexError):
                         pass
                 new_fields[new_i] = field.ljust(_FIELD_WIDTH)
-            f.write(line[:_LINE_HEADER_LEN] + "".join(new_fields) + "\n")
+            return line[:_LINE_HEADER_LEN] + "".join(new_fields) + "\n"
+
+        # 数据段按历元块处理: 丢弃卫星时同步修正历元行的卫星计数
+        idx = header_end_idx + 1
+        while idx < len(lines):
+            line = lines[idx]
+            if not line.strip():
+                f.write(line if line.endswith("\n") else line + "\n")
+                idx += 1
+                continue
+            if line[0] != ">":
+                idx += 1
+                continue
+            try:
+                nsat = int(line[32:35])
+            except ValueError:
+                nsat = 0
+            block = lines[idx + 1: idx + 1 + nsat]
+            if wanted is not None:
+                # gnss_t 已指定: 只保留被选中系统的卫星行, 并修正卫星数
+                block = [row for row in block
+                         if row.strip() and row[0] in sys_selected]
+                line = f"{line[:32]}{len(block):3d}{line[35:]}"
+            f.write(line if line.endswith("\n") else line + "\n")
+            for row in block:
+                f.write(_rewrite_row(row))
+            idx += 1 + nsat
 
     return str(out_path)
 
