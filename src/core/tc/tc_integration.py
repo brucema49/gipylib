@@ -1430,16 +1430,19 @@ class TcIntegration:
         spp_epoch_sow = None
         relpos_epoch_sow = None
 
-        # SPP 粗定位 (GPS-only 避免 BDS/GAL 时间系统偏差导致发散)
+        # SPP 粗定位: 与配置同步的多系统 (gnss_t) 纯 GNSS 解算。
+        # 多系统 SPP 由 pntpos 的 GPS 基准钟差 + GLO/GAL/BDS 系统间偏差状态
+        # 吸收时间系统偏差; 这样非 GPS 星座的 ISB 初值可直接用于 TC 钟差状态。
         try:
             from src.core.gnss.rtklib.ephemeris import satposs
-            from src.core.gnss.rtklib.pntpos import estpos
-            from src.core.tc.tc_stream import _filter_gps_svh
+            from src.core.tc.tc_stream import (
+                estpos_for_init, resolve_gnss_systems)
+            init_systems = resolve_gnss_systems(nav, self._cfg)
             rs, var, dts, svh = satposs(obsr, nav)
-            svh_gps = _filter_gps_svh(obsr, svh)
             if np.any(nav.rb):
                 nav.x[0:3] = nav.rb
-            sol, x_spp = estpos(obsr, nav, rs[:, :3], dts, svh_gps)
+            sol, x_spp = estpos_for_init(
+                obsr, nav, rs[:, :3], dts, svh, init_systems)
             if provenance_enabled:
                 spp_epoch_sow = self._explicit_solution_sow(sol)
             if not sol.stat:
@@ -1459,7 +1462,9 @@ class TcIntegration:
         if self._mode in ("rtk", "rtd") and obsb is not None:
             try:
                 from src.core.gnss.rtklib.rtkpos import relpos
-                from src.core.gnss.rtklib.rtkcmn import Sol, SOLQ_NONE
+                from src.core.gnss.rtklib.rtkcmn import Sol, SOLQ_NONE, uGNSS
+                from src.core.gnss.rtklib.pntpos import estpos
+                from src.core.tc.tc_stream import _filter_gps_svh
                 nav.x[0:6] = sol.rr[0:6]
                 nav.x[6:9] = 1e-6
                 rtk_sol = Sol()
@@ -1472,7 +1477,30 @@ class TcIntegration:
                     # 仅 RTK 保留 SPP 一致性检验以拦截载波 false fix。RTD
                     # 是码双差定位，必须使用其相对位置初始化而非被 SPP 阈值否决。
                     pos_diff = float(np.linalg.norm(rtk_rr - x_spp[:3]))
-                    if self._mode == "rtk" and pos_diff > 50.0:
+                    if (self._mode == "rtk" and pos_diff > 50.0
+                            and init_systems != {uGNSS.GPS}):
+                        # 多系统 SPP 在个别数据集上可能因非 GPS 星历/观测问题
+                        # 而远离真值; 用 GPS-only SPP 复核, 通过则仍可初始化,
+                        # 保证不劣于历史的 GPS-only 初始化基线。
+                        sol_g, x_g = estpos(
+                            obsr, nav, rs[:, :3], dts, _filter_gps_svh(obsr, svh))
+                        diff_g = (float(np.linalg.norm(rtk_rr - x_g[:3]))
+                                  if sol_g.stat else float("inf"))
+                        if diff_g <= 50.0:
+                            logger.warning(
+                                f"TC init SPP fallback: multi-constellation SPP "
+                                f"diff {pos_diff:.2f}m > 50m, GPS-only SPP "
+                                f"diff {diff_g:.2f}m, use GPS-only (t={t_gnss:.1f})")
+                            sol, x_spp = sol_g, x_g
+                        else:
+                            logger.warning(
+                                f"TC init reject: RTK-SPP pos diff {pos_diff:.2f}m "
+                                f"> 50m (GPS-only retry {diff_g:.2f}m) "
+                                f"(t={t_gnss:.1f}, q={rtk_sol.stat}), skip init")
+                            self._restore_nav(nav, saved_x, saved_P,
+                                              saved_fix, saved_lock)
+                            return
+                    elif self._mode == "rtk" and pos_diff > 50.0:
                         logger.warning(
                             f"TC init reject: RTK-SPP pos diff {pos_diff:.2f}m > 50m "
                             f"(t={t_gnss:.1f}, q={rtk_sol.stat}), skip init")
@@ -2304,8 +2332,7 @@ class TcIntegration:
         不更新速度/姿态/钟差/模糊度 (H 对应列为 0)。
         """
         from src.core.gnss.rtklib.ephemeris import satposs
-        from src.core.gnss.rtklib.pntpos import estpos
-        from src.core.tc.tc_stream import _filter_gps_svh
+        from src.core.tc.tc_stream import estpos_for_init, resolve_gnss_systems
 
         saved_x = nav.x.copy()
         saved_P = nav.P.copy()
@@ -2313,10 +2340,11 @@ class TcIntegration:
         saved_lock = nav.lock.copy() if hasattr(nav, 'lock') else None
         try:
             rs, var, dts, svh = satposs(obsr, nav)
-            svh_gps = _filter_gps_svh(obsr, svh)
             if np.any(nav.rb):
                 nav.x[0:3] = nav.rb
-            sol, x_spp = estpos(obsr, nav, rs[:, :3], dts, svh_gps)
+            sol, x_spp = estpos_for_init(
+                obsr, nav, rs[:, :3], dts, svh,
+                resolve_gnss_systems(nav, self._cfg))
             if not sol.stat:
                 self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
                 return False
@@ -2382,8 +2410,7 @@ class TcIntegration:
             True 恢复成功, False 失败
         """
         from src.core.gnss.rtklib.ephemeris import satposs
-        from src.core.gnss.rtklib.pntpos import estpos
-        from src.core.tc.tc_stream import _filter_gps_svh
+        from src.core.tc.tc_stream import estpos_for_init, resolve_gnss_systems
 
         saved_x = nav.x.copy()
         saved_P = nav.P.copy()
@@ -2391,10 +2418,11 @@ class TcIntegration:
         saved_lock = nav.lock.copy() if hasattr(nav, 'lock') else None
         try:
             rs, var, dts, svh = satposs(obsr, nav)
-            svh_gps = _filter_gps_svh(obsr, svh)
             if np.any(nav.rb):
                 nav.x[0:3] = nav.rb
-            sol, x_spp = estpos(obsr, nav, rs[:, :3], dts, svh_gps)
+            sol, x_spp = estpos_for_init(
+                obsr, nav, rs[:, :3], dts, svh,
+                resolve_gnss_systems(nav, self._cfg))
             if not sol.stat:
                 self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
                 logger.warning(
@@ -2668,27 +2696,27 @@ class TcIntegration:
         """未初始化时输出纯 GNSS 解 (Qins=0, 速度=0, 姿态=0)。
 
         根据 self._mode 选择解算方式:
-          - spp: SPP 单点定位 (GPS-only 避免 BDS/GAL 时间偏差发散)
-          - rtk/rtd: relpos 双差解算
+          - spp: SPP 单点定位 (使用配置 gnss_t 声明的星座)
+          - rtk/rtd: relpos 双差解算 (配置的多系统双频)
         输出频率为 GNSS 频率 (1Hz)。
         """
         if self._writer is None:
             return
 
-        # SPP 粗定位 (GPS-only, 保存/恢复 nav 状态)
-        from src.core.tc.tc_stream import _filter_gps_svh
+        # SPP 粗定位 (与配置同步的多系统, 保存/恢复 nav 状态)
+        from src.core.tc.tc_stream import estpos_for_init, resolve_gnss_systems
         saved_x = nav.x.copy()
         saved_P = nav.P.copy()
         saved_fix = nav.fix.copy() if hasattr(nav, 'fix') else None
         saved_lock = nav.lock.copy() if hasattr(nav, 'lock') else None
         try:
             from src.core.gnss.rtklib.ephemeris import satposs
-            from src.core.gnss.rtklib.pntpos import estpos
             rs, var, dts, svh = satposs(obsr, nav)
-            svh_gps = _filter_gps_svh(obsr, svh)
             if np.any(nav.rb):
                 nav.x[0:3] = nav.rb
-            sol, x_spp = estpos(obsr, nav, rs[:, :3], dts, svh_gps)
+            sol, x_spp = estpos_for_init(
+                obsr, nav, rs[:, :3], dts, svh,
+                resolve_gnss_systems(nav, self._cfg))
             if not sol.stat:
                 self._restore_nav(nav, saved_x, saved_P, saved_fix, saved_lock)
                 return

@@ -227,10 +227,9 @@ class SppTcMeas(TcMeasurement):
         h(est) = r + dtr_est - c*dts + dion + dtrp
         其中 dtr_est = effective_x[clk_bias + sys_off] (stored + ε_clk)。
 
-        注: 仅使用 GPS 卫星, 与 GPS-only SPP 初始化 (tc_integration._try_init 中
-        _filter_gps_svh) 一致。rtklib-py 不能正确处理本数据集 BDS/GAL 观测
-        (BDS 周数 +1356 修复后残差仍 ~km 量级), inter-system bias 状态虽建模
-        但初始化未估计, 残差会拉偏位置导致发散。
+        注: 参与量测的星座由配置 gnss_t 决定 (经 rinex_improve 简化后观测里
+        只保留配置声明的星座)。GLO/GAL/BDS 的 inter-system bias 由
+        clk_bias 块的独立状态估计, 初值来自初始化时同星座的 SPP 解。
         """
         rr = state.pos_e
         vr = state.vel_e

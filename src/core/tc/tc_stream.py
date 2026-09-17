@@ -28,19 +28,89 @@ from src.log.tc_measurement_trace import TcMeasurementTraceWriter
 logger = logging.getLogger(__name__)
 
 
+_SYSTEM_NAME_TO_UGNSS = {
+    "GPS": uGNSS.GPS,
+    "GLO": uGNSS.GLO,
+    "GAL": uGNSS.GAL,
+    "BDS": uGNSS.BDS,
+    "QZS": uGNSS.QZS,
+}
+
+
+def resolve_gnss_systems(nav=None, config=None):
+    """解析"配置要求参与解算"的星座集合 (uGNSS 枚举 set)。
+
+    初始化阶段的纯 GNSS 解算 (SPP 粗定位 + relpos 相对定位) 必须与组合导航
+    配置里声明的多系统双频方案保持同步, 而不是固定退化成 GPS-only。
+
+    优先级:
+      1. ``nav.gnss_t`` —— rtkinit 从配置注入, 且已被 ``resolve_stream_plan``
+         按 rover/base 实际共同观测裁剪, 是运行期唯一权威来源;
+      2. ``config["gnss"]["gnss_t"]`` —— 字符串名列表 (nav 未就绪时的回退);
+      3. ``{uGNSS.GPS}`` —— 历史默认行为。
+
+    解析为空集合时同样回退到 GPS, 保证 estpos 至少有可用量测。
+    """
+    systems = set()
+    gnss_t = getattr(nav, "gnss_t", None)
+    if gnss_t:
+        for entry in gnss_t:
+            try:
+                systems.add(int(entry))
+            except (TypeError, ValueError):
+                continue
+    if not systems and config:
+        gnss_cfg = config.get("gnss", {}) if isinstance(config, dict) else {}
+        for name in (gnss_cfg.get("gnss_t") or []):
+            sys_id = _SYSTEM_NAME_TO_UGNSS.get(str(name).strip().upper())
+            if sys_id is not None:
+                systems.add(sys_id)
+    if not systems:
+        systems.add(uGNSS.GPS)
+    return systems
+
+
+def _filter_svh_by_systems(obsr, svh, systems):
+    """把 systems 之外星座的 svh 标记为非零, 使 estpos/satposs 跳过它们。
+
+    rtklib-py 的 ``pntpos`` 已按系统估计独立钟差 (GPS 基准 + GLO/GAL/BDS
+    系统间偏差), 因此多系统 SPP 本身可解; 这里只负责把"配置未启用的星座"
+    排除掉, 使初始化纯 GNSS 解算与配置声明的多系统双频方案一致。
+    """
+    filtered_svh = svh.copy()
+    keep = set(systems)
+    for i in range(len(obsr.sat)):
+        sys, _ = sat2prn(obsr.sat[i])
+        if sys not in keep:
+            filtered_svh[i] = 99  # 非零 = 不健康, estpos 会跳过
+    return filtered_svh
+
+
 def _filter_gps_svh(obsr, svh):
     """将非 GPS 卫星的 svh 标记为非零, 使 estpos/satposs 跳过它们。
 
-    用于 SPP 单点定位: BDS/GAL 时间系统偏差 (BDT-GPST ~14s, GST-GPST)
-    在 rtklib-py 中未完全处理, 多星座 SPP 会发散。
-    TC 量测更新有自己的 clk_bias 状态处理多星座, 不受此限制。
+    保留为 GPS-only 语义的显式入口 (历史行为/单元测试使用); 运行期初始化
+    一律走 :func:`resolve_gnss_systems` + :func:`_filter_svh_by_systems`,
+    以跟随配置的多系统双频方案。
     """
-    filtered_svh = svh.copy()
-    for i in range(len(obsr.sat)):
-        sys, _ = sat2prn(obsr.sat[i])
-        if sys != uGNSS.GPS:
-            filtered_svh[i] = 99  # 非零 = 不健康, estpos 会跳过
-    return filtered_svh
+    return _filter_svh_by_systems(obsr, svh, {uGNSS.GPS})
+
+
+def estpos_for_init(obsr, nav, rs, dts, svh, systems):
+    """初始化/纯 GNSS 输出的 SPP: 先用配置声明的星座, 无解时回退 GPS-only。
+
+    多系统 SPP 依赖 rtklib-py ``pntpos`` 的 GPS 基准钟差 + GLO/GAL/BDS
+    系统间偏差状态。个别数据集的非 GPS 星历/观测若未被正确处理,
+    ``estpos`` 可能无解; 此时回退到历史 GPS-only 行为, 保证初始化阶段的
+    纯 GNSS 解算不会比纯 GPS 基线更差。
+    """
+    from src.core.gnss.rtklib.pntpos import estpos
+
+    sol, x = estpos(
+        obsr, nav, rs, dts, _filter_svh_by_systems(obsr, svh, systems))
+    if sol.stat or set(systems) <= {uGNSS.GPS}:
+        return sol, x
+    return estpos(obsr, nav, rs, dts, _filter_gps_svh(obsr, svh))
 
 
 class TcStream:
@@ -229,12 +299,14 @@ class TcStream:
         saved_lock = nav.lock.copy() if hasattr(nav, "lock") else None
         try:
             from src.core.gnss.rtklib.ephemeris import satposs
-            from src.core.gnss.rtklib.pntpos import estpos
             rs, var, dts, svh = satposs(obsr, nav)
-            svh_gps = _filter_gps_svh(obsr, svh)  # GPS-only SPP
+            # 与配置同步的纯 GNSS 粗定位: 未初始化时同样使用配置声明的
+            # 多系统 (gnss_t), 而不是固定 GPS-only。
             if np.any(nav.rb):
                 nav.x[0:3] = nav.rb
-            sol, x_spp = estpos(obsr, nav, rs[:, :3], dts, svh_gps)
+            sol, x_spp = estpos_for_init(
+                obsr, nav, rs[:, :3], dts, svh,
+                resolve_gnss_systems(nav, self.config))
             if not sol.stat:
                 return
         except Exception as e:
