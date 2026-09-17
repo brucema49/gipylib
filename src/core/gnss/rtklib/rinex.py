@@ -5,6 +5,8 @@ Copyright (c) 2021 Rui Hirokawa (from CSSRLIB)
 Copyright (c) 2022 Tim Everett
 """
 
+import bisect
+
 import numpy as np
 from copy import deepcopy
 from collections.abc import MutableMapping
@@ -640,7 +642,23 @@ def next_obs(nav, rov, base, dir):
     rov.index += dir   # 1=forward, -1=backward
     if abs(dir) != 1 or rov.index < 0 or rov.index >= len(rov.obslist):
         return [], []
-    obsr, obsb = rov.obslist[rov.index], base.obslist[base.index]
+    obsr = rov.obslist[rov.index]
+    # 基准文件与流动文件的起止时刻可能相差数小时 (长基准记录): 逐历元单步
+    # 步进永远追不上, 导致全程星历错配 (实测 rtk-evc: 基站早 2.5 h, RTK 退化为
+    # Q=4/ns=2)。先按时间二分把基准索引快进到流动历元邻近处, 再做单步精调。
+    rt = obsr.t.time + obsr.t.sec
+    times = getattr(base, "_time_cache", None)
+    if times is None:
+        times = [o.t.time + o.t.sec for o in base.obslist]
+        base._time_cache = times
+    if 0 <= base.index < len(times) and abs(times[base.index] - rt) > 2.5:
+        i = bisect.bisect_left(times, rt)
+        best, best_dt = base.index, abs(times[base.index] - rt)
+        for c in (i - 1, i, i + 1):
+            if 0 <= c < len(times) and abs(times[c] - rt) < best_dt:
+                best, best_dt = c, abs(times[c] - rt)
+        base.index = best
+    obsb = base.obslist[base.index]
     dt = timediff(obsr.t, obsb.t)
     baseChange = False
     ixb = base.index + dir

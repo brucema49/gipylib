@@ -780,15 +780,17 @@ def trace(level, msg):
 def tracemat(level, msg, mat, fmt='.6f'):
     if level > trace_level:
         return
+    mat = np.asarray(mat)
     fmt = '{:' + fmt + '}'
-    if len(mat.shape) == 1 or mat.shape[1] == 1:
+    if mat.ndim == 1 or mat.ndim == 2 and mat.shape[1] == 1:
+        # 一维或列向量: 展平后逐元素格式化 (直接 format ndarray 会 TypeError)
         trace(level, msg)
-        sys.stderr.write(' '.join(map(fmt.format, mat)))
+        sys.stderr.write(' '.join(fmt.format(v) for v in mat.ravel()))
         sys.stderr.write('\n')
     else:
         trace(level, msg + '\n')
         for row in mat:
-            sys.stderr.write(' '.join(map(fmt.format, row)))
+            sys.stderr.write(' '.join(fmt.format(v) for v in row))
             sys.stderr.write('\n')
     
 def tracelevel(level):
