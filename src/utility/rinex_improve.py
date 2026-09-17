@@ -595,6 +595,12 @@ def improve_rinex(input_path: str, output_path: str,
         sys_old_codes[sys_char] = codes
         if band_plan is not None:
             plan = [int(b) for b in (band_plan.get(sys_char) or [])]
+            if not plan:
+                # 波段方案未覆盖该系统 (如基站无 GLONASS 观测): 与解码器的
+                # raw_band_to_slot 保持一致, 直接丢弃。若在此处用 LibGnut
+                # 默认波段兜底展开, 改写后的文件会保留解码器不支持的系统,
+                # 触发 unsupported_raw_band 硬失败 (R1 回归实测)。
+                continue
         else:
             plan = None
         signal_priority = None

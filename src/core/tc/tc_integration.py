@@ -2613,14 +2613,26 @@ class TcIntegration:
         self._est.joseph_update(v_const, H_const, R_const)
         self._est.feedback()
 
+        from src.core.gnss.rtklib.rtkcmn import sat2id
+        fixed_desc = ",".join(
+            f"{sat2id(js)}:f{jf}:{fixed_dd[k]:+.2f}"
+            for k, (js, jf, _orient) in enumerate(dds)
+            if np.isfinite(fixed_dd[k]))
         logger.info(
             f"TC amb fixed: ratio={ratio:.2f}, nb={nb}, "
-            f"n_const={n_const}, holdamb R={VAR_HOLDAMB}")
+            f"n_const={n_const}, ref={sat2id(ref_sat)}:f{ref_frq}, "
+            f"fixed=[{fixed_desc}], holdamb R={VAR_HOLDAMB}")
         logger.debug(
             f"TC amb diag: ratio={ratio:.2f}, nb={nb}, partial="
             f"{self._ambiguity.last_partial}, maxdev="
             f"{self._ambiguity.last_maxdev}, maxsig="
             f"{self._ambiguity.last_maxsig}")
+        # 候选全集诊断: 浮点 DD 值、固定掩码 (部分固定时定位被裁剪的候选)
+        cand_desc = ",".join(
+            f"{sat2id(ks)}:f{kf}={y_dd[k]:+.2f}"
+            f"{'*' if np.isfinite(fixed_dd[k]) else 'x'}"
+            for k, (ks, kf, _o) in enumerate(dds))
+        logger.debug(f"TC amb cands: {cand_desc}")
         self._amb_fixed = True
 
     # ===== 约束 =====
