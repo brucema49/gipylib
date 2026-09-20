@@ -1,0 +1,283 @@
+# GInsStream 统一定位解算配置文件
+# 配置来源: rtklib-py (GNSS) + ignav (INS) + KF-GINS (YAML 风格)
+# 时间系统: Unix 时间戳 (gtime_t.time + gtime_t.sec), 转换工具 src/core/time_utils.py
+# 单滤波架构: StateIndex 参数块管理 (基础15维 + 可选杆臂/安装角/时间对齐)
+
+#===========================================================================================#
+# GNSS 数据源与文件路径 (rtklib-py)
+#===========================================================================================#
+gnss:
+  gnss_source: "internal"              # internal=内部解算 / external=外部结果文件
+  positioning_mode: "rtk"              # 定位模式 (internal): rtk（与 GREAT TCRTK 一致，需基站观测）
+  rover_path: "../GREAT-MSF/sample_data/MSF_20201027/GNSS/Rover/campus-day.20O"
+  base_path:                           # 基站观测文件列表: 运行窗口 02:09:50–02:19:56 跨 0200/0215 两个 15 min 文件
+    - "../GREAT-MSF/sample_data/MSF_20201027/GNSS/Base/WUH200CHN_R_20203010200_15M_01S_MO.crx.20O"
+    - "../GREAT-MSF/sample_data/MSF_20201027/GNSS/Base/WUH200CHN_R_20203010215_15M_01S_MO.crx.20O"
+  eph_path: "../GREAT-MSF/sample_data/MSF_20201027/GNSS/Product/BRDM00DLR_S_20203010000_01D_MN.rnx"
+  week: 2129                           # GPST 周号 (campus01: 2129；七列 rate IMU 时间戳换算用)
+  external_sol_path: ""                # 外部 GNSS 结果文件 (external)
+  external_sol_format: "pos"           # 外部结果格式: pos / nmea / csv
+  default_pos_std: 1.0                 # 外部结果默认位置标准差 [m]
+  default_vel_std: 0.5                 # 外部结果默认速度标准差 [m/s]
+  pos_covariance_available: false      # 外部结果是否含协方差
+
+  #--- 定位模式 (rtklib-py) ---#
+  nf: 1                              # 单频：每个星座仅 slot 0，严格匹配 GREAT <frequency>1</frequency>
+  pmode: "kinematic"                   # 定位模式: static / kinematic
+  filtertype: "forward"               # 滤波类型: forward / backward / combined / combined_noreset
+  use_sing_pos: false                  # 每历元是否重新单精解初始位置
+
+  #--- 观测值筛选 (rtklib-py) ---#
+  elmin: 7.0                           # 与 GREAT 单频基线 <minimum_elev>7 一致；非调参
+  remove_sat: ["C01"]                  # 剔除卫星 (如 ["C01"])
+  cnr_min: [28, 20]                    # 最小信噪比 [dB-Hz, freq1, freq2]
+
+  #--- 周跳与粗差检测 (rtklib-py) ---#
+  maxinno: 5.0                         # 载波相位周跳/粗差阈值 [m]
+  maxcode: 30.0                        # 伪距双差门限 [m] (与 maxinno 相位门限分离, RTKLIB 默认 5/30)
+  prefit_outlier_enable: false         # GREAT: complete DD set enters EKF; post-fit only
+  tc_doppler_sigma: 0.5                # 未启用 Doppler 时不参与量测
+  maxage: 30.0                         # 最大差分龄期 [s]
+  maxout: 4                            # 最大差分中断历元数
+  thresdop: 5.0                        # 多普勒法周跳检测阈值
+  thresslip: 0.10                      # 几何无关组合 (LG) 周跳检测阈值
+  interp_base: false                   # 是否插值基站观测值
+
+  #--- 卡尔曼滤波统计 (rtklib-py) ---#
+  eratio: [300, 100]                   # 伪距/载波噪声比 [L1, L5/L2]
+  efact_gps: 1.0                       # GPS 星座相对权重
+  efact_glo: 1.5                       # GLONASS 星座相对权重
+  efact_gal: 1.0                       # Galileo 星座相对权重
+  err_base: 0.003                      # 基线误差 sigma [m]
+  err_el: 0.003                        # 仰角误差 sigma [m]
+  err_satclk: 5.0e-12                  # 卫星钟误差 sigma [s]
+  snrmax: 45.0                         # 方差计算最大信噪比 [dB-Hz]
+  accelh: 20.0                         # 水平加速度噪声 sigma [m/s²] (增大以跟踪车辆动态)
+  accelv: 10.0                         # 垂直加速度噪声 sigma [m/s²]
+  pos_psd: 0.0                          # 位置随机游走 PSD [m²/s]: TC 模式设 0 (参考 ignav, 位置协方差通过速度耦合自然传播)
+  prnbias: 0.03                         # 载波相位偏差 sigma [cycles] (0.03 对齐 ignav stats-prnbias; 原 0.5 使 P_amb 托底~13cycle^2 致浮点解码级,见 issue/8-22 第11节)
+  sig_p0: 30.0                         # 初始位置 sigma [m]
+  sig_v0: 10.0                         # 初始速度/加速度 sigma [m/s]
+  sig_n0: 30.0                         # 初始模糊度 sigma [m] (GREAT sig_init_amb)
+  sig_n0_units: "m"                   # RTKLIB 状态仍为 cycles; 按每颗卫星波长转换
+
+  #--- 模糊度解算 (rtklib-py) ---#
+  armode: 0                            # 模糊度解算: 0=off / 1=continuous / 3=fix-and-hold (GREAT fix_mode=SEARCH)
+  thresar: 2.0                         # AR ratio 检验阈值 (GREAT <ratio>2</ratio>)
+  thresar1: 0.5                        # AR 位置方差阈值 [m²]: posvar 超此值时跳过 AR (稳态 posvar≈0.15, 原 0.05 过严致 AR 从未运行)
+  minlock: 0                           # 参与 AR 的最小连续锁定历元数
+  glo_hwbias: 0.0                      # GLONASS 硬件偏差 [m]
+  elmaskar: 15.0                       # AR 仰角掩模 [deg]
+  var_holdamb: 0.1                     # 保持模糊度方差 [m²]
+  minfix: 20                           # 触发 hold 的最小固定样本数
+  minfixsats: 4                        # 固定时最小卫星对数
+  minholdsats: 5                       # hold 时最小卫星对数
+  mindropsats: 10                      # 丢弃卫星的最小卫星对数
+
+  #--- 单点定位 (rtklib-py) ---#
+  sing_p0: 30.0                       # SPP 初始位置 sigma [m]
+  sing_v0: 10.0                        # SPP 初始速度 sigma [m/s]
+  sing_elmin: 10.0                     # SPP 最小仰角 [deg]
+
+  #--- 星座与信号 (rtklib-py) ---#
+  # 手动频点映射（保留）：真实数据与 LibGnut 库级默认存在冲突——自动方案按
+  # GNSS_BAND_PRIORITY 选 BDS B1I(C2I)，实测 3D RMS 0.548 → 1.123 m，本数据集
+  # 的标定组合是 B3I(C6I)。故此处显式声明每系统一条已验证物理共同载波：
+  # G L1, E E1, C B3I(C6I), R G1(FDMA)；raw RINEX band 与 solver Hz index 分离。
+  # freq_table/freq_ix*/dfreq_glo 未手写时由 gnutlib 频率表自动派生（B3I =
+  # 1268.52 MHz），与手写等价。
+  gnss_t: ["GPS", "GAL", "BDS", "GLO"]
+  raw_band_priority: {GPS: [1], GAL: [1], BDS: [6], GLO: [1]}
+  # GREAT RAW_MIX tracking-attribute priority; keys are literal RINEX bands.
+  raw_signal_priority:
+    GPS: {1: {code: "CPW", phase: "CSLXPWYM"}}
+    GAL: {1: {code: "CX", phase: "ABCXZ"}}
+    BDS: {6: {code: "IQX", phase: "IQX"}}
+    GLO: {1: {code: "CP", phase: "PC"}}
+  pair_phase_code_rows: true          # GREAT RAW_MIX：码行仅与同频原始相位共视
+
+  #--- 基站与初始位置 (rtklib-py) ---#
+  rb: [-2267750.14853585, 5009154.50747098, 3221294.38263863]           # 基站 WUH2 ECEF 位置 [m] (GREAT XML <rec id="WUH2">; 作为 SPP 初值种子)
+  rr_f: [0, 0, 0, 0, 0, 0]             # 流动站初始位置速度 (正向) [m, m/s] (全 0: 自动 SPP)
+  rr_b: [0, 0, 0, 0, 0, 0]             # 流动站初始位置速度 (反向) [m, m/s] (全 0: 自动 SPP)
+
+
+#===========================================================================================#
+# 组合导航配置 (ignav configure.ini 风格)
+#===========================================================================================#
+ins:
+  #--- 主开关 ---#
+  enabled: "tc"                        # 主开关: lc=松组合 / off=纯GNSS / tc=紧组合
+
+  #--- 数据路径与采样率 ---#
+  imu_data_path: "../GREAT-MSF/sample_data/MSF_20201027/IMU/campus-01-MEMS.txt"
+  data_rate: 100                       # IMU 采样率 [Hz] (原始 100 Hz, 禁止重采样/抽取)
+  imu_format: "great_msf_7col_rate"    # 七列速率: sow gx gy gz ax ay az (空格分隔)
+  imu_data_form: "rate"                # 输入语义: rate=速率 / increment=增量
+  rate_to_increment: false             # false=rate 直接进入 TC 机械编排; true=边界一次性转增量
+  imu_coordinate_system: "FRD"         # 七列解码器已按 axis_order 输出 FRD, 此处不再变换
+  axis_order: "garfu"                  # GREAT DataFormat/AxisOrder (Right-Front-Up → FRD)
+  gyro_unit: "DPS"                     # GREAT GyroUnit (deg/s → rad/s)
+  accel_unit: "MPS2"                   # GREAT AcceUnit (m/s²)
+  frequency_hz: 100                    # GREAT Frequency 声明值 (记录用, 不触发重采样)
+  # 紧组合专属开关见下方 ins_tc 段 (tc_use_doppler)
+
+  #--- 使能开关 ---#
+  nhc_enable: 0                        # NHC 策略 (0=关, 2=2D v系侧向+垂向 推荐)
+  zupt_enable: 0                       # ZUPT 开关 (0=关 / 1=3D 零速更新; 静态时与 NHC 互斥)
+  zaru_enable: 0                       # ZARU 开关 (0=关 / 1=零角速率更新, 估计陀螺零偏; 静态时与 NHC 互斥)
+
+  #--- 初始对准 (skills/初始化.md 第 5 节) ---#
+  static_speed_threshold: 0.5          # 静态检测阈值 [m/s] (GNSS 速度范数 < 此值判定为静态)
+  dynamic_speed_threshold: 3.0         # 动态速度阈值 [m/s] (GNSS 速度范数 > 此值才可动对准)
+  angular_velocity_threshold_deg: 30.0 # 动态角速度阈值 [deg/s] (陀螺范数 < 此值才可动对准)
+  alignnment_dynamic_method: "auto"    # 动对准方法: auto/velocity_vector/position_diff
+  gnss_buffer_size: 3                  # 位置差分 GNSS 历元缓冲区大小 (只用最新两个计算差分)
+  high_precision_ins_mode: false       # 高精度 INS 初始化模式: false=低精度(当前实现) / true=高精度(预留)
+  static_duration: 10.0                # 静态初始化 GNSS 位置平均窗口 [s] (少于 10s 用全部, 多于 10s 取最新 10s)
+
+  #--- IMU 误差标定 (传感器标定值, 当前置 0 依赖 EKF 在线估计) ---#
+  # initial_gyro_bias [deg/h] × dh2rs → [rad/s]
+  # initial_acce_bias [mGal]  × 1e-6×g0 → [m/s²], g0=9.7803267715
+  initial_gyro_bias: [0, 0, 0]         # 初始陀螺零偏 [x, y, z] [deg/h]
+  initial_acce_bias: [0, 0, 0]         # 初始加计零偏 [x, y, z] [mGal]
+
+  #--- 杆臂与安装角 ---#
+  leverarm: [-0.41, -0.05, -0.15]      # GNSS 天线杆臂 (b 系 FRD) [m] = GREAT RFU(-0.05,-0.41,0.15) 转 FRD
+  initial_imu_angle: [0, 0]            # 初始 IMU 安装角 [pitch, yaw] [deg] (roll=0)
+  initial_imu_leverarm: [0.0, 0.0, 0.0]  # 初始 IMU 杆臂 (b→v) [m]
+
+  #--- 初始不确定度 (1σ, per axis, ECEF/SI 单位) ---#
+  # GREAT XML selects the ADIS16470 model.  Its model-table initial STD is
+  # [3 m, 0.5 m/s, 0.5/0.5/5 deg, 120 deg/h, 0.05 mg]; use those SI values
+  # explicitly so the initializer does not replace the configured yaw STD.
+  initial_pos_std_si: [3.0, 3.0, 3.0]             # GREAT ADIS16470 model [m]
+  initial_vel_std_si: [0.5, 0.5, 0.5]             # GREAT ADIS16470 model [m/s]
+  initial_att_std_si: [0.00872664625997, 0.00872664625997, 0.0872664625997] # [0.5,0.5,5] deg
+  gyro_bias_std_si: [5.81776417331e-4, 5.81776417331e-4, 5.81776417331e-4]  # 120 deg/h
+  # GREAT gsetins.cpp ADIS16470: AcceBiasInitialSTD = 0.05/t_gglv::mg, 而
+  # gins.cpp 用 db_tmp*t_gglv::mg 回填 P, 故进入 P 的值是 0.05 m/s² (5.11 mg),
+  # 不是 0.05 mg。gipylib 的 P 以 SI (m/s²) 为单位, 因此直接写 0.05。
+  acce_bias_std_si: [0.05, 0.05, 0.05]                     # 0.05 m/s² = 5.11 mg
+  # 可选状态参数初始不确定度
+  lever_arm_std: [0.1, 0.1, 0.1]      # GNSS 杆臂初始标准差 [m]
+  imu_angle_std: [10.0, 10.0]          # IMU 安装角初始标准差 [pitch, yaw] [deg]
+  imu_leverarm_std: [1.0, 1.0, 1.0]    # IMU 杆臂初始标准差 [m]
+  time_sync_std: 0.01                 # 时间对齐初始标准差 [s]
+
+  #--- 过程噪声 PSD (严格按 GREAT ADIS16470 模型单位转换) ---#
+  # GREAT: Qt = [att*dpsh, vel*mgpsHz, pos*mpsh,
+  #              gyro_bias*dphpsh, accel_bias*mgpsh]^2.
+  # No extra direct velocity PSD or empirical P_vel floor is applied: the
+  # velocity block is the accelerometer-noise block, as in GREAT.
+  gyro_psd: 7.11620139001727e-09       # GREAT attitude PSD [rad²/s]
+  accel_psd: 4.72278200625e-07         # GREAT velocity/accel PSD [m²/s³]
+  gyro_bias_psd: 1.72231306427737e-13  # GREAT gyro-bias RW PSD [rad²/s³]
+  acce_bias_psd: 1.0010896e-07        # GREAT accel-bias RW PSD [m²/s⁵]
+  # pos_psd / vel_psd 是**松组合专属**稳定项: 它们把额外位置/速度随机游走直接
+  # 注入 P, 紧组合的位置/速度不确定度必须完全由 Q(IMU 噪声) 与 H/R 传播得到,
+  # 注入后会破坏与 GREAT 的等价性 (issue/9-14机械编排发散.md P5)。
+  # 因此本 TC 配置不写这两个键; 它们只能出现在 ins_lc 段。
+  # GREAT gins.cpp:32,46 把 _tauG/_tauA 恒置零向量, set_Ft() 直接把它写成
+  # eb-eb/db-db 对角块, 即零偏为纯随机游走, 无 -I/τ 阻尼。缺省 36 s 保留给
+  # 其它配置; 本 GREAT 对照配置显式声明 inf 以取得同一随机游走语义。
+  gyro_bias_corr_time_s: .inf         # GREAT: random-walk gyro bias (no GM damping)
+  acce_bias_corr_time_s: .inf         # GREAT: random-walk accel bias (no GM damping)
+  #--- NHC 配置 (非完整性约束, 参考 ignav ins-nhc.cc) ---#
+  nhc_std: 0.5                         # NHC 速度观测标准差 [m/s] (std=0.5+dec=10 防止 100Hz 过约束高程退化)
+  nhc_max_vel: 0.5                     # NHC 单维速度 guard [m/s] (ignav MAXVEL, 超阈剔除该维)
+  nhc_max_gyro: 30.0                   # NHC 角速率 guard [deg/s] (ignav, 剧烈转弯跳过整个 NHC)
+  nhc_decimation: 10                   # NHC 抽样间隔 [epoch] (1=每IMU历元, 10=100Hz下10Hz)
+
+  #--- ZUPT 配置 (零速更新, 参考 ignav ins-zvu.cc) ---#
+  # 静态时与 NHC 互斥 (静态 → ZUPT+ZARU, 运动 → NHC)
+  zupt_std: 0.05                       # ZUPT 速度观测标准差 [m/s] (ignav VARVEL=SQR(0.05))
+  zupt_max_vel: 0.1                    # ZUPT 速度 guard [m/s] (ignav MAXVEL, 超阈跳过)
+  zupt_max_gyro: 10.0                  # ZUPT 角速率 guard [deg/s] (ignav MAXGYRO)
+  zupt_min_count: 15                   # ZUPT 最小间隔 [epoch] (ignav MINZC=15)
+
+  #--- ZARU 配置 (零角速率更新, 参考 ignav ins-zaru.cc) ---#
+  # 静态时与 NHC 互斥, 估计陀螺零偏 (gyro_bias 状态始终在 15 维基础状态中)
+  zaru_std: 0.01745                    # ZARU 角速率观测标准差 [rad/s] (ignav VARARE=SQR(1°/s))
+  zaru_max_vel: 0.1                    # ZARU 速度 guard [m/s] (ignav MAXVEL)
+  zaru_max_gyro: 5.0                   # ZARU 角速率 guard [deg/s] (ignav MAXGYRO, 比ZUPT更严)
+  zaru_min_count: 100                  # ZARU 最小间隔 [epoch] (ignav MINZAC=100)
+
+  #--- 静态检测配置 (参考 ignav ins-static-detect.cc) ---#
+  # 用于 NHC/ZUPT/ZARU 互斥选择 (静态→ZUPT/ZARU, 运动→NHC)
+  static_detect_method: "GLRT"         # 检测方法: GLRT/MV/MAG/ARE/ALL
+  static_window_size: 20               # 滑动窗口大小 [epoch] (100Hz下0.2s)
+  static_sig_gyro: 0.1                 # 陀螺噪声 σ [rad/s]
+  static_sig_accl: 0.1                 # 加计噪声 σ [m/s²]
+  static_gamma_glrt: 100.0             # GLRT 阈值
+  static_gamma_mv: 50.0                # MV 阈值
+  static_gamma_mag: 50.0               # MAG 阈值
+  static_gamma_are: 50.0               # ARE 阈值
+
+  #--- 可选状态参数开关 (单滤波 StateIndex 管理) ---#
+  estimate_leverarm: 0                # 0=使用 GREAT XML 固定的天线杆臂 (RFU -0.05,-0.41,0.15 → FRD)
+  estimate_mounting_angle: 0          # 1=估计 IMU 安装角 (2维, 替代旧 evaluate_imu_angle)
+  estimate_imu_leverarm: 0            # 1=估计 IMU 杆臂 b→v (3维, 需 estimate_mounting_angle=1)
+  estimate_time_sync: 0               # 1=估计时间对齐误差 (1维, 算法参考 ignav)
+
+
+#===========================================================================================#
+# 紧组合专属 INS 参数 (仅 ins.enabled=tc 生效, 加载时合并进 ins 段)
+# 这里只能写"只有紧组合才有意义"的参数; 松组合专属参数见 ins_lc 段。
+#===========================================================================================#
+ins_tc:
+  tc_use_doppler: false               # 与 GREAT <doppler>false</doppler> 对齐；非调参
+
+
+#===========================================================================================#
+# 松组合专属 INS 参数 (仅 ins.enabled=lc 生效)
+# 本配置为紧组合, 该段不生效, 保留仅作参数对照与文档用途; 若把 ins.enabled 改成 lc,
+# 需要同时给 gnss 段配置 rtk_float_pos_std 等观测噪声, 否则 LC 观测权重不成立。
+#===========================================================================================#
+ins_lc:
+  pos_psd: 0.0                        # 位置随机游走 PSD [m²/s]: LC 稳定项, 本数据集无需额外注入
+  vel_psd: 0.0                        # 速度随机游走 PSD [m²/s²]: LC 稳定项, 本数据集无需额外注入
+
+
+#===========================================================================================#
+# 紧组合配置 (ins.enabled=tc 时生效)
+#===========================================================================================#
+tc:
+  measurement_trace:
+    enabled: true
+    format: jsonl
+    filename: campus01-tc-measurement-trace.jsonl
+  #--- 量测诊断 (逐量测更新写 CSV, 用于参数核对) ---#
+  diagnostics_path: "data-great/output/rtktc-rate/tc-measurement-diagnostics.csv"
+  # 诊断导出：仅记录 P/Q/Phi，不改变滤波路径或权重
+  matrix_diagnostics_path: "data-great/output/rtktc-rate/tc-matrix-diagnostics.jsonl"
+  # GREAT keeps the INS nominal trajectory on DD rejection; no SPP reset,
+  # velocity guard, or automatic recovery is injected into the epoch stream.
+  spp_fallback_enable: false
+  auto_recovery: false
+  velocity_guard_enable: false
+  # GREAT removes the offending satellite and rebuilds reference/DD rows at
+  # the same GNSS endpoint (no frozen-row slicing).
+  satellite_retry_enable: true
+  #--- 降级管理 (rtk→rtd→spp→imu_only) ---#
+  degrade:
+    fail_threshold: 3                  # 连续量测失败次数触发降级
+    reboot_threshold: 30.0             # 降级后持续失败时长触发 reboot [s]
+
+
+#===========================================================================================#
+# 输出配置
+#===========================================================================================#
+# 输出文件 (按 ins.enabled 启用):
+#   off → .pos  纯 GNSS 解算结果
+#   lc  → .pos + .csv + .rslt  (纯GNSS副输出 + 对齐CSV + 松组合100Hz)
+#   tc  → .rslt  紧组合100Hz结果
+output:
+  output_dir: "data-great/output/rtktc-rate"
+  nav_csv_filename: "nav-100hz.csv"         # 机械编排状态 CSV: week,sow,x,y,z,vx,vy,vz,roll,pitch,yaw
+  gnss_filename: "spp.pos"                  # 纯 GNSS 解算结果 (.pos)
+  aligned_filename: "aligned-spp-tc.csv"    # 对齐块状 CSV (.csv) - ins.enabled=lc 输出
+  rslt_filename: "tc.rslt"                  # 组合导航结果 (.rslt) - 未设置 nav_csv_filename 时使用
+  position_format: "llh"                    # 位置输出格式: llh=经纬度高 / xyz=ECEF直角坐标
+  time_format: "gpst"                       # 时间输出格式: gpst=GPS周+周内秒 / datetime=YYYY/MM/DD HH:MM:SS.sss
+  trace_level: 0                            # trace文件等级: 0=off / 1=info / 2=detail / 3=debug (生成 .trace 文件)

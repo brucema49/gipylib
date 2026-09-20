@@ -2,7 +2,7 @@
 
 > **当前状态索引（2026-09-15）**：配置说明需同时区分相位 `maxinno` 与伪距 `maxcode`；**INS 参数已拆 `ins`/`ins_tc`/`ins_lc` 三段，`pos_psd`/`vel_psd` 为 LC-only 机制禁止用于 TC**。当前 RTK 浮点基线为 `prnbias=0.03`，输出支持 `stat_level`/`trace_enabled`，Data19 可使用 `ins.imu_time_offset_s`。详见 [项目当前状态](项目当前状态.md) 第 4.4 节。
 
-> 定义 GInsStream 统一定位解算配置文件的格式、字段与默认值。
+> 定义 gipylib 统一定位解算配置文件的格式、字段与默认值。
 > 配置文件采用 YAML 格式，存放于 `data/config.yaml`（参考配置：`data/spp-ins-lc.yaml`、`data/rtdtc.yaml`、`phone/rtdtc.yaml`、`data/ignav-rtktc.conf`）。
 >
 > **配置来源约定**：
@@ -83,7 +83,7 @@
 
 ## 1. 概述
 
-GInsStream 采用**单一 YAML 配置文件**驱动整个定位解算流程，涵盖：
+gipylib 采用**单一 YAML 配置文件**驱动整个定位解算流程，涵盖：
 
 1. **GNSS 解算配置**（SPP/RTK/RTD，参考 rtklib-py）
 2. **组合导航配置**（INS 机械编排 + 单滤波 EKF + NHC/ZUPT，参考 ignav）
@@ -334,7 +334,7 @@ grep 'SYS / # / OBS TYPES' /tmp/simplified.obs   # 每个目标系统都应在�
 | `gnss_enable` | int | `1` | GNSS 量测使能（0=关闭） | `gnss_enable` |
 | `imu_enable` | int | `1` | IMU 机械编排放能 | `imu_enable` |
 | `nhc_enable` | int | `2` | NHC 策略（0-9，见 4.7） | `nhc_enable` |
-| `zupt_enable` | int | `0` | ZUPT 策略（0=关闭，1=启用 3D 零速更新；与 NHC 互斥） | GInsStream 扩展 |
+| `zupt_enable` | int | `0` | ZUPT 策略（0=关闭，1=启用 3D 零速更新；与 NHC 互斥） | gipylib 扩展 |
 
 ### 4.3 数据路径与采样率
 
@@ -346,7 +346,7 @@ grep 'SYS / # / OBS TYPES' /tmp/simplified.obs   # 每个目标系统都应在�
 | `data_rate` | int | `100` | Hz | IMU 采样率 | `data_rate` |
 | `result_output_rate` | int | `1` | Hz | 结果输出率 | `result_output_rate` |
 | `imudatalen` | int | `7` | — | IMU 文件列数（只用前 7 列） | 参考 kf-gins |
-| `imu_format` | str | `"gpst"` | — | IMU 数据文件格式。`gpst`=GPS 周+周内秒（`week,sow,gx,gy,gz,ax,ay,az`），由 `ImuFormator` 解码；`euroc`=Unix 纳秒时间戳（`timestamp_ns,wx,wy,wz,ax,ay,az`），由 `EuRoCImuFormator` 解码。`ImuSensor._create_formator()` 根据此参数工厂创建对应解码器（详见 [imu.md](file:///home/mxl/workplace/gipylib/skills/imu.md) / [StreamDesign.md](file:///home/mxl/workplace/gipylib/skills/StreamDesign.md)） | GInsStream 扩展 |
+| `imu_format` | str | `"gpst"` | — | IMU 数据文件格式。`gpst`=GPS 周+周内秒（`week,sow,gx,gy,gz,ax,ay,az`），由 `ImuFormator` 解码；`euroc`=Unix 纳秒时间戳（`timestamp_ns,wx,wy,wz,ax,ay,az`），由 `EuRoCImuFormator` 解码。`ImuSensor._create_formator()` 根据此参数工厂创建对应解码器（详见 [imu.md](file:///home/mxl/workplace/gipylib/skills/imu.md) / [StreamDesign.md](file:///home/mxl/workplace/gipylib/skills/StreamDesign.md)） | gipylib 扩展 |
 
 ### 4.4 初始对准
 
@@ -366,8 +366,8 @@ grep 'SYS / # / OBS TYPES' /tmp/simplified.obs   # 每个目标系统都应在�
 | `gnss_buffer_size` | int | `3` | 个 | 位置差分初始化的 GNSS 历元缓冲区大小（[初始化.md 9.3](file:///home/mxl/workplace/gipylib/skills/初始化.md#93-处理流程伪代码)）。运动阈值达到时确保缓冲区存满 N 个历元，但只用最新两个历元计算差分速度 | — |
 | `alignnment_attitude_mode` | int | `1` | — | 0=自动对准 / 1=使用给定姿态 `initial_att` | `alignnment_attitude_mode` |
 | `alignnment_posvelatt_mode` | int | `0` | — | 1=使用给定位置速度姿态对准（最高优先级） | `alignnment_posvelatt_mode` |
-| `high_precision_ins_mode` | bool | `false` | — | 高精度 INS 初始化模式（[初始化调整.md](file:///home/mxl/workplace/gipylib/skills/初始化调整.md)）。`false`=低精度模式（本项目当前实现：静态位置 GNSS 历史平均 + 姿态置 0 + 速度置 0）；`true`=高精度模式（预留，AcceLeveling + 解析寻北，后续实现） | GInsStream 扩展 |
-| `static_duration` | double | `10.0` | s | 静态初始化 GNSS 位置平均窗口（[初始化.md 7.3](file:///home/mxl/workplace/gipylib/skills/初始化.md#73-静态位置平均)）。GNSS 历史少于 `static_duration` 秒时用全部历元求平均；多于时取最新 `static_duration` 秒内的历元求平均 | GInsStream 扩展 |
+| `high_precision_ins_mode` | bool | `false` | — | 高精度 INS 初始化模式（[初始化调整.md](file:///home/mxl/workplace/gipylib/skills/初始化调整.md)）。`false`=低精度模式（本项目当前实现：静态位置 GNSS 历史平均 + 姿态置 0 + 速度置 0）；`true`=高精度模式（预留，AcceLeveling + 解析寻北，后续实现） | gipylib 扩展 |
+| `static_duration` | double | `10.0` | s | 静态初始化 GNSS 位置平均窗口（[初始化.md 7.3](file:///home/mxl/workplace/gipylib/skills/初始化.md#73-静态位置平均)）。GNSS 历史少于 `static_duration` 秒时用全部历元求平均；多于时取最新 `static_duration` 秒内的历元求平均 | gipylib 扩展 |
 
 **三阈值选择建议**（[初始化.md 5.4.3](file:///home/mxl/workplace/gipylib/skills/初始化.md#543-三组独立阈值static_speed--dynamic_speed--angular_velocity)）：
 

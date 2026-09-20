@@ -16,7 +16,7 @@
 - Modify: config/rtktc-rate.yaml lines 12-16 and 113
 - Do not modify: configuration values, algorithm switches, output filenames, or existing repository-relative output paths.
 
-- [ ] Step 1: Replace only the five external absolute paths.
+- [x] Step 1: Replace only the five external absolute paths.
 
 Use these exact repository-root-relative values:
 
@@ -33,7 +33,7 @@ Leave these existing repository-relative paths unchanged:
     matrix_diagnostics_path: "data-great/output/rtktc-rate/tc-matrix-diagnostics.jsonl"
     output_dir: "data-great/output/rtktc-rate"
 
-- [ ] Step 2: Confirm the path-only scope.
+- [x] Step 2: Confirm the path-only scope.
 
 Run: git diff -- config/rtktc-rate.yaml
 
@@ -45,7 +45,7 @@ Expected: only the five /home/mxl/workplace/GREAT-MSF/... strings change to ../G
 - Modify: README.md before the 目录结构 section
 - Reference: plot/tra-diff-rtkdc.png, plot/rtk-tc-error.png, plot/tra-enu.png
 
-- [ ] Step 1: Add the GREAT-MSF dataset context.
+- [x] Step 1: Add the GREAT-MSF dataset context.
 
 Add a result-comparison section stating that the plots use the GREAT-MSF/sample_data/MSF_20201027 campus01 dataset and these inputs:
 
@@ -54,7 +54,7 @@ Add a result-comparison section stating that the plots use the GREAT-MSF/sample_
 - ephemeris: GNSS/Product/BRDM00DLR_S_20203010000_01D_MN.rnx
 - IMU: IMU/campus-01-MEMS.txt, 100 Hz rate data
 
-- [ ] Step 2: Insert the three-image HTML table.
+- [x] Step 2: Insert the three-image HTML table.
 
 Use repository-relative image sources and one caption per image:
 
@@ -73,7 +73,7 @@ Keep surrounding README content unchanged except for the new section and dataset
 **Files:**
 - Verify: README.md, config/rtktc-rate.yaml, and the three PNG files.
 
-- [ ] Step 1: Verify assets and relative references.
+- [x] Step 1: Verify assets and relative references.
 
 Run:
     test -f plot/tra-diff-rtkdc.png
@@ -83,7 +83,7 @@ Run:
 
 Expected: all three files exist and README contains the three image references plus the GREAT-MSF dataset identifiers.
 
-- [ ] Step 2: Verify no absolute GREAT input paths remain.
+- [x] Step 2: Verify no absolute GREAT input paths remain.
 
 Run:
     if rg -n '/home/mxl/workplace/GREAT-MSF|^[[:space:]]*(rover_path|eph_path|imu_data_path):[[:space:]]*"/' config/rtktc-rate.yaml; then
@@ -93,7 +93,7 @@ Run:
 
 Expected: the first command produces no output and exits successfully; the second prints the five relative external input paths.
 
-- [ ] Step 3: Check whitespace and review the final diff without running the configuration.
+- [x] Step 3: Check whitespace and review the final diff without running the configuration.
 
 Run:
     git diff --check

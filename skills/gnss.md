@@ -2,7 +2,7 @@
 
 > **当前状态索引（2026-09-15）**：BDS GEO、BDS ISB、BDT→GPST 14 s、RINEX 基站列映射和未初始化相位行保护已完成验证。RTK 当前使用相位/伪距分离门限；BDS-only AR 仍未闭环。详见 [项目当前状态](项目当前状态.md)。
 
-> 基于 rtklib-py 算法参考 + GREAT-MSF 架构模式，设计 GInsStream 流式 GNSS 处理框架。
+> 基于 rtklib-py 算法参考 + GREAT-MSF 架构模式，设计 gipylib 流式 GNSS 处理框架。
 > 实现 SPP 和 RTK（含 RTD 退化模式）功能，采用 ABC 抽象类继承体系。
 >
 > **时间系统约定**：全框架内部统一使用 **Unix 时间戳（float 秒，与 rtklib-py `gtime_t.time + gtime_t.sec` 一致）**。
@@ -869,7 +869,7 @@ week, sow = unix_to_gpst(sol.timestamp)
 
 ### 9.1 GNSS 在框架中的双重角色
 
-GNSS 解算在 GInsStream 框架中承担两种角色：
+GNSS 解算在 gipylib 框架中承担两种角色：
 
 | 角色 | 集成方式 | 实现类 | 触发场景 | 实现状态 |
 |------|---------|--------|---------|---------|

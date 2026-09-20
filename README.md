@@ -1,4 +1,4 @@
-# GInsStream
+# gipylib
 
 基于流式读取的 GNSS/INS 组合导航后处理程序（Python）。
 
@@ -18,7 +18,7 @@
 - **非完整性约束接口**：NHC/ZUPT/ZARU 约束作为独立模块，通过配置文件使能，可自主开关
 - **可自主开发**：代码结构清晰，模块化设计，便于二次开发与算法替换
 - **可自主开发**：速率式imu数据处理参考ignav，增量式数据处理参考KF-GINS和GREAT-MSF
-- **低成本传感器支持**：支持手机级低成本 IMU + GNSS 的紧组合解算（`phone/rtdtc.yaml`），这是部分开源程序难以实现的场景
+- **低成本传感器支持**：支持手机级低成本 IMU + GNSS 的紧组合解算，可适配不同精度等级的传感器数据
 
 ## 快速开始
 
@@ -30,34 +30,23 @@ pip install -r requirements.txt
 
 需要 Python 3.8+，依赖 numpy、PyYAML、pytest。
 
-### 运行测试数据
+### 运行程序
 
-测试数据使用 `data/config.yaml` 配置文件，包含 GINav 的 CPT 战术级 IMU 数据集：
+准备符合[配置手册](man/manual.md)要求的配置文件与观测数据后，运行：
 
 ```bash
-python3 src/main.py data/config.yaml
+python3 src/main.py <配置文件路径>
 ```
 
-输出文件生成在 `data/output/` 目录下：
+程序会根据配置生成定位与组合导航结果：
+
 - `RTK.pos`：纯 GNSS 定位结果（1Hz）
 - `RTKLC.rslt`：松组合导航结果
 - `RTKTC.rslt`：紧组合导航结果
 
-### 精度评估
-
-```bash
-python3 data/plot/error.py
-```
-
-将定位结果与 `data/truth.csv` 真值比对，输出 3D RMSE、平面/高程误差、姿态误差等统计量。
-
-### 手机低成本传感器紧组合
-
-本项目可对手机级低成本传感器数据进行紧组合解算，配置文件为 `phone/rtdtc.yaml`。由于数据隐私，仅提供较高传感器精度的 `data/` 测试样例（GINav CPT 数据），手机数据样例不公开。
-
 ## 配置说明
 
-通过修改 `data/config.yaml` 中的 `ins.enabled` 字段切换运行模式：
+通过修改配置文件中的 `ins.enabled` 字段切换运行模式：
 
 | `ins.enabled` | 模式 | 说明 | 输出文件 |
 |---------------|------|------|----------|
@@ -66,6 +55,18 @@ python3 data/plot/error.py
 | `tc` | 紧组合 | GNSS 原始观测 + IMU TC EKF 融合 | `.rslt` |
 
 详细配置参数说明请参考 [man/manual.md](man/manual.md)。
+
+## 结果对比
+
+以下结果使用 GREAT-MSF 的 `sample_data/MSF_20201027` `campus01` 数据集：流动站观测为 `GNSS/Rover/campus-day.20O`，基站观测为 `GNSS/Base/WUH200CHN_R_20203010200_15M_01S_MO.crx.20O` 和 `GNSS/Base/WUH200CHN_R_20203010215_15M_01S_MO.crx.20O`，星历为 `GNSS/Product/BRDM00DLR_S_20203010000_01D_MN.rnx`，IMU 为 100 Hz 速率数据 `IMU/campus-01-MEMS.txt`。
+
+<table>
+<tr>
+<td align="center"><img src="plot/tra-diff-rtkdc.png" alt="gipylib 与 ignav2s 轨迹差异" width="100%"><br>gipylib 与 ignav2s 的轨迹差异</td>
+<td align="center"><img src="plot/rtk-tc-error.png" alt="gipylib 与 GREAT 定位误差" width="100%"><br>gipylib 与 GREAT RTK-TC 的 ENU 定位误差</td>
+<td align="center"><img src="plot/tra-enu.png" alt="gipylib 与 GREAT 的 ENU 轨迹差异" width="100%"><br>gipylib 与 GREAT/真值的 ENU 轨迹差异</td>
+</tr>
+</table>
 
 ## 目录结构
 
@@ -87,17 +88,6 @@ gipylib/
 │   ├── log/                   # 输出与日志
 │   ├── stream/                # 流式数据读取传感器
 │   └── utility/               # 配置加载与 RINEX 简化
-├── data/                      # 测试数据与配置
-│   ├── config.yaml            # 主配置文件
-│   ├── cpt0870.19o            # 流动站 RINEX 观测
-│   ├── cpt0870_base.19o       # 基站 RINEX 观测
-│   ├── brdm0870.19p           # 星历文件
-│   ├── cpt_euroc.csv          # IMU 数据
-│   ├── truth.csv              # 真值（用于精度评估）
-│   └── plot/error.py          # 精度评估脚本
-├── phone/                     # 手机数据与配置
-│   └── rtdtc.yaml             # 手机紧组合配置
-├── tests/                     # 测试用例
 ├── skills/                    # 设计文档（AI 开发需求说明）
 └── man/
     └── manual.md              # 配置文件使用手册

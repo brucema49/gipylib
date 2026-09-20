@@ -20,6 +20,14 @@ rtk-evc/
 .worktrees/
 .pytest_cache/
 .superpowers/
+
+# Project directories excluded from version control.
+.vscode/
+docs/
+exp-8-26/
+issue/
+problem/
+
 .gitignore
 *.stat
 *.txt
@@ -28,4 +36,3 @@ rtk-evc/
 *.rslt
 *.pyc
 *.json
-

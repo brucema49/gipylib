@@ -1,4 +1,4 @@
-# GInsStream 整体代码框架
+# gipylib 整体代码框架
 
 > **当前状态索引（2026-09-15）**：当前架构是队列驱动的流式 Python 管线 + 单滤波 EKF，实际代码位于 `src/core/ins/`、`src/core/tc/`、`src/core/gnss/` 和 `src/stream/`。本文中“双滤波”、旧 `core/imu`/`core/estimator` 路径和旧策略层均为历史设计；最新实现和已验证结果以 [项目当前状态](项目当前状态.md) 为准。
 
@@ -79,7 +79,7 @@
 
 ## 1. 项目概述
 
-GInsStream 是一个 GNSS/INS 组合导航项目，核心特点是**流式读取**——不全量加载文件，逐行/逐块读取，O(1) 内存占用。采用 ABC 类继承体系 + 设计模式（工厂/策略/依赖注入）设计，参考 GREAT-MSF 的 t_gbasemodel / t_gcombmodel / t_gsins / t_gsinskf / t_gintegration 模式。当前阶段实现松组合功能，包含：
+gipylib 是一个 GNSS/INS 组合导航项目，核心特点是**流式读取**——不全量加载文件，逐行/逐块读取，O(1) 内存占用。采用 ABC 类继承体系 + 设计模式（工厂/策略/依赖注入）设计，参考 GREAT-MSF 的 t_gbasemodel / t_gcombmodel / t_gsins / t_gsinskf / t_gintegration 模式。当前阶段实现松组合功能，包含：
 
 - **GNSS 定位**：SPP 单点定位 + RTK（含 RTD 退化模式）
 - **外部 GNSS 结果流**：支持直接读取外部 GNSS 定位结果文件，跳过内部 GNSS 解算

@@ -2080,7 +2080,7 @@ class Logger:
 - **4 种时间对齐情况**：参考 KF-GINS 的 `isToUpdate()` 判断
 - **增量切分**：GNSS 时刻在两个 IMU 之间时，切分 IMU 增量而非弹出
 
-详细实现参考 [estimator.md 第 9 节 时间同步与 IMU 插值](file:///e:/program_project/python/GInsStream/skills/estimator.md#9-时间同步与-imu-插值)。
+详细实现参考 [estimator.md 第 9 节 时间同步与 IMU 插值](file:///e:/program_project/python/gipylib/skills/estimator.md#9-时间同步与-imu-插值)。
 
 ### 9.2 初始化策略详解
 
