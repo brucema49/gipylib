@@ -1,0 +1,108 @@
+[2026-09-10 19:29:55] [I] [166 ] <main                                    > : path is file!
+[2026-09-10 19:29:56] [E] [280 ] <decode_data                             > : Not defined frequency code I09
+[2026-09-10 19:29:56] [E] [280 ] <decode_data                             > : Not defined frequency code I09
+[2026-09-10 19:29:56] [E] [280 ] <decode_data                             > : Not defined frequency code I09
+[2026-09-10 19:29:56] [E] [280 ] <decode_data                             > : Not defined frequency code I09
+[2026-09-10 19:29:56] [E] [280 ] <decode_data                             > : Not defined frequency code I09
+[2026-09-10 19:29:56] [E] [280 ] <decode_data                             > : Not defined frequency code I09
+[2026-09-10 19:29:56] [E] [280 ] <decode_data                             > : Not defined frequency code I09
+[2026-09-10 19:29:57] [I] [190 ] <main                                    > : main:  READ: file://.\model\igs14_2185.atx time:  2.000 sec
+[2026-09-10 19:29:57] [I] [166 ] <main                                    > : path is file!
+[2026-09-10 19:29:57] [I] [190 ] <main                                    > : main:  READ: file://.\model\oceanload time:  0.000 sec
+[2026-09-10 19:29:57] [I] [166 ] <main                                    > : path is file!
+[2026-09-10 19:29:57] [I] [190 ] <main                                    > : main:  READ: file://.\model\jpleph_de405 time:  0.000 sec
+[2026-09-10 19:29:57] [I] [166 ] <main                                    > : path is file!
+[2026-09-10 19:29:57] [I] [190 ] <main                                    > : main:  READ: file://.\model\poleut1_2109_2201 time:  0.000 sec
+[2026-09-10 19:29:57] [I] [166 ] <main                                    > : path is file!
+[2026-09-10 19:29:57] [I] [142 ] <decode_head                             > : reading VER: 3.04 SYS: M
+[2026-09-10 19:29:57] [I] [190 ] <main                                    > : main:  READ: file://.\GNSS\Product\BRDM00DLR_S_20203010000_01D_MN.rnx time:  0.000 sec
+[2026-09-10 19:29:57] [I] [166 ] <main                                    > : path is file!
+[2026-09-10 19:29:57] [W] [709 ] <_fix_band                               > : Warning: Both C1x and C2x coding should be accepted and treated as C2x in RINEX 3.02/3.03
+[2026-09-10 19:29:57] [W] [709 ] <_fix_band                               > : Warning: Both C1x and C2x coding should be accepted and treated as C2x in RINEX 3.02/3.03
+[2026-09-10 19:29:57] [W] [709 ] <_fix_band                               > : Warning: Both C1x and C2x coding should be accepted and treated as C2x in RINEX 3.02/3.03
+[2026-09-10 19:29:57] [W] [709 ] <_fix_band                               > : Warning: Both C1x and C2x coding should be accepted and treated as C2x in RINEX 3.02/3.03
+[2026-09-10 19:29:57] [I] [190 ] <main                                    > : main:  READ: file://.\GNSS\Rover\campus-day.20O time:  0.000 sec
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Warning - Warning: 4-CHAR: MARKER_NAME [SEPT] not equal to site from filename [.\GN] .. .\GNSS\Rover\campus-day.20O
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Error - SYS / PHASE SHIFT not recognized OBS:1C .. .\GNSS\Rover\campus-day.20O
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Error - SYS / PHASE SHIFT not recognized OBS:2W .. .\GNSS\Rover\campus-day.20O
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Error - SYS / PHASE SHIFT not recognized OBS:2L .. .\GNSS\Rover\campus-day.20O
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Error - SYS / PHASE SHIFT not recognized OBS:6C .. .\GNSS\Rover\campus-day.20O
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Error - SYS / PHASE SHIFT not recognized OBS:7Q .. .\GNSS\Rover\campus-day.20O
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Error - SYS / PHASE SHIFT not recognized OBS:1P .. .\GNSS\Rover\campus-day.20O
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Error - SYS / PHASE SHIFT not recognized OBS:2P .. .\GNSS\Rover\campus-day.20O
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Error - SYS / PHASE SHIFT not recognized OBS:2C .. .\GNSS\Rover\campus-day.20O
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Error - SYS / PHASE SHIFT not recognized OBS:3Q .. .\GNSS\Rover\campus-day.20O
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Error - SYS / PHASE SHIFT not recognized OBS:1I .. .\GNSS\Rover\campus-day.20O
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Error - SYS / PHASE SHIFT not recognized OBS:7I .. .\GNSS\Rover\campus-day.20O
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Error - SYS / PHASE SHIFT not recognized OBS:6I .. .\GNSS\Rover\campus-day.20O
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Error - APR XYZ not available! .. .\GNSS\Rover\campus-day.20O
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Error - SYS PHASE SHIFT not available! .. .\GNSS\Rover\campus-day.20O
+[2026-09-10 19:29:57] [I] [166 ] <main                                    > : path is file!
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [I] [190 ] <main                                    > : main:  READ: file://.\GNSS\Base\WUH200CHN_R_20203010130_15M_01S_MO.crx.20O time:  0.000 sec
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Warning - Warning: 4-CHAR: MARKER_NAME [WUH200CHN] not equal to site from filename [.\GNSS\BA] .. .\GNSS\Base\WUH200CHN_R_20203010130_15M_01S_MO.crx.20O
+[2026-09-10 19:29:57] [I] [166 ] <main                                    > : path is file!
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [I] [190 ] <main                                    > : main:  READ: file://.\GNSS\Base\WUH200CHN_R_20203010145_15M_01S_MO.crx.20O time:  0.000 sec
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Warning - Warning: 4-CHAR: MARKER_NAME [WUH200CHN] not equal to site from filename [.\GNSS\BA] .. .\GNSS\Base\WUH200CHN_R_20203010145_15M_01S_MO.crx.20O
+[2026-09-10 19:29:57] [I] [166 ] <main                                    > : path is file!
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [I] [190 ] <main                                    > : main:  READ: file://.\GNSS\Base\WUH200CHN_R_20203010200_15M_01S_MO.crx.20O time:  0.000 sec
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Warning - Warning: 4-CHAR: MARKER_NAME [WUH200CHN] not equal to site from filename [.\GNSS\BA] .. .\GNSS\Base\WUH200CHN_R_20203010200_15M_01S_MO.crx.20O
+[2026-09-10 19:29:57] [I] [166 ] <main                                    > : path is file!
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [I] [190 ] <main                                    > : main:  READ: file://.\GNSS\Base\WUH200CHN_R_20203010215_15M_01S_MO.crx.20O time:  0.000 sec
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Warning - Warning: 4-CHAR: MARKER_NAME [WUH200CHN] not equal to site from filename [.\GNSS\BA] .. .\GNSS\Base\WUH200CHN_R_20203010215_15M_01S_MO.crx.20O
+[2026-09-10 19:29:57] [I] [166 ] <main                                    > : path is file!
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [I] [190 ] <main                                    > : main:  READ: file://.\GNSS\Base\WUH200CHN_R_20203010230_15M_01S_MO.crx.20O time:  0.000 sec
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Warning - Warning: 4-CHAR: MARKER_NAME [WUH200CHN] not equal to site from filename [.\GNSS\BA] .. .\GNSS\Base\WUH200CHN_R_20203010230_15M_01S_MO.crx.20O
+[2026-09-10 19:29:57] [I] [166 ] <main                                    > : path is file!
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [W] [726 ] <_fix_band                               > : Warning: Changing BDS-3 C7D/C7P/C7Z to C9D/C9P/C9Z in RINEX 3.04
+[2026-09-10 19:29:57] [I] [190 ] <main                                    > : main:  READ: file://.\GNSS\Base\WUH200CHN_R_20203010245_15M_01S_MO.crx.20O time:  0.000 sec
+[2026-09-10 19:29:57] [W] [136 ] <~t_gcoder                               > : Warning - Warning: 4-CHAR: MARKER_NAME [WUH200CHN] not equal to site from filename [.\GNSS\BA] .. .\GNSS\Base\WUH200CHN_R_20203010245_15M_01S_MO.crx.20O
+[2026-09-10 19:29:57] [I] [166 ] <main                                    > : path is file!
+[2026-09-10 19:29:58] [I] [190 ] <main                                    > : main:  READ: file://.\IMU\campus-01-MEMS.txt time:  1.000 sec
+[2026-09-10 19:29:58] [I] [238 ] <main                                    > : main:  main:  No two site/data for processing!
