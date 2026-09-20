@@ -20,6 +20,7 @@ rtk-evc/
 .worktrees/
 .pytest_cache/
 .superpowers/
+.superpowers/sdd/
 
 # Project directories excluded from version control.
 .vscode/
@@ -29,6 +30,7 @@ issue/
 problem/
 
 .gitignore
+rtkrcv.nav
 *.stat
 *.txt
 *.ini
