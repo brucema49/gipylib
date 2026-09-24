@@ -38,15 +38,13 @@ from src.core.data_types import (
     IncrementImuData,
 )
 from src.core.ins.attitude import euler2dcm, att_caln2e, dcm2quat
-from src.core.ins.constraints import Constraints
 from src.core.ins.earth_param import cal_Ce2n, ecef2llh
 from src.core.ins.initializer import InsInitializer, InitMode
 from src.core.ins.interpolator import (
     imu_interpolate_linear,
     split_increment_at_gnss,
 )
-from src.core.ins.lc_integration import _DecimationCounter
-from src.core.ins.static_detect import StaticDetect
+from src.core.motion.motion_manager import MotionConstraintManager
 from src.core.time_utils import unix_to_gpst
 from src.core.tc.tc_ambiguity import (
     GREAT_MAXDEV_CYCLES,
@@ -138,19 +136,17 @@ class TcIntegration:
         # 初始化模式选择 (与 LcStream 一致)
         self._init_mode = self._select_init_mode(config)
 
-        # 约束 + 静态检测
-        self.nhc_enable = int(ins_cfg.get("nhc_enable", 0))
-        self.zupt_enable = int(ins_cfg.get("zupt_enable", 0))
-        self.zaru_enable = int(ins_cfg.get("zaru_enable", 0))
-        self._nhc_counter = _DecimationCounter(
-            int(ins_cfg.get("nhc_decimation", 1)))
-        self._nhc_warmup = int(ins_cfg.get("nhc_warmup", 30))
-        self._zupt_counter = _DecimationCounter(
-            int(ins_cfg.get("zupt_min_count", 15)))
-        self._zaru_counter = _DecimationCounter(
-            int(ins_cfg.get("zaru_min_count", 100)))
-        self._static_detect = StaticDetect(config)
-        self._constraints = Constraints(config)
+        # 约束 + 静态检测: 与松组合共用 MotionConstraintManager
+        # (使能开关 / decimation / 互斥调度 / 残差输出 / 抗差接入)
+        self.motion = MotionConstraintManager(
+            config, nhc_warmup=int(ins_cfg.get("nhc_warmup", 30)))
+        self.motion.open()
+        # 兼容旧命名的只读视图
+        self.nhc_enable = self.motion.nhc_enable
+        self.zupt_enable = self.motion.zupt_enable
+        self.zaru_enable = self.motion.zaru_enable
+        self._static_detect = self.motion.detector
+        self._constraints = self.motion.constraints
 
         # 降级管理
         tc_cfg = config.get("tc", {}).get("degrade", {})
@@ -1018,7 +1014,7 @@ class TcIntegration:
 
         if self.imucur is None:
             self.imucur = imu
-            self._static_detect.push(imu)
+            self.motion.push_imu(imu)
             self.last_qins = 2
             return
 
@@ -1058,7 +1054,7 @@ class TcIntegration:
                 self.imucur = interp
                 self._est.time_update(interp)
                 self._record_latest_propagation()
-                self._static_detect.push(interp)
+                self.motion.push_imu(interp)
                 self._apply_constraints(interp)
                 mechanized = True
 
@@ -1082,7 +1078,7 @@ class TcIntegration:
             return
         self._est.time_update(imu)
         self._record_latest_propagation()
-        self._static_detect.push(imu)
+        self.motion.push_imu(imu)
         self._apply_constraints(imu)
 
         self._check_velocity_divergence()
@@ -1119,7 +1115,7 @@ class TcIntegration:
         self.imucur = segment
         self._est.time_update(segment)
         self._record_latest_propagation()
-        self._static_detect.push(segment)
+        self.motion.push_imu(segment)
         self._apply_constraints(segment)
 
     @staticmethod
@@ -1233,7 +1229,7 @@ class TcIntegration:
             raise TypeError("rate-to-increment processing requires rate IMU input")
         if self.imucur is None:
             self.imucur = imu
-            self._static_detect.push(imu)
+            self.motion.push_imu(imu)
             self.last_qins = 2
             self.last_split_action = "none"
             self.last_split_ratio = None
@@ -1282,7 +1278,7 @@ class TcIntegration:
             raise TypeError("native increment processing requires increment IMU input")
         if self.imucur is None:
             self.imucur = imu
-            self._static_detect.push(imu)
+            self.motion.push_imu(imu)
             self.last_qins = 2
             self.last_split_action = "none"
             self.last_split_ratio = None
@@ -2666,25 +2662,13 @@ class TcIntegration:
     # ===== 约束 =====
 
     def _apply_constraints(self, imu: ImuMeasurement) -> None:
-        """NHC/ZUPT/ZARU 约束更新 (per-IMU, decimation, 互斥)。"""
-        if not (self.nhc_enable or self.zupt_enable or self.zaru_enable):
-            return
+        """NHC/ZUPT/ZARU 约束更新 (per-IMU, decimation, 互斥)。
 
-        state = self._est.state
-        is_static = self._static_detect.detect(state.pos_e)
-
-        applied = False
-        if is_static:
-            if self.zupt_enable and self._zupt_counter.should_trigger():
-                if self._constraints.zupt(self._est):
-                    applied = True
-            if self.zaru_enable and self._zaru_counter.should_trigger():
-                if self._constraints.zaru(self._est, imu):
-                    applied = True
-        elif (self.nhc_enable and self._nhc_counter.should_trigger()
-              and self._meas_count >= self._nhc_warmup):
-            if self._constraints.nhc(self._est, imu):
-                applied = True
+        调度逻辑已抽出到 ``MotionConstraintManager``（与松组合 ``LcIntegration``
+        共用同一份实现），这里只负责调用后的反馈与状态标记。
+        """
+        applied = self.motion.apply_constraints(
+            imu, self._est, meas_count=self._meas_count)
 
         if applied:
             self._est.feedback()
@@ -2778,6 +2762,8 @@ class TcIntegration:
 
     def finalize(self) -> int:
         """流式结束, 返回总输出数。"""
+        # 关闭可选的约束残差转储文件
+        self.motion.close()
         if not self._initialized:
             logger.warning("TcIntegration: 未初始化, 无 TC 输出")
             return 0

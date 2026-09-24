@@ -39,6 +39,11 @@ class StaticDetect:
             "MAG":  float(ins_cfg.get("static_gamma_mag",  50.0)),
             "ARE":  float(ins_cfg.get("static_gamma_are",  50.0)),
         }
+        # 速度判据: 比力在"匀速直线行驶"与"静止"下都≈重力, 四种 IMU 检验量
+        # 都无法区分这两种状态 (实测: 运动段 GLRT T 中位 29.7, 静止段 2.7,
+        # 但 ignav 默认 gamma=100 会把 91% 的运动历元判成静止)。用估计速度
+        # 作为第二段判据后, NHC 不会被"假静止"吞掉, ZUPT 也不会误触发。
+        self.max_vel = float(ins_cfg.get("static_max_vel", 0.5))  # m/s
         self._buf: Deque[ImuMeasurement] = deque(maxlen=self.ws)
 
     @property
@@ -53,15 +58,19 @@ class StaticDetect:
         """压入一个 IMU 测量到滑动窗口。"""
         self._buf.append(imu)
 
-    def detect(self, pos_e: np.ndarray) -> bool:
+    def detect(self, pos_e: np.ndarray, vel_e: np.ndarray = None) -> bool:
         """对当前窗口执行静态检测。
 
         Args:
             pos_e: ECEF 位置 [3], 用于计算局部重力大小 (GLRT/MAG 需要)
+            vel_e: ECEF 速度 [3] (可选)。给定时, ‖vel_e‖ >= static_max_vel
+                   直接判为运动 —— 见 __init__ 中关于"匀速直线 vs 静止"的说明。
 
         Returns:
             True=静态, False=运动; 窗口未填满时返回 False
         """
+        if vel_e is not None and float(np.linalg.norm(vel_e)) > self.max_vel:
+            return False
         n = len(self._buf)
         if n < self.ws:
             return False

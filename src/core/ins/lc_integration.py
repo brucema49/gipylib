@@ -27,34 +27,18 @@ from typing import Optional
 import numpy as np
 
 from src.core.data_types import IncrementImuData, GnssSolution, ImuMeasurement
-from src.core.ins.constraints import Constraints
 from src.core.ins.interpolator import (
     imu_interpolate_linear,
     split_increment_at_gnss,
 )
-from src.core.ins.static_detect import StaticDetect
+from src.core.motion.decimation_counter import DecimationCounter
+from src.core.motion.motion_manager import MotionConstraintManager
 from src.core.time_utils import unix_to_gpst
 
 logger = logging.getLogger(__name__)
 
-
-class _DecimationCounter:
-    """Decimation 计数器 (参考 ignav nc++>nhz 逻辑)。
-
-    should_trigger() 在计数达到 min_count 时返回 True 并复位,
-    无论后续 guard 是否通过 (与 ignav 一致)。
-    """
-
-    def __init__(self, min_count: int):
-        self.min_count = max(0, int(min_count))
-        self.count = 0
-
-    def should_trigger(self) -> bool:
-        if self.count >= self.min_count:
-            self.count = 0
-            return True
-        self.count += 1
-        return False
+# 兼容旧导入路径: 计数器实现已迁到 src/core/motion/decimation_counter.py
+_DecimationCounter = DecimationCounter
 
 
 class LcIntegration:
@@ -69,21 +53,17 @@ class LcIntegration:
         self.est = estimator
         self._output_callback = output_callback
         ins_cfg = config.get("ins", {})
-        # 使能开关
-        self.nhc_enable = int(ins_cfg.get("nhc_enable", 0))
-        self.zupt_enable = int(ins_cfg.get("zupt_enable", 0))
-        self.zaru_enable = int(ins_cfg.get("zaru_enable", 0))
-        # Decimation
-        self._nhc_counter = _DecimationCounter(
-            int(ins_cfg.get("nhc_decimation", 1)))
-        self._zupt_counter = _DecimationCounter(
-            int(ins_cfg.get("zupt_min_count", 15)))
-        self._zaru_counter = _DecimationCounter(
-            int(ins_cfg.get("zaru_min_count", 100)))
-        # 静态检测
-        self._static_detect = StaticDetect(config)
-        # 约束更新模块 (NHC/ZUPT/ZARU, 独立于 LcEstimator)
-        self._constraints = Constraints(config)
+        # NHC/ZUPT/ZARU 的使能开关、decimation、静态检测、互斥调度、残差输出、
+        # 抗差接入全部收敛到 MotionConstraintManager（与紧组合共用同一份实现）。
+        self.motion = MotionConstraintManager(
+            config, nhc_warmup=int(ins_cfg.get("nhc_warmup", 1)))
+        self.motion.open()
+        # 兼容旧命名的只读视图
+        self.nhc_enable = self.motion.nhc_enable
+        self.zupt_enable = self.motion.zupt_enable
+        self.zaru_enable = self.motion.zaru_enable
+        self._static_detect = self.motion.detector
+        self._constraints = self.motion.constraints
 
         self.imupre: Optional[ImuMeasurement] = None
         self.imucur: Optional[ImuMeasurement] = None
@@ -105,7 +85,6 @@ class LcIntegration:
         # NHC warmup: 动态初始化后需等待首次 GNSS 量测更新修正 yaw, 再启用 NHC
         # (与 TcIntegration._nhc_warmup 一致, 默认 1 = 至少 1 次 GNSS 更新后启用)
         self._meas_count: int = 0
-        self._nhc_warmup = int(ins_cfg.get("nhc_warmup", 1))
         self.last_split_action: str | None = None
         self.last_split_ratio: float | None = None
         # 输入数据形式与机械编排处理形式独立：目前 LC 可将 rate 输入
@@ -141,7 +120,7 @@ class LcIntegration:
 
         if self.imucur is None:
             self.imucur = imu
-            self._static_detect.push(imu)
+            self.motion.push_imu(imu)
             self.last_qins = 2
             return
 
@@ -184,7 +163,7 @@ class LcIntegration:
                 self.imupre = cur
                 self.imucur = interp
                 self.est.time_update(interp)
-                self._static_detect.push(interp)
+                self.motion.push_imu(interp)
                 self._apply_constraints(interp)
 
                 # 触发 GNSS 量测更新 + 反馈
@@ -198,7 +177,7 @@ class LcIntegration:
         self.imupre = cur
         self.imucur = imu
         self.est.time_update(imu)
-        self._static_detect.push(imu)
+        self.motion.push_imu(imu)
         self._apply_constraints(imu)
 
     def _add_rate_as_increment_imu(self, imu: ImuMeasurement) -> None:
@@ -214,7 +193,7 @@ class LcIntegration:
             raise TypeError("rate-to-increment processing requires rate IMU input")
         if self.imucur is None:
             self.imucur = imu
-            self._static_detect.push(imu)
+            self.motion.push_imu(imu)
             self.last_qins = 2
             self.last_split_action = "none"
             self.last_split_ratio = None
@@ -266,7 +245,7 @@ class LcIntegration:
         """Consume a native increment sample with KF-GINS boundary handling."""
         if self.imucur is None:
             self.imucur = imu
-            self._static_detect.push(imu)
+            self.motion.push_imu(imu)
             self.last_qins = 2
             self.last_split_action = "none"
             self.last_split_ratio = None
@@ -320,7 +299,7 @@ class LcIntegration:
                 self.imupre = cur
                 self.imucur = segment_current
                 self.est.time_update(segment_current)
-                self._static_detect.push(segment_current)
+                self.motion.push_imu(segment_current)
                 self._apply_constraints(segment_current)
                 self._apply_gnss_update(gnss)
                 self._emit_output(3)
@@ -338,7 +317,7 @@ class LcIntegration:
                 self.imupre = cur
                 self.imucur = head
                 self.est.time_update(head)
-                self._static_detect.push(head)
+                self.motion.push_imu(head)
                 self._apply_constraints(head)
                 self._apply_gnss_update(gnss)
                 self._emit_output(3)
@@ -356,7 +335,7 @@ class LcIntegration:
             self.imupre = cur
             self.imucur = segment_current
             self.est.time_update(segment_current)
-            self._static_detect.push(segment_current)
+            self.motion.push_imu(segment_current)
             self._apply_constraints(segment_current)
 
     def add_gnss(self, gnss: GnssSolution) -> None:
@@ -422,28 +401,11 @@ class LcIntegration:
     def _apply_constraints(self, imu: ImuMeasurement) -> None:
         """NHC/ZUPT/ZARU 约束更新 (per-IMU, decimation, 互斥)。
 
-        互斥逻辑 (参考 ignav postpos.cc):
-          静态 → ZUPT + ZARU (若启用)
-          运动 → NHC (若启用, 需非剧烈转弯)
+        调度逻辑已抽出到 ``MotionConstraintManager``（与紧组合 ``TcIntegration``
+        共用同一份实现），这里只负责调用后的反馈与状态标记。
         """
-        if not (self.nhc_enable or self.zupt_enable or self.zaru_enable):
-            return
-
-        state = self.est.state
-        is_static = self._static_detect.detect(state.pos_e)
-
-        applied = False
-        if is_static:
-            if self.zupt_enable and self._zupt_counter.should_trigger():
-                if self._constraints.zupt(self.est):
-                    applied = True
-            if self.zaru_enable and self._zaru_counter.should_trigger():
-                if self._constraints.zaru(self.est, imu):
-                    applied = True
-        elif (self.nhc_enable and self._nhc_counter.should_trigger()
-              and self._meas_count >= self._nhc_warmup):
-            if self._constraints.nhc(self.est, imu):
-                applied = True
+        applied = self.motion.apply_constraints(
+            imu, self.est, meas_count=self._meas_count)
 
         if applied:
             self.est.feedback()
