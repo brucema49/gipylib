@@ -75,7 +75,6 @@ gipylib/
 ├── README.md                  # 项目说明
 ├── requirements.txt           # Python 依赖
 ├── .gitignore
-├── pytest.ini                 # pytest 配置
 ├── src/                       # 源代码
 │   ├── main.py                # 主入口
 │   ├── core/
