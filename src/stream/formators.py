@@ -81,7 +81,7 @@ class ImuFormator(FormatorBase):
             return None
         parts = line.split(",")
         if len(parts) < 8:
-            return None
+            raise ValueError(f"GPST IMU row requires at least 8 columns, got {len(parts)}")
         try:
             week = int(parts[0])
             sow = float(parts[1])
@@ -91,8 +91,10 @@ class ImuFormator(FormatorBase):
             ax = float(parts[5])
             ay = float(parts[6])
             az = float(parts[7])
-        except (ValueError, IndexError):
-            return None
+        except (ValueError, IndexError) as exc:
+            raise ValueError(f"invalid numeric field in GPST IMU row: {exc}") from exc
+        if not np.all(np.isfinite([sow, gx, gy, gz, ax, ay, az])):
+            raise ValueError("GPST IMU row must contain finite values")
         imu = ImuMeasurement(
             timestamp=gpst_to_unix(week, sow),
             week=week,
@@ -119,7 +121,7 @@ class EuRoCImuFormator(FormatorBase):
             return None
         parts = line.split(",")
         if len(parts) < 7:
-            return None
+            raise ValueError(f"EuRoC IMU row requires at least 7 columns, got {len(parts)}")
         try:
             timestamp_ns = int(parts[0])
             wx = float(parts[1])
@@ -128,8 +130,10 @@ class EuRoCImuFormator(FormatorBase):
             ax = float(parts[4])
             ay = float(parts[5])
             az = float(parts[6])
-        except (ValueError, IndexError):
-            return None
+        except (ValueError, IndexError) as exc:
+            raise ValueError(f"invalid numeric field in EuRoC IMU row: {exc}") from exc
+        if not np.all(np.isfinite([wx, wy, wz, ax, ay, az])):
+            raise ValueError("EuRoC IMU row must contain finite values")
         timestamp = timestamp_ns / 1e9
         week, sow = unix_to_gpst(timestamp)
         # 与 rtklib-py 的 epoch2time 一致: 把 GPS 时间当作 UTC 处理 (伪 Unix GPS)
@@ -229,13 +233,13 @@ class PosSolFormator(FormatorBase):
 
     def decode(self, line: str) -> Optional[SensorData]:
         line = line.strip()
-        if not line or line.startswith("%"):
+        if not line or line.startswith(("%", "#")):
             return None
         # 时间字段格式: yyyy/mm/dd hh:mm:ss.s
         # 用空格分割后，前两段是日期和时间
         parts = line.split()
-        if len(parts) < 8:
-            return None
+        if len(parts) < 10:
+            raise ValueError(f"POS row requires at least 10 columns, got {len(parts)}")
         try:
             date_str = parts[0]  # yyyy/mm/dd
             time_str = parts[1]  # hh:mm:ss.s
@@ -253,8 +257,10 @@ class PosSolFormator(FormatorBase):
             sdx = float(parts[7])
             sdy = float(parts[8])
             sdz = float(parts[9])
-        except (ValueError, IndexError):
-            return None
+        except (ValueError, IndexError) as exc:
+            raise ValueError(f"invalid date/time or numeric field in POS row: {exc}") from exc
+        if not np.all(np.isfinite([s, x, y_pos, z, sdx, sdy, sdz])):
+            raise ValueError("POS row must contain finite values")
         sol = GnssSolution(
             timestamp=gpst_to_unix(week, sow),
             week=week,

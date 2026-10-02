@@ -40,16 +40,31 @@ class StreamerBase(BaseSensor, Thread):
 
     def run(self):
         """线程入口：逐行读取 → 解码 → 入队 → EOF sentinel。"""
+        line_number = 0
+        records = 0
         try:
             with open(self.file_path, "r", encoding="utf-8") as f:
-                for line in f:
+                for line_number, line in enumerate(f, 1):
                     if not self.control.is_running():
                         break
                     data = self.formator.decode(line)
                     if data is not None:
-                        self.output_queue.put(data)
+                        data = self._process_data(data)
+                        if not self.control.put(self.output_queue, data):
+                            break
+                        records += 1
+            if self.control.is_running() and records == 0:
+                raise ValueError("no usable data records (empty file or no records in the configured time range)")
+        except Exception as exc:
+            where = f"{self.tag} file '{self.file_path}'"
+            if line_number:
+                where += f", line {line_number}"
+            self.control.fail(where, exc)
         finally:
-            self.output_queue.put(None)  # EOF sentinel
+            self.control.put(self.output_queue, None)  # EOF sentinel
+
+    def _process_data(self, data):
+        return data
 
     def get_data(self):
         """非阻塞返回队列头部数据。"""

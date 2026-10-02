@@ -13,6 +13,7 @@ from src.core.thread_control import ThreadControl
 from src.core.data_types import SensorData
 from src.core.gnss.rtklib_config_adapter import RtklibEnv
 from src.stream.gnss_band_mapping import resolve_raw_band_priority
+from src.utility.input_validation import validate_gnss_files, validate_rinex_header
 from src.utility.rinex_improve import (
     improve_rinex,
     needs_improvement,
@@ -46,16 +47,21 @@ class TcGnssSensor(Thread):
     def run(self):
         try:
             self._run_impl()
+        except Exception as exc:
+            self.control.fail(
+                f"GNSS reader (rover={self.gnss_cfg.get('rover_path')}, "
+                f"base={self.gnss_cfg.get('base_path')}, nav={self.gnss_cfg.get('eph_path')})", exc)
         finally:
             for p in self._temp_files:
                 try:
                     Path(p).unlink(missing_ok=True)
                 except Exception:
                     pass
-            self.output_queue.put(None)  # EOF sentinel
+            self.control.put(self.output_queue, None)  # EOF sentinel
 
     def _prepare_rinex(self, path: str) -> str:
         """如需改写（LibGnut 频带归一化/频点选择）则生成临时文件。"""
+        validate_rinex_header(path, "O")
         if not needs_improvement(
             path,
             band_plan=self.resolved_raw_band_priority,
@@ -69,6 +75,7 @@ class TcGnssSensor(Thread):
             mode="w", suffix=suffix, delete=False, encoding="utf-8"
         )
         tmp.close()
+        self._temp_files.append(tmp.name)
         improve_rinex(
             path,
             tmp.name,
@@ -77,10 +84,10 @@ class TcGnssSensor(Thread):
             raw_signal_priority=self.raw_signal_priority or None,
             max_freqs=max(int(self.gnss_cfg.get("nf", 2) or 2), 2),
         )
-        self._temp_files.append(tmp.name)
         return tmp.name
 
     def _run_impl(self):
+        validate_gnss_files(self.config)
         # 1. 解析流级信号方案（显式映射优先，否则按 RINEX 头自动规划），
         #    并补齐缺失的频率映射键
         cfg, self.resolved_raw_band_priority = resolve_stream_plan(
@@ -135,11 +142,11 @@ class TcGnssSensor(Thread):
                         best_dt = d
                         best_j = j
                 obsb = base.obslist[best_j] if best_j >= 0 else None
-                self.output_queue.put(
+                self.control.put(self.output_queue,
                     SensorData(tag="gnss_raw", gnss_raw=(obsr, obsb, nav)))
         else:
             for obsr in rov.obslist:
                 if not self.control.is_running():
                     break
-                self.output_queue.put(
+                self.control.put(self.output_queue,
                     SensorData(tag="gnss_raw", gnss_raw=(obsr, None, nav)))

@@ -68,20 +68,11 @@ class ImuSensor(StreamerBase):
                 f"(expected 'gpst', 'euroc' or 'great_msf_7col_rate')"
             )
 
-    def run(self):
-        """线程入口：逐行读取 → 解码 → 坐标系转换 → 入队 → EOF sentinel。"""
-        try:
-            with open(self.file_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if not self.control.is_running():
-                        break
-                    data = self.formator.decode(line)
-                    if data is not None:
-                        if data.imu is not None:
-                            data.imu = self._convert_to_frd(data.imu)
-                        self.output_queue.put(data)
-        finally:
-            self.output_queue.put(None)
+    def _process_data(self, data):
+        """Apply the IMU axis conversion inside the shared reader error boundary."""
+        if data.imu is not None:
+            data.imu = self._convert_to_frd(data.imu)
+        return data
 
     def _convert_to_frd(self, imu: ImuMeasurement) -> ImuMeasurement:
         """将 IMU 数据从原始坐标系转换到 FRD（前-右-下）。"""

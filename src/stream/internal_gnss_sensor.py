@@ -12,6 +12,7 @@ from src.core.thread_control import ThreadControl
 from src.core.data_types import SensorData
 from src.core.gnss.rtklib_config_adapter import RtklibEnv
 from src.stream.gnss_band_mapping import resolve_raw_band_priority
+from src.utility.input_validation import validate_gnss_files, validate_rinex_header
 from src.utility.rinex_improve import (
     improve_rinex,
     needs_improvement,
@@ -45,6 +46,10 @@ class InternalGnssSensor(Thread):
     def run(self):
         try:
             self._run_impl()
+        except Exception as exc:
+            self.control.fail(
+                f"GNSS reader (rover={self.gnss_cfg.get('rover_path')}, "
+                f"base={self.gnss_cfg.get('base_path')}, nav={self.gnss_cfg.get('eph_path')})", exc)
         finally:
             # 清理临时改写文件
             for p in self._temp_files:
@@ -52,10 +57,11 @@ class InternalGnssSensor(Thread):
                     Path(p).unlink(missing_ok=True)
                 except Exception:
                     pass
-            self.output_queue.put(None)  # EOF sentinel
+            self.control.put(self.output_queue, None)  # EOF sentinel
 
     def _prepare_rinex(self, path: str) -> str:
         """如需改写（LibGnut 频带归一化/频点选择）则生成临时文件。"""
+        validate_rinex_header(path, "O")
         if not needs_improvement(
             path,
             band_plan=self.resolved_raw_band_priority,
@@ -69,6 +75,7 @@ class InternalGnssSensor(Thread):
             mode="w", suffix=suffix, delete=False, encoding="utf-8"
         )
         tmp.close()
+        self._temp_files.append(tmp.name)
         improve_rinex(
             path,
             tmp.name,
@@ -77,10 +84,10 @@ class InternalGnssSensor(Thread):
             raw_signal_priority=self.raw_signal_priority or None,
             max_freqs=max(int(self.gnss_cfg.get("nf", 2) or 2), 2),
         )
-        self._temp_files.append(tmp.name)
         return tmp.name
 
     def _run_impl(self):
+        validate_gnss_files(self.config)
         # 1. 解析流级信号方案（显式映射优先，否则按 RINEX 头自动规划），
         #    并补齐缺失的频率映射键
         cfg, self.resolved_raw_band_priority = resolve_stream_plan(
@@ -146,7 +153,7 @@ class InternalGnssSensor(Thread):
                 break
             sol = processor.process_epoch(obsr)
             if sol is not None:
-                self.output_queue.put(SensorData(tag="gnss_solution", gnss_solution=sol))
+                self.control.put(self.output_queue, SensorData(tag="gnss_solution", gnss_solution=sol))
 
     def _run_rtk_loop(self, processor, rov, base, nav, rn):
         """RTK 模式: 用 first_obs/next_obs 做时间同步。"""
@@ -159,7 +166,7 @@ class InternalGnssSensor(Thread):
                 break
             sol = processor.process_epoch(obsr, obsb)
             if sol is not None:
-                self.output_queue.put(SensorData(tag="gnss_solution", gnss_solution=sol))
+                self.control.put(self.output_queue, SensorData(tag="gnss_solution", gnss_solution=sol))
             obsr, obsb = rn.next_obs(nav, rov, base, dir)
 
     def _run_rtk_batch(self, nav, rov, base, filtertype):
@@ -184,4 +191,4 @@ class InternalGnssSensor(Thread):
                 break
             gsol = sol_to_gnss_solution(sol)
             if gsol is not None:
-                self.output_queue.put(SensorData(tag="gnss_solution", gnss_solution=gsol))
+                self.control.put(self.output_queue, SensorData(tag="gnss_solution", gnss_solution=gsol))

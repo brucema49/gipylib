@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 import numpy as np
+from src.utility.input_validation import InputTextReader, validate_epoch
 
 from .gnss import GOBSBAND, GSYS, gobs2str, pha2snr, str2gobs
 
@@ -108,10 +109,10 @@ def _parse_float(text: str) -> float:
     text = text.strip()
     if not text:
         return 0.0
-    try:
-        return float(text.replace("D", "E").replace("d", "e"))
-    except ValueError:
-        return 0.0
+    value = float(text.replace("D", "E").replace("d", "e"))
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite RINEX numeric field {text!r}")
+    return value
 
 
 def parse_obs_header(path: str) -> RinexObsHeader:
@@ -121,7 +122,7 @@ def parse_obs_header(path: str) -> RinexObsHeader:
     pending_nsat = 0
     pending_sats: list[str] = []
 
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with InputTextReader(path) as f:
         for line in f:
             if len(line) < 60:
                 if line.strip() == "":
@@ -169,8 +170,8 @@ def parse_obs_header(path: str) -> RinexObsHeader:
                              _OBS_CODE_RE.finditer(chunk))
                 while len(codes) < nsig:
                     cont = f.readline()
-                    if not cont:
-                        break
+                    if not cont or not cont[60:].startswith("SYS / # / OBS TYPES"):
+                        raise ValueError("incomplete SYS / # / OBS TYPES continuation")
                     codes.extend(m.group(0) for m in
                                  _OBS_CODE_RE.finditer(cont[7:7 + 4 * _SIGS_PER_LINE]))
                 header.types[sys_char] = codes[:nsig]
@@ -196,11 +197,23 @@ def parse_obs_header(path: str) -> RinexObsHeader:
             if label.startswith("SYS / PHASE SHIFT"):
                 if line[0] in "GRECJSI":
                     shifts = header.phase_shifts.setdefault(line[0], {})
-                    for i in range(12):
-                        sat = line[8 + 7 * i:11 + 7 * i].strip()
-                        val = line[11 + 7 * i:22 + 7 * i].strip()
-                        if sat and val:
-                            shifts[sat] = _parse_float(val) * math.pi
+                    code = line[2:5].strip()
+                    if code:
+                        # Correction is in cycles. Metadata only; do not read
+                        # the label at column 60 as satellite/value fields.
+                        shift = _parse_float(line[6:14])
+                        nsat = int(line[16:18].strip() or "0")
+                        sats = line[19:60].split()
+                        while len(sats) < nsat:
+                            cont = f.readline()
+                            if not cont or not cont[60:].startswith("SYS / PHASE SHIFT"):
+                                raise ValueError("incomplete SYS / PHASE SHIFT continuation")
+                            sats.extend(cont[19:60].split())
+                        if nsat:
+                            for sat in sats[:nsat]:
+                                shifts[f"{code}:{sat}"] = shift
+                        else:
+                            shifts[code] = shift
                 continue
             if label.startswith("GLONASS SLOT / FRQ #"):
                 for i in range(8):
@@ -210,8 +223,10 @@ def parse_obs_header(path: str) -> RinexObsHeader:
                         header.glo_slot_freq[sat] = int(_parse_float(chn))
                 continue
             if label.startswith("GLONASS COD/PHS/BIS"):
-                header.glo_code_phase_bias["P1"] = _parse_float(line[5:14])
-                header.glo_code_phase_bias["P2"] = _parse_float(line[19:28])
+                for i in range(4):
+                    code = line[1 + 13*i:4 + 13*i].strip()
+                    if code:
+                        header.glo_code_phase_bias[code] = _parse_float(line[5 + 13*i:13 + 13*i])
                 continue
             # SCALE FACTOR 卫星列表续行（无 60 列标签）
             if pending_sys is not None and line.startswith("      "):
@@ -289,7 +304,7 @@ def iter_obs_epochs(path: str, header: RinexObsHeader,
     codes = header.normalized_types()
     scale_cache: dict[tuple[str, str], float] = {}
 
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with InputTextReader(path) as f:
         # 跳过头部（rinexo3.cpp 以第 60 列起的标签判定；标签后可能有尾随空格）
         for line in f:
             label = line[60:].rstrip("\r\n") if len(line) >= 60 else ""
@@ -304,6 +319,7 @@ def iter_obs_epochs(path: str, header: RinexObsHeader,
             hour = int(line[13:15])
             minute = int(line[16:18])
             sec = float(line[19:29] or 0)
+            validate_epoch(year, month, day, hour, minute, sec)
             flag = int(line[31] or 0)
             nsat = int(line[32:35] or 0)
             # 事件历元（flag != 0/1）跳过其后 nsat 行（rinexo3.cpp 441-463）
@@ -316,8 +332,8 @@ def iter_obs_epochs(path: str, header: RinexObsHeader,
                              flag=flag)
             for _ in range(nsat):
                 line = f.readline()
-                if not line:
-                    break
+                if not line or line.startswith(">"):
+                    raise ValueError("truncated observation epoch: missing satellite record")
                 sys_char = line[0]
                 if sys_char not in codes:
                     continue

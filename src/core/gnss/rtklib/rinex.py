@@ -6,6 +6,7 @@ Copyright (c) 2022 Tim Everett
 """
 
 import bisect
+from src.utility.input_validation import InputTextReader, validate_rinex_header, validate_epoch
 
 import numpy as np
 from copy import deepcopy
@@ -135,13 +136,21 @@ class rnx_decode:
                 result[system] = values
         return result
 
-    def flt(self, u, c=-1):
+    def flt(self, u, c=-1, *, required=False):
+        if not u:
+            raise ValueError("truncated RINEX navigation record")
         if c >= 0:
+            if required and len(u.rstrip("\r\n")) < 19*(c+1)+4:
+                raise ValueError("truncated required RINEX navigation field")
             u = u[19*c+4:19*(c+1)+4]
-        try:
-            return float(u.replace("D", "E"))
-        except:
-            return 0
+        if not u.strip():
+            if required:
+                raise ValueError("missing required RINEX navigation value")
+            return 0.0  # Blank optional navigation fields are legal.
+        value = float(u.replace("D", "E").replace("d", "e"))
+        if not np.isfinite(value):
+            raise ValueError(f"non-finite RINEX numeric field {u!r}")
+        return value
         
     
     def adjday(self, t, t0):
@@ -155,16 +164,15 @@ class rnx_decode:
 
     def decode_nav(self, navfile, nav):
         """decode RINEX Navigation message from file """
+        validate_rinex_header(navfile, "N")
         nav.eph = []
         nav.geph = []
-        with open(navfile, 'rt') as fnav:
+        with InputTextReader(navfile) as fnav:
             for line in fnav:
                 if line[60:73] == 'END OF HEADER':
                     break
                 elif line[60:80] == 'RINEX VERSION / TYPE':
                     self.ver = float(line[4:10])
-                    if self.ver < 3.02:
-                        return -1
                 elif line[60:76] == 'IONOSPHERIC CORR':
                     if line[0:4] == 'GPSA' or line[0:4] == 'QZSA':
                         for k in range(4):
@@ -187,47 +195,48 @@ class rnx_decode:
                 hour = int(line[15:17])
                 minute = int(line[18:20])
                 sec = int(line[21:23])
+                validate_epoch(year, month, day, hour, minute, sec)
                 toc = epoch2time([year, month, day, hour, minute, sec])
                 if sys != uGNSS.GLO:
                     eph = Eph(sat)
                     eph.toc = toc
-                    eph.f0 = self.flt(line, 1)
-                    eph.f1 = self.flt(line, 2)
+                    eph.f0 = self.flt(line, 1, required=True)
+                    eph.f1 = self.flt(line, 2, required=True)
                     eph.f2 = self.flt(line, 3)
     
                     line = fnav.readline() #3:6
-                    eph.iode = int(self.flt(line, 0)) 
-                    eph.crs = self.flt(line, 1)
-                    eph.deln = self.flt(line, 2)
-                    eph.M0 = self.flt(line, 3)
+                    eph.iode = int(self.flt(line, 0, required=True))
+                    eph.crs = self.flt(line, 1, required=True)
+                    eph.deln = self.flt(line, 2, required=True)
+                    eph.M0 = self.flt(line, 3, required=True)
     
                     line = fnav.readline() #7:10
-                    eph.cuc = self.flt(line, 0)
-                    eph.e = self.flt(line, 1)
-                    eph.cus = self.flt(line, 2)
-                    sqrtA = self.flt(line, 3)
+                    eph.cuc = self.flt(line, 0, required=True)
+                    eph.e = self.flt(line, 1, required=True)
+                    eph.cus = self.flt(line, 2, required=True)
+                    sqrtA = self.flt(line, 3, required=True)
                     eph.A = sqrtA**2
     
                     line = fnav.readline() #11:14
-                    eph.toes = int(self.flt(line, 0))
-                    eph.cic = self.flt(line, 1)
-                    eph.OMG0 = self.flt(line, 2)
-                    eph.cis = self.flt(line, 3)
+                    eph.toes = int(self.flt(line, 0, required=True))
+                    eph.cic = self.flt(line, 1, required=True)
+                    eph.OMG0 = self.flt(line, 2, required=True)
+                    eph.cis = self.flt(line, 3, required=True)
     
                     line = fnav.readline() #15:18
-                    eph.i0 = self.flt(line, 0)
-                    eph.crc = self.flt(line, 1)
-                    eph.omg = self.flt(line, 2)
-                    eph.OMGd = self.flt(line, 3)
+                    eph.i0 = self.flt(line, 0, required=True)
+                    eph.crc = self.flt(line, 1, required=True)
+                    eph.omg = self.flt(line, 2, required=True)
+                    eph.OMGd = self.flt(line, 3, required=True)
     
                     line = fnav.readline() #19:22
-                    eph.idot = self.flt(line, 0)
+                    eph.idot = self.flt(line, 0, required=True)
                     eph.code = int(self.flt(line, 1))  # source for GAL NAV type
-                    eph.week = int(self.flt(line, 2))
+                    eph.week = int(self.flt(line, 2, required=True))
     
                     line = fnav.readline() #23:26
                     eph.sva = self.flt(line, 0)
-                    eph.svh = int(self.flt(line, 1))
+                    eph.svh = int(self.flt(line, 1, required=True))
                     tgd = np.zeros(2)
                     tgd[0] = float(self.flt(line, 2))
                     if sys == uGNSS.GAL:
@@ -237,7 +246,7 @@ class rnx_decode:
                     eph.tgd = tgd
     
                     line = fnav.readline() #27:30
-                    tot = int(self.flt(line, 0))
+                    tot = int(self.flt(line, 0, required=True))
                     if len(line) >= 42:
                         eph.fit = int(self.flt(line, 1))
     
@@ -257,44 +266,43 @@ class rnx_decode:
                     nav.eph.append(eph)
                 else:  # GLONASS
                     if prn > uGNSS.GLOMAX:
-                        print('Reject nav entry: %s' % line[:3])
-                        break
+                        raise ValueError(f"unsupported GLONASS satellite {line[:3]}")
                     geph = Geph(sat)
                     # Toc rounded by 15 min in utc 
                     week, tow = time2gpst(toc)
                     toc = gpst2time(week,np.floor((tow + 450.0) / 900.0) * 900)
                     dow = int(np.floor(tow  / 86400.0))
                     # time of frame in UTC 
-                    tod = self.flt(line, 2) % 86400
+                    tod = self.flt(line, 2, required=True) % 86400
                     tof = gpst2time(week ,tod + dow * 86400.0)
                     tof = self.adjday(tof, toc)
                     geph.toe = utc2gpst(toc)
                     geph.tof = utc2gpst(tof)
                     # IODE = Tb (7bit), Tb =index of UTC+3H within current day
                     geph.iode = int(((tow + 10800.0) % 86400) / 900.0 + 0.5)
-                    geph.taun = -self.flt(line, 1)
-                    geph.gamn = self.flt(line, 2)
+                    geph.taun = -self.flt(line, 1, required=True)
+                    geph.gamn = self.flt(line, 2, required=True)
                     
                     line = fnav.readline() #3:6
                     pos =np.zeros(3)
                     vel = np.zeros(3)
                     acc = np.zeros(3)
-                    pos[0] = self.flt(line, 0)
-                    vel[0] = self.flt(line, 1)
-                    acc[0] = self.flt(line, 2)
-                    geph.svh = self.flt(line, 3)
+                    pos[0] = self.flt(line, 0, required=True)
+                    vel[0] = self.flt(line, 1, required=True)
+                    acc[0] = self.flt(line, 2, required=True)
+                    geph.svh = self.flt(line, 3, required=True)
                     
                     line = fnav.readline() #7:10
-                    pos[1] = self.flt(line, 0)
-                    vel[1] = self.flt(line, 1)
-                    acc[1] = self.flt(line, 2)
-                    geph.frq = self.flt(line, 3)
+                    pos[1] = self.flt(line, 0, required=True)
+                    vel[1] = self.flt(line, 1, required=True)
+                    acc[1] = self.flt(line, 2, required=True)
+                    geph.frq = self.flt(line, 3, required=True)
                     nav.glofrq[sat - uGNSS.GPSMAX - 1] = int(geph.frq)
 
                     line = fnav.readline() #11:14
-                    pos[2] = self.flt(line, 0)
-                    vel[2] = self.flt(line, 1)
-                    acc[2] = self.flt(line, 2)                                      
+                    pos[2] = self.flt(line, 0, required=True)
+                    vel[2] = self.flt(line, 1, required=True)
+                    acc[2] = self.flt(line, 2, required=True)
                     geph.age = self.flt(line, 2)
                     
                     geph.pos = pos * 1000
@@ -303,20 +311,30 @@ class rnx_decode:
                     
                     nav.geph.append(geph)
     
+        if not nav.eph and not nav.geph:
+            raise ValueError(f"{navfile}: no usable navigation ephemeris records")
         #nav.eph.sort(key=lambda x: (x.sat, x.toe.time))
         nav.eph.sort(key=lambda x: x.toe.time)
         nav.geph.sort(key=lambda x: x.toe.time)
         return nav
 
     def decode_obsh(self, obsfile):
-        self.fobs = open(obsfile, 'rt')
+        validate_rinex_header(obsfile, "O")
+        try:
+            return self._decode_obsh(obsfile)
+        except (ValueError, IndexError, UnicodeDecodeError) as exc:
+            if self.fobs is not None:
+                self.fobs.close()
+            line_number = self.fobs.line_number if self.fobs is not None else 1
+            raise ValueError(f"{obsfile}: line {line_number}: {exc}") from exc
+
+    def _decode_obsh(self, obsfile):
+        self.fobs = InputTextReader(obsfile)
         for line in self.fobs:
             if line[60:73] == 'END OF HEADER':
                 break
             if line[60:80] == 'RINEX VERSION / TYPE':
                 self.ver = float(line[4:10])
-                if self.ver < 3.02:
-                    return -1
             elif line[60:79] == 'APPROX POSITION XYZ':
                 self.pos = np.array([float(line[0:14]),
                                      float(line[14:28]),
@@ -327,13 +345,17 @@ class rnx_decode:
                 else:
                     continue
                 self.nsig[sys] = int(line[3:6])
-                s = line[7:7+4*13]
-                if self.nsig[sys] >= 14:
+                s = line[7:7+4*13].ljust(4*13)
+                for _ in range((self.nsig[sys] - 1) // 13):
                     line2 = self.fobs.readline()
-                    s += line2[7:7+4*13]
+                    if not line2 or line2[60:79] != 'SYS / # / OBS TYPES':
+                        raise ValueError("incomplete SYS / # / OBS TYPES continuation")
+                    s += line2[7:7+4*13].ljust(4*13)
 
                 for k in range(self.nsig[sys]):
                     sig = s[4*k:3+4*k]
+                    if len(sig.strip()) != 3:
+                        raise ValueError("missing observation code in SYS / # / OBS TYPES")
                     # Keep the literal header code even when it is unknown to
                     # rtklib.  The reader trace must distinguish an unknown
                     # target signal (reject) from an unknown distractor
@@ -381,6 +403,13 @@ class rnx_decode:
             hour = int(line[13:15])
             minute = int(line[16:18])
             sec = float(line[19:29])
+            validate_epoch(year, month, day, hour, minute, sec)
+            flag = int(line[31])
+            if flag not in (0, 1):
+                for _ in range(nsat):
+                    if not self.fobs.readline():
+                        raise ValueError("truncated RINEX event record")
+                continue
             obs.t = epoch2time([year, month, day, hour, minute, sec])
             obs.P = np.zeros((nsat, gn.MAX_NFREQ))
             obs.L = np.zeros((nsat, gn.MAX_NFREQ))
@@ -394,6 +423,8 @@ class rnx_decode:
             n = 0
             for k in range(nsat):
                 line = self.fobs.readline()
+                if not line or line.startswith('>'):
+                    raise ValueError("truncated observation epoch: missing satellite record")
                 if line[0] not in self.gnss_tbl:
                     continue
                 sys = self.gnss_tbl[line[0]]
@@ -484,10 +515,9 @@ class rnx_decode:
                             error_code="empty_observation",
                         )
                         continue
-                    try:
-                        obsval = float(obs_)
-                    except:
-                        obsval = 0
+                    obsval = float(obs_.replace("D", "E").replace("d", "e"))
+                    if not np.isfinite(obsval):
+                        raise ValueError(f"non-finite observation {input_obs_code}: {obs_!r}")
                     f = band_slot[band]
                     if f >= gn.MAX_NFREQ:
                         sys_name = {
@@ -520,7 +550,7 @@ class rnx_decode:
                         Pstd = line[16*i+18]
                         obs.Pstd[n, f] = int(Pstd) if Pstd != " " else 0
                     elif self.typeid[sys][i] == 1:  # carrier
-                        obs.L[n, f] = float(obs_)
+                        obs.L[n, f] = obsval
                         obs.raw_signal_by_slot[(int(obs.sat[n]), int(f), "phase")] = {
                             "raw_band": int(band),
                             "track": str(input_obs_code),
@@ -622,8 +652,21 @@ class rnx_decode:
 
     
     def decode_obsfile(self, nav, obsfile, maxepoch):
-        self.decode_obsh(obsfile)
-        self.decode_obs(nav, maxepoch)
+        try:
+            self.decode_obsh(obsfile)
+            self.decode_obs(nav, maxepoch)
+            if not self.obslist or not any(np.any(obs.P) for obs in self.obslist):
+                raise ValueError("no usable pseudorange observation records for the selected systems/signals")
+        except (ValueError, IndexError, UnicodeDecodeError) as exc:
+            if isinstance(exc, ObservationMappingError):
+                raise
+            if str(exc).startswith(f"{obsfile}:"):
+                raise
+            line_number = self.fobs.line_number if self.fobs is not None else 1
+            raise ValueError(f"{obsfile}: line {line_number}: {exc}") from exc
+        finally:
+            if self.fobs is not None:
+                self.fobs.close()
 
 def first_obs(nav, rov, base, dir):
     if dir == 1: # forward solution

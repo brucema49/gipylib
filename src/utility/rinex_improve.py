@@ -17,6 +17,7 @@
 """
 
 from pathlib import Path
+import math
 
 
 from src.stream.gnss_band_mapping import (
@@ -615,7 +616,7 @@ def improve_rinex(input_path: str, output_path: str,
         if selected:
             sys_selected[sys_char] = selected
 
-    with open(in_path, "r", encoding="utf-8", errors="replace") as f:
+    with open(in_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
     with open(out_path, "w", encoding="utf-8", newline="\n") as f:
@@ -631,8 +632,8 @@ def improve_rinex(input_path: str, output_path: str,
                 sys_char = line[0]
                 try:
                     nsig = int(line[3:6])
-                except ValueError:
-                    nsig = 0
+                except ValueError as exc:
+                    raise ValueError(f"{in_path}: line {idx + 1}: invalid observation type count") from exc
                 n_cont = max(0, -(-max(nsig - _SIGS_PER_HEADER_LINE, 0)
                                   // _SIGS_PER_HEADER_LINE))
                 if sys_char in sys_selected:
@@ -655,7 +656,7 @@ def improve_rinex(input_path: str, output_path: str,
                 continue  # 比例因子已烤入数值
             f.write(line)
 
-        def _rewrite_row(line: str) -> str:
+        def _rewrite_row(line: str, line_number: int) -> str:
             """按选择的信号表重写一条卫星观测行。"""
             sys_char = line[0]
             old_codes = sys_old_codes[sys_char]
@@ -680,13 +681,23 @@ def improve_rinex(input_path: str, output_path: str,
                     continue
                 start = _FIELD_WIDTH * old_i
                 field = body[start:start + _FIELD_WIDTH]
+                number = field[:13].strip()
+                if number:
+                    try:
+                        value = float(number.replace("D", "E").replace("d", "e"))
+                        if not math.isfinite(value):
+                            raise ValueError("non-finite value")
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"{in_path}: line {line_number}: invalid observation "
+                            f"{old_codes[old_i]}: {number!r}") from exc
                 if factor != 1.0 and field.strip():
                     try:
                         value = float(field.split()[0]) * factor
                         keep = (field[14:] if len(field) > 14 else "").ljust(2)
                         field = f"{value:14.3f}" + keep
-                    except (ValueError, IndexError):
-                        pass
+                    except (ValueError, IndexError) as exc:
+                        raise ValueError(f"{in_path}: line {line_number}: invalid scaled observation") from exc
                 new_fields[new_i] = field.ljust(_FIELD_WIDTH)
             return line[:_LINE_HEADER_LEN] + "".join(new_fields) + "\n"
 
@@ -703,17 +714,26 @@ def improve_rinex(input_path: str, output_path: str,
                 continue
             try:
                 nsat = int(line[32:35])
-            except ValueError:
-                nsat = 0
-            block = lines[idx + 1: idx + 1 + nsat]
+            except ValueError as exc:
+                raise ValueError(f"{in_path}: line {idx + 1}: invalid satellite count") from exc
+            block = list(enumerate(lines[idx + 1: idx + 1 + nsat], idx + 2))
+            if len(block) != nsat or any(row.startswith('>') for _, row in block):
+                raise ValueError(f"{in_path}: line {idx + 1}: truncated observation epoch")
+            flag = int(line[31])
+            if flag not in (0, 1):
+                f.write(line)
+                for _, row in block:
+                    f.write(row)
+                idx += 1 + nsat
+                continue
             if wanted is not None:
                 # gnss_t 已指定: 只保留被选中系统的卫星行, 并修正卫星数
-                block = [row for row in block
+                block = [(number, row) for number, row in block
                          if row.strip() and row[0] in sys_selected]
                 line = f"{line[:32]}{len(block):3d}{line[35:]}"
             f.write(line if line.endswith("\n") else line + "\n")
-            for row in block:
-                f.write(_rewrite_row(row))
+            for line_number, row in block:
+                f.write(_rewrite_row(row, line_number))
             idx += 1 + nsat
 
     return str(out_path)

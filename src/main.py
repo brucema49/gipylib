@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import time
+from functools import partial
 from pathlib import Path
 from queue import Queue
 
@@ -25,6 +26,15 @@ from src.log.solution_writer import SolutionWriter
 from src.log.solution_logger import SolutionLogger
 from src.log.trace_file_writer import TraceFileWriter
 from src.utility.config_loader import load_config
+from src.utility.input_validation import validate_input_files
+
+
+def _run_worker(run, name, control):
+    """Forward reader/writer thread failures to the CLI's exit status."""
+    try:
+        run()
+    except Exception as exc:
+        control.fail(name, exc)
 
 
 def main(config_path: str = "data/config.yaml"):
@@ -35,6 +45,7 @@ def main(config_path: str = "data/config.yaml"):
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     config = load_config(config_path)
+    validate_input_files(config)
 
     # trace 文件 (level > 0 时启用)
     output_cfg = config.get("output", {})
@@ -75,22 +86,25 @@ def main(config_path: str = "data/config.yaml"):
     sensors, logger = _assemble_pipeline(config, control, imu_queue, gnss_queue)
 
     t0 = time.monotonic()
-    for s in sensors:
-        s.start()
-    logger.start()
-
-    logger.join()
-    elapsed = time.monotonic() - t0
-    control.shutdown()
-    for s in sensors:
-        s.join(timeout=2)
-
-    if trace_writer is not None:
-        if trace_writer.enabled:
-            trace_writer.write_event(1, "RUN_END",
-                                     f"elapsed={elapsed:.1f}s",
-                                     mode=config["ins"]["enabled"])
-        trace_writer.close()
+    for worker in [*sensors, logger]:
+        worker.run = partial(_run_worker, worker.run, worker.name, control)
+    try:
+        for s in sensors:
+            s.start()
+        logger.start()
+        logger.join()
+    finally:
+        elapsed = time.monotonic() - t0
+        control.shutdown()
+        for s in sensors:
+            if s.ident is not None:
+                s.join(timeout=2)
+        if trace_writer is not None:
+            if trace_writer.enabled:
+                trace_writer.write_event(1, "RUN_END", f"elapsed={elapsed:.1f}s",
+                                         mode=config["ins"]["enabled"])
+            trace_writer.close()
+    control.raise_if_failed()
 
     print(f"运行时长: {elapsed:.1f}s ({int(elapsed // 60)}m {elapsed % 60:.1f}s)")
 
@@ -295,4 +309,8 @@ if __name__ == "__main__":
         "--config", dest="config_option", default=None,
         help="YAML 配置文件路径 (显式选项, 优先于位置参数)")
     args = parser.parse_args()
-    main(args.config_option or args.config)
+    try:
+        main(args.config_option or args.config)
+    except Exception as exc:
+        logging.getLogger(__name__).error("解算失败: %s", exc)
+        sys.exit(1)

@@ -61,11 +61,13 @@ class AwesomeImuFormator:
             return None
         parts = line.split()
         if len(parts) < 7:
-            return None
+            raise ValueError(f"Awesome IMU row requires at least 7 columns, got {len(parts)}")
         try:
             values = [float(value) for value in parts[:7]]
-        except ValueError:
-            return None
+        except ValueError as exc:
+            raise ValueError(f"invalid numeric field in Awesome IMU row: {exc}") from exc
+        if not np.all(np.isfinite(values)):
+            raise ValueError("Awesome IMU row must contain finite values")
 
         sow = values[0]
         dtheta = np.asarray(values[1:4], dtype=np.float64)
@@ -110,16 +112,16 @@ class AwesomeGnssFormator:
             return None
         parts = line.split()
         if len(parts) < 7:
-            return None
+            raise ValueError(f"Awesome GNSS row requires at least 7 columns, got {len(parts)}")
         try:
             sow, lat, lon, height = (float(value) for value in parts[:4])
             sd_n, sd_e, sd_u = (float(value) for value in parts[4:7])
-        except ValueError:
-            return None
+        except ValueError as exc:
+            raise ValueError(f"invalid numeric field in Awesome GNSS row: {exc}") from exc
+        if not np.all(np.isfinite([sow, lat, lon, height, sd_n, sd_e, sd_u])):
+            raise ValueError("Awesome GNSS row must contain finite values")
         if ((self.start_sow is not None and sow < self.start_sow)
                 or (self.end_sow is not None and sow > self.end_sow)):
-            return None
-        if not np.all(np.isfinite([sow, lat, lon, height, sd_n, sd_e, sd_u])):
             return None
         if min(sd_n, sd_e, sd_u) < 0.0:
             raise ValueError("Awesome GNSS standard deviations must be non-negative")
